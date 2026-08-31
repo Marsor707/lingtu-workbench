@@ -12,12 +12,13 @@
 
 ## 当前状态
 
-截至 2026-08-31，仓库已切换到 Node/TypeScript 后端，并完成本地 Mock Provider 闭环：
+截至 2026-08-31，仓库已切换到 Node/TypeScript 后端，并完成本地任务数据闭环：
 
-- React/Vite/TypeScript 前端已通过 `POST /api/jobs` 提交真实任务，并通过 SSE 接收状态；真实 Provider 仍需用户自行配置后验证。
+- React/Vite/TypeScript 前端已通过 `POST /api/jobs` 提交真实任务，并通过 SSE 接收状态；队列、画廊和工作台统计均从本地服务读取，真实 Provider 仍需用户自行配置后验证。
 - Tauri 2 已配置 `externalBin`、托盘菜单和 Shell 插件；macOS 本机已验证 `.app` 能启动包内 sidecar、托管 `dist` 并打开浏览器，Windows runner 尚未在本机验证。
-- `server/` 已提供 SQLite 任务元数据、异步任务编排、REST/SSE、OpenAI 兼容 Provider 适配器和 base64 图片落盘；API Key 仅在进程内存中使用，不写入任务快照。
-- `src/data/builtin-prompts.ts` 已内置参考软件 v2.3.9 配置快照中的 79 条非空生成提示词，按类别和两宫格/四宫格/十五宫格布局标记；运行时不依赖参考软件目录。
+- `server/` 已提供 SQLite 任务元数据、异步任务编排、REST/SSE、OpenAI 兼容 Provider 适配器和 base64 图片落盘；API Key 仅保存在本地 Provider 配置表中，不写入任务快照、任务列表或接口响应。
+- 工作区设置通过 `PUT /api/provider` 写入本地 Provider 配置；页面刷新后通过 `GET /api/provider` 恢复地址，生图任务只需传地址，由后端从本地配置表补回 API Key。
+- `server/prompts.ts` 提供参考软件 v2.3.9 配置快照中的 79 条非空生成提示词，首次初始化 SQLite 时写入 `prompts` 表，前端通过 `GET /api/prompts` 读取。
 - 迁移期间保留的 `backend/` Python 健康检查代码仅作为过渡证据，不属于目标生产技术栈；新增业务代码统一放在 `server/` 并使用 TypeScript。
 
 ## 本地开发
@@ -76,7 +77,7 @@ npm run build:desktop
 
 ## 内置提示词
 
-提示词库首屏直接加载 `src/data/builtin-prompts.ts`，包含参考软件中 79 条非空模板；空的“本地提示词”和“自定义提示词”槽位不会被迁移。迁移脚本 `scripts/import-reference-prompts.py` 只接受显式传入的外部快照路径，避免运行时或构建时依赖已下载的参考软件目录。
+安装或首次初始化本地数据库时，后端将 79 条非空内置模板写入 `prompts` 表；前端通过 `GET /api/prompts` 读取，提示词库和工作台共用这份数据。空的“本地提示词”和“自定义提示词”槽位不会被迁移。迁移脚本 `scripts/import-reference-prompts.py` 只接受显式传入的外部快照路径，避免运行时或构建时依赖已下载的参考软件目录。
 
 ## Tauri 构建
 

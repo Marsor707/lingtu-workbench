@@ -27,6 +27,82 @@ test('健康检查保持既有契约', async () => {
   assert.deepEqual(body, { status: 'ok', service: 'lingtu-workbench' })
 })
 
+test('提示词接口返回安装时初始化的 79 条内置数据', async () => {
+  const { response, body } = await request('/api/prompts')
+  assert.equal(response.status, 200)
+  assert.equal(body.total, 79)
+  assert.equal(body.items.length, 79)
+  assert.equal(body.items[0].id, 'reference-v239-two_up-000')
+  assert.equal(body.items[0].builtin, true)
+  assert.ok(body.items.every((item) => item.text.length > 0))
+})
+
+test('Provider 配置写入 SQLite，重启后任务创建可复用且不回传密钥', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-provider-config-'))
+  const dbPath = join(directory, 'jobs.db')
+  const configStore = new JobStore(dbPath)
+  const configServer = await startServer(0, '127.0.0.1', configStore)
+  const configAddress = configServer.address()
+  const configBaseUrl = `http://127.0.0.1:${configAddress.port}`
+  try {
+    const saveResponse = await fetch(`${configBaseUrl}/api/provider`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ baseUrl: 'https://provider.example/v1', apiKey: 'local-secret' }),
+    })
+    assert.equal(saveResponse.status, 200)
+    assert.deepEqual(await saveResponse.json(), { baseUrl: 'https://provider.example/v1', configured: true })
+    const readResponse = await fetch(`${configBaseUrl}/api/provider`)
+    assert.equal(readResponse.status, 200)
+    assert.deepEqual(await readResponse.json(), { baseUrl: 'https://provider.example/v1', configured: true })
+  } finally {
+    await new Promise((resolve, reject) => configServer.close((error) => error ? reject(error) : resolve()))
+    configStore.close()
+  }
+
+  const restoredStore = new JobStore(dbPath)
+  try {
+    const created = restoredStore.create({ mode: 'generate', prompt: '测试提示词', provider: { baseUrl: 'https://provider.example/v1' } }).job
+    assert.equal(restoredStore.provider(created.id)?.apiKey, 'local-secret')
+  } finally {
+    restoredStore.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('统计接口读取任务状态和工作区实际结果文件大小', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-stats-workspace-'))
+  const statsStore = new JobStore(join(directory, 'jobs.db'))
+  const statsServer = await startServer(0, '127.0.0.1', statsStore, { workspaceDir: directory })
+  const statsAddress = statsServer.address()
+  const statsBaseUrl = `http://127.0.0.1:${statsAddress.port}`
+  try {
+    const emptyResponse = await fetch(`${statsBaseUrl}/api/stats`)
+    assert.equal(emptyResponse.status, 200)
+    assert.deepEqual(await emptyResponse.json(), { completed: 0, running: 0, review: 0, failed: 0, total: 0, storageBytes: 0 })
+
+    const completed = statsStore.create({ mode: 'generate' }).job
+    const running = statsStore.create({ mode: 'generate' }).job
+    const review = statsStore.create({ mode: 'generate' }).job
+    const failed = statsStore.create({ mode: 'generate' }).job
+    const resultPath = join('jobs', completed.id, '001.png')
+    mkdirSync(join(directory, 'jobs', completed.id), { recursive: true })
+    writeFileSync(join(directory, resultPath), Buffer.alloc(7))
+    statsStore.update(completed.id, 'completed', { results: [{ path: resultPath, index: 0 }] })
+    statsStore.update(running.id, 'running')
+    statsStore.update(review.id, 'review')
+    statsStore.update(failed.id, 'failed')
+
+    const response = await fetch(`${statsBaseUrl}/api/stats`)
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { completed: 1, running: 1, review: 1, failed: 1, total: 4, storageBytes: 7 })
+  } finally {
+    await new Promise((resolve, reject) => statsServer.close((error) => error ? reject(error) : resolve()))
+    statsStore.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
 test('按配置托管静态首页和资源，并隔离静态 404 与 API 404', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'lingtu-static-'))
   const staticDir = join(directory, 'dist')

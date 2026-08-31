@@ -1,11 +1,12 @@
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { isSea } from 'node:sea'
 import { editImage, generateImage, ProviderError } from './provider.js'
 import type { GenerationResult } from './provider.js'
+import { builtinPrompts } from './prompts.js'
 
 declare const process: { env: Record<string, string | undefined>; argv: string[]; exitCode?: number }
 type HttpRequest = { method?: string; url?: string; headers: Record<string, string | string[] | undefined>; on(event: string, listener: (...args: any[]) => void): void }
@@ -16,6 +17,8 @@ export type JobMode = 'generate' | 'edit' | 'text_to_image' | 'one_to_many'
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
 export type PromptWindow = { id?: string | number; name?: string; prompt: string; enabled?: boolean }
 export type JobResult = { path: string; index: number }
+export type Prompt = { id: string; category: string; title: string; text: string; layout: string; builtin: boolean; sourceName: string }
+export type AppStats = { completed: number; running: number; review: number; failed: number; total: number; storageBytes: number }
 export type SourceImage = { data: string; mimeType: string; name: string }
 export type Job = {
   id: string; mode: JobMode; status: JobStatus; idempotencyKey?: string; prompt?: string; layout?: string; size?: string; quality?: string; repeat: number
@@ -97,13 +100,18 @@ function providerConfig(value: unknown, defaults: Partial<ProviderConfig>): Prov
 
 export class JobStore {
   private readonly db: DatabaseSync
-  // Provider 密钥只保存在当前进程内存，绝不写入任务快照或 SQLite。
+  // Provider 密钥只保存在本地配置表，不写入任务快照、列表接口或日志。
   private readonly runtimeProviders = new Map<string, ProviderConfig>()
   constructor(dbPath = ':memory:') {
     if (dbPath !== ':memory:' && !dbPath.startsWith('file:')) mkdirSync(dirname(resolve(dbPath)), { recursive: true })
     this.db = new DatabaseSync(dbPath)
     this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE, mode TEXT NOT NULL, status TEXT NOT NULL, windows_json TEXT, provider_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, cancelled_at TEXT, request_json TEXT, results_json TEXT, error_json TEXT);`)
     for (const column of ['request_json TEXT', 'results_json TEXT', 'error_json TEXT']) { try { this.db.exec(`ALTER TABLE jobs ADD COLUMN ${column}`) } catch { /* 兼容已包含列的旧数据库 */ } }
+    this.db.exec('CREATE TABLE IF NOT EXISTS prompts (id TEXT PRIMARY KEY, category TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, layout TEXT NOT NULL, builtin INTEGER NOT NULL, source_name TEXT NOT NULL)')
+    const seedPrompt = this.db.prepare('INSERT OR IGNORE INTO prompts (id, category, title, text, layout, builtin, source_name) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    // 提示词随数据库首次初始化写入，后续启动只补齐缺失项，不覆盖用户已有记录。
+    for (const prompt of builtinPrompts) seedPrompt.run(prompt.id, prompt.category, prompt.title, prompt.text, prompt.layout, prompt.builtin ? 1 : 0, prompt.sourceName)
+    this.db.exec('CREATE TABLE IF NOT EXISTS provider_config (id INTEGER PRIMARY KEY CHECK (id = 1), base_url TEXT NOT NULL, api_key TEXT NOT NULL, updated_at TEXT NOT NULL)')
   }
   close(): void { this.db.close() }
   private fromRow(row: Record<string, unknown>): Job {
@@ -119,7 +127,7 @@ export class JobStore {
     const sourceImage = sourceImageValue(input.sourceImage)
     if (mode === 'edit' && !sourceImage) throw new RequestValidationError('invalid_source_image', 'edit 模式必须提供 sourceImage')
     if (mode === 'edit' && !prompt) throw new RequestValidationError('invalid_prompt', 'edit 模式必须提供 prompt')
-    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), provider: providerConfig(input.provider, defaults), ...(sourceImage ? { sourceImage } : {}) }
+    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), provider: providerConfig(input.provider, { ...this.getProviderConfig(), ...defaults }), ...(sourceImage ? { sourceImage } : {}) }
     const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.quality ? { quality: request.quality } : {}), repeat: request.repeat, ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
     const persistedRequest = { ...request, provider: { baseUrl: request.provider.baseUrl, apiKey: '' } }
     this.db.prepare('INSERT INTO jobs (id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, request_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(job.id, idempotencyKey ?? null, job.mode, job.status, job.windows ? JSON.stringify(job.windows) : null, JSON.stringify(job.provider), job.createdAt, job.updatedAt, JSON.stringify(persistedRequest))
@@ -128,6 +136,55 @@ export class JobStore {
   }
   list(): Job[] { return (this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC').all() as Record<string, unknown>[]).map((row) => this.fromRow(row)) }
   get(id: string): Job | undefined { const row = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as Record<string, unknown> | undefined; return row ? this.fromRow(row) : undefined }
+  getProviderConfig(): ProviderConfig | undefined {
+    const row = this.db.prepare('SELECT base_url, api_key FROM provider_config WHERE id = 1').get() as { base_url?: string; api_key?: string } | undefined
+    return row?.base_url && row.api_key ? { baseUrl: String(row.base_url), apiKey: String(row.api_key) } : undefined
+  }
+  saveProviderConfig(config: ProviderConfig): void {
+    this.db.prepare('INSERT INTO provider_config (id, base_url, api_key, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET base_url = excluded.base_url, api_key = excluded.api_key, updated_at = excluded.updated_at').run(config.baseUrl, config.apiKey, now())
+  }
+  prompts(): Prompt[] {
+    return (this.db.prepare('SELECT id, category, title, text, layout, builtin, source_name FROM prompts ORDER BY rowid').all() as Record<string, unknown>[]).map((row) => ({
+      id: String(row.id), category: String(row.category), title: String(row.title), text: String(row.text), layout: String(row.layout), builtin: Number(row.builtin) === 1, sourceName: String(row.source_name),
+    }))
+  }
+  stats(workspaceDir: string): AppStats {
+    const counts = { completed: 0, running: 0, review: 0, failed: 0, total: 0 }
+    const paths = new Set<string>()
+    const rows = this.db.prepare('SELECT status, results_json FROM jobs').all() as Record<string, unknown>[]
+    for (const row of rows) {
+      counts.total += 1
+      const status = String(row.status)
+      if (status === 'completed') counts.completed += 1
+      else if (status === 'running') counts.running += 1
+      else if (status === 'review') counts.review += 1
+      else if (status === 'failed') counts.failed += 1
+      if (typeof row.results_json === 'string') {
+        try {
+          const results = JSON.parse(row.results_json) as unknown
+          if (Array.isArray(results)) for (const result of results) {
+            if (result && typeof result === 'object' && typeof (result as Record<string, unknown>).path === 'string') paths.add((result as Record<string, unknown>).path as string)
+          }
+        } catch {
+          // 旧版本结果快照损坏时跳过该条，不影响工作台其他统计。
+        }
+      }
+    }
+    const root = resolve(workspaceDir)
+    let storageBytes = 0
+    for (const resultPath of paths) {
+      const candidate = resolve(root, resultPath)
+      const outside = relative(root, candidate)
+      if (isAbsolute(outside) || outside === '..' || outside.startsWith('../') || outside.startsWith('..\\')) continue
+      try {
+        const file = statSync(candidate)
+        if (file.isFile()) storageBytes += file.size
+      } catch {
+        // 结果文件可能已被用户移除，统计以当前工作区实际内容为准。
+      }
+    }
+    return { ...counts, storageBytes }
+  }
   request(id: string): StoredRequest | undefined { const row = this.db.prepare('SELECT request_json FROM jobs WHERE id = ?').get(id) as { request_json?: string } | undefined; return row?.request_json ? JSON.parse(row.request_json) as StoredRequest : undefined }
   provider(id: string): ProviderConfig | undefined { return this.runtimeProviders.get(id) }
   forgetProvider(id: string): void { this.runtimeProviders.delete(id) }
@@ -136,7 +193,7 @@ export class JobStore {
 }
 export class RequestValidationError extends Error { constructor(public readonly code: string, message: string) { super(message) } }
 function portFromEnvironment(): number { const value = process.env.LINGTU_PORT; if (value === undefined || value === '') return DEFAULT_PORT; const port = Number(value); if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('LINGTU_PORT must be an integer between 0 and 65535'); return port }
-function setCors(res: HttpResponse): void { res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS') }
+function setCors(res: HttpResponse): void { res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS') }
 function dataEvent(event: string, data: unknown): string { return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n` }
 const STATIC_CONTENT_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -188,7 +245,10 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       const current = store.get(id); if (current?.status === 'cancelled') return; const completed = store.update(id, 'completed', { provider: { status: 'completed', invoked: true }, results }); if (completed) emit(id, 'completed', completed)
     } catch (error) {
       const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) { if (current) emit(id, 'failed', current); return }
-      const safeError = error instanceof ProviderError ? { code: error.code, message: error.message } : { code: 'generation_failed', message: '生图任务失败' }
+      // 仅向前端返回可操作的诊断方向，不透传 Provider 原始响应或请求内容。
+      const safeError = error instanceof ProviderError
+        ? { code: error.code, message: error.message }
+        : { code: 'generation_failed', message: 'Provider 请求未完成，请检查接口地址、网络或 API Key' }
       const failed = store.update(id, 'failed', { provider: { status: 'failed', invoked: true }, error: safeError }); if (failed) emit(id, 'failed', failed)
     } finally { if (runtimes.get(id) === runtime) runtimes.delete(id); store.forgetProvider(id) }
   }
@@ -196,6 +256,28 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   return createServer(async (req: HttpRequest, res: HttpResponse) => {
     setCors(res); if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }; const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
     if (req.method === 'GET' && path === '/health') { json(res, 200, { status: 'ok', service: 'lingtu-workbench' }); return }
+    if (req.method === 'GET' && path === '/api/stats') { json(res, 200, store.stats(workspaceDir)); return }
+    if (req.method === 'GET' && path === '/api/prompts') { const items = store.prompts(); json(res, 200, { items, total: items.length }); return }
+    if (req.method === 'GET' && path === '/api/provider') {
+      const config = store.getProviderConfig()
+      json(res, 200, { baseUrl: config?.baseUrl ?? '', configured: Boolean(config?.apiKey) })
+      return
+    }
+    if (req.method === 'PUT' && path === '/api/provider') {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      try {
+        const config = providerConfig(body, {})
+        if (!config.baseUrl) throw new RequestValidationError('invalid_provider_base_url', 'provider_base_url 必须是非空字符串')
+        if (!config.apiKey) throw new RequestValidationError('invalid_provider_api_key', 'provider_api_key 必须是非空字符串')
+        store.saveProviderConfig(config)
+        json(res, 200, { baseUrl: config.baseUrl, configured: true })
+      } catch (error) {
+        if (error instanceof RequestValidationError) { errorResponse(res, 400, error.code, error.message); return }
+        errorResponse(res, 500, 'internal_error', 'Provider 配置保存失败')
+      }
+      return
+    }
     if (req.method === 'POST' && path === '/api/jobs') {
       let body: unknown; try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }; if (!body || typeof body !== 'object' || Array.isArray(body)) { errorResponse(res, 400, 'invalid_body', '请求体必须是 JSON 对象'); return }
       const input = body as JobInput; const bodyKey = input.idempotencyKey; const headerKey = headerValue(req.headers['idempotency-key']); if (bodyKey !== undefined && typeof bodyKey !== 'string') { errorResponse(res, 400, 'invalid_idempotency_key', 'idempotencyKey 必须是字符串'); return }; if (bodyKey && headerKey && bodyKey !== headerKey) { errorResponse(res, 400, 'idempotency_key_mismatch', '请求体与请求头的幂等键不一致'); return }; const idempotencyKey = bodyKey || headerKey; if (idempotencyKey !== undefined && (idempotencyKey.trim() === '' || idempotencyKey.length > 200)) { errorResponse(res, 400, 'invalid_idempotency_key', 'idempotencyKey 长度必须为 1 到 200 个字符'); return }

@@ -12,7 +12,6 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleHelp,
-  Clock3,
   CloudUpload,
   Copy,
   Eye,
@@ -41,12 +40,10 @@ import {
   Upload,
   X,
 } from 'lucide-react'
-import { builtinPrompts } from './data/builtin-prompts'
-import type { BuiltinPrompt } from './data/builtin-prompts'
 import './styles.css'
 
 type Mode = 'generate' | 'edit' | 'text' | 'one-to-many'
-type Page = 'workbench' | 'queue' | 'gallery' | 'prompts' | 'compliance'
+type Page = 'workbench' | 'queue' | 'gallery' | 'prompts'
 
 type PromptWindow = {
   id: number
@@ -55,7 +52,15 @@ type PromptWindow = {
   enabled: boolean
 }
 
-type PromptSelection = BuiltinPrompt['id']
+type PromptSelection = string
+
+type PromptItem = {
+  id: string
+  title: string
+  text: string
+  category: string
+  layout: string
+}
 
 type ChannelConfig = {
   baseUrl: string
@@ -71,6 +76,7 @@ type QueueItem = {
   status: QueueStatus
   progress: number
   time: string
+  error?: string
 }
 
 type GalleryAsset = {
@@ -88,6 +94,19 @@ type ApiJob = {
   createdAt?: string
   updatedAt?: string
   job?: ApiJob
+  results?: Array<{ index: number }>
+  error?: { message?: string }
+}
+
+type DashboardStats = {
+  completed?: number
+  running?: number
+  review?: number
+  failed?: number
+  total?: number
+  storageBytes?: number
+  storageUsedGb?: number
+  storageTotalGb?: number
 }
 
 type ApiErrorBody = {
@@ -97,6 +116,17 @@ type ApiErrorBody = {
 const LOCAL_API_BASE = 'http://127.0.0.1:8765'
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024
 const SOURCE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
+function formatToday(): string {
+  return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()).replaceAll('/', '.')
+}
 
 async function encodeFile(file: File): Promise<string> {
   const bytes = new Uint8Array(await file.arrayBuffer())
@@ -115,15 +145,6 @@ const modes: Array<{ id: Mode; label: string; detail: string }> = [
   { id: 'one-to-many', label: '一裂多', detail: '一张源图 · 多方向变体' },
 ]
 
-const galleryImages = [
-  { src: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=900&q=85', title: '城市机能鞋 · A组', tag: 'PASS', tone: 'pass' },
-  { src: 'https://images.unsplash.com/photo-1529139574466-a303027c1d8b?auto=format&fit=crop&w=900&q=85', title: '户外层叠 · 结构版', tag: 'REVIEW', tone: 'review' },
-  { src: 'https://images.unsplash.com/photo-1503342217505-b0a15ec3261c?auto=format&fit=crop&w=900&q=85', title: '美式复古 · 字标版', tag: 'PASS', tone: 'pass' },
-  { src: 'https://images.unsplash.com/photo-1460353581641-37baddab0fa2?auto=format&fit=crop&w=900&q=85', title: '跑鞋细节 · 4K', tag: 'BLOCK', tone: 'block' },
-  { src: 'https://images.unsplash.com/photo-1525507119028-ed4c629a60a3?auto=format&fit=crop&w=900&q=85', title: '服装陈列 · 二宫格', tag: 'PASS', tone: 'pass' },
-  { src: 'https://images.unsplash.com/photo-1551488831-00ddcb6c6bd3?auto=format&fit=crop&w=900&q=85', title: '材质实验 · 测试', tag: 'REVIEW', tone: 'review' },
-]
-
 const statusNames: Record<string, string> = {
   PASS: '可用',
   REVIEW: '待复核',
@@ -131,14 +152,16 @@ const statusNames: Record<string, string> = {
   UNKNOWN: '待确认',
 }
 
-const queueSeed: QueueItem[] = [
-  { id: 'LT-240830-014', title: '夏季户外鞋 · 一裂多', meta: '3 个窗口 · 4K 四宫格', status: 'running', progress: 68, time: '运行 02:41' },
-  { id: 'LT-240830-013', title: '城市机能鞋 · 常规批次', meta: '18 张 · 6 个模板', status: 'done', progress: 100, time: '完成于 09:42' },
-  { id: 'LT-240830-012', title: '复古字标 · 改图', meta: '单张 · 标准 IMG2', status: 'review', progress: 100, time: '待人工确认' },
-  { id: 'LT-240830-011', title: '春季陈列 · 文生图', meta: '4 张 · 1K 方图', status: 'failed', progress: 44, time: '接口超时' },
-]
-
-const defaultPrompt = builtinPrompts.find((item) => item.layout === 'four_up') ?? builtinPrompts[0]
+function assetsFromJob(job: ApiJob): GalleryAsset[] {
+  if (job.status !== 'completed' || !Array.isArray(job.results)) return []
+  const modeLabel = modes.find((item) => item.id === (job.mode === 'text_to_image' ? 'text' : job.mode))?.label ?? '生图'
+  return job.results.map((result) => ({
+    src: `${LOCAL_API_BASE}/api/jobs/${encodeURIComponent(job.id)}/results/${result.index}`,
+    title: `${modeLabel} · ${job.id.slice(-8)}`,
+    tag: 'PASS',
+    tone: 'pass',
+  }))
+}
 
 function App() {
   const [page, setPage] = useState<Page>('workbench')
@@ -161,21 +184,23 @@ function App() {
     }
     return { baseUrl: 'https://api.example.com/v1', apiKey: '' }
   })
-  const [selectedPrompt, setSelectedPrompt] = useState<PromptSelection>(defaultPrompt.id)
-  const [textPrompt, setTextPrompt] = useState(defaultPrompt.text)
+  const [prompts, setPrompts] = useState<PromptItem[]>([])
+  const [promptsLoading, setPromptsLoading] = useState(true)
+  const [promptsError, setPromptsError] = useState('')
+  const [selectedPrompt, setSelectedPrompt] = useState<PromptSelection>('')
+  const [textPrompt, setTextPrompt] = useState('')
   const [layout, setLayout] = useState('4K 四宫格')
   const [size, setSize] = useState('3840 × 2160')
   const [quality, setQuality] = useState('高')
   const [repeat, setRepeat] = useState(1)
   const [inputName, setInputName] = useState('未选择输入文件夹')
   const [sourceFile, setSourceFile] = useState<File | null>(null)
-  const [promptWindows, setPromptWindows] = useState<PromptWindow[]>([
-    { id: 1, name: builtinPrompts[0].title, prompt: builtinPrompts[0].text, enabled: true },
-    { id: 2, name: builtinPrompts[1].title, prompt: builtinPrompts[1].text, enabled: true },
-    { id: 3, name: '节日氛围', prompt: '', enabled: false },
-  ])
-  const [queue, setQueue] = useState(queueSeed)
+  const [promptWindows, setPromptWindows] = useState<PromptWindow[]>([])
+  const [queue, setQueue] = useState<QueueItem[]>([])
   const [galleryAssets, setGalleryAssets] = useState<GalleryAsset[]>([])
+  const [stats, setStats] = useState<DashboardStats | null>(null)
+  const [statsLoading, setStatsLoading] = useState(true)
+  const [statsError, setStatsError] = useState('')
   const [serviceOnline, setServiceOnline] = useState(false)
   const [submitError, setSubmitError] = useState('')
   const eventSourceRef = useRef<EventSource | null>(null)
@@ -192,12 +217,91 @@ function App() {
     return () => controller.abort()
   }, [])
 
+  useEffect(() => {
+    const controller = new AbortController()
+    fetch(`${LOCAL_API_BASE}/api/provider`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() as Promise<{ baseUrl?: string }> : Promise.reject(new Error('provider config unavailable')))
+      .then((body) => {
+        if (typeof body.baseUrl === 'string' && body.baseUrl.trim()) setChannelConfig((current) => ({ ...current, baseUrl: body.baseUrl!.trim() }))
+      })
+      .catch(() => undefined)
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    setPromptsLoading(true)
+    setPromptsError('')
+    fetch(`${LOCAL_API_BASE}/api/prompts`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error('提示词接口不可用')))
+      .then((body: unknown) => {
+        const rawItems = Array.isArray(body) ? body : body && typeof body === 'object' && Array.isArray((body as { items?: unknown }).items) ? (body as { items: unknown[] }).items : []
+        const items = rawItems.flatMap((value, index) => {
+          if (!value || typeof value !== 'object') return []
+          const item = value as Record<string, unknown>
+          const text = typeof item.text === 'string' ? item.text : typeof item.prompt === 'string' ? item.prompt : ''
+          const title = typeof item.title === 'string' ? item.title : typeof item.name === 'string' ? item.name : `提示词 ${index + 1}`
+          const id = item.id === undefined || item.id === null ? `prompt-${index + 1}` : String(item.id)
+          if (!text.trim()) return []
+          return [{ id, title, text, category: typeof item.category === 'string' ? item.category : '未分类', layout: typeof item.layout === 'string' ? item.layout : '' }]
+        })
+        setPrompts(items)
+        if (items.length > 0) {
+          const first = items.find((item) => item.layout.includes('four') || item.layout.includes('四')) ?? items[0]
+          setSelectedPrompt(first.id)
+          setTextPrompt(first.text)
+          setPromptWindows(items.slice(0, 2).map((item, index) => ({ id: index + 1, name: item.title, prompt: item.text, enabled: true })))
+        } else {
+          setSelectedPrompt('')
+          setTextPrompt('')
+          setPromptWindows([])
+        }
+      })
+      .catch((error) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+        setPrompts([])
+        setSelectedPrompt('')
+        setTextPrompt('')
+        setPromptWindows([])
+        setPromptsError(error instanceof Error ? error.message : '提示词加载失败')
+      })
+      .finally(() => setPromptsLoading(false))
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    setStatsLoading(true)
+    setStatsError('')
+    fetch(`${LOCAL_API_BASE}/api/stats`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error('统计接口不可用')))
+      .then((body: unknown) => {
+        const source = body && typeof body === 'object' && body !== null && 'data' in body && body.data && typeof body.data === 'object' ? body.data as Record<string, unknown> : body as Record<string, unknown>
+        const numberValue = (...keys: string[]) => { const value = keys.map((key) => source?.[key]).find((item) => typeof item === 'number'); return typeof value === 'number' ? value : undefined }
+        setStats({
+          completed: numberValue('completed', 'completedToday', 'todayCompleted'),
+          running: numberValue('running', 'runningJobs', 'activeJobs'),
+          review: numberValue('review', 'pendingReview', 'reviewCount'),
+          failed: numberValue('failed'),
+          total: numberValue('total'),
+          storageBytes: numberValue('storageBytes'),
+        })
+      })
+      .catch((error) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+        setStats(null)
+        setStatsError(error instanceof Error ? error.message : '统计加载失败')
+      })
+      .finally(() => setStatsLoading(false))
+    return () => controller.abort()
+  }, [])
+
   useEffect(() => () => {
     eventSourceRef.current?.close()
   }, [])
 
   const activeMode = modes.find((item) => item.id === mode) ?? modes[0]
-  const selectedPromptItem = builtinPrompts.find((item) => item.id === selectedPrompt) ?? defaultPrompt
+  const selectedPromptItem = prompts.find((item) => item.id === selectedPrompt)
   const enabledWindows = promptWindows.filter((item) => item.enabled && item.prompt.trim())
   const pageTitle = useMemo(() => {
     const titles: Record<Page, string> = {
@@ -205,21 +309,28 @@ function App() {
       queue: '任务队列',
       gallery: '生成画廊',
       prompts: '提示词库',
-      compliance: '合规中心',
     }
     return titles[page]
   }, [page])
 
   const handlePromptSelect = (id: PromptSelection) => {
-    const item = builtinPrompts.find((prompt) => prompt.id === id)
+    const item = prompts.find((prompt) => prompt.id === id)
     setSelectedPrompt(id)
     if (item) setTextPrompt(item.text)
   }
 
-  const saveChannelConfig = (config: ChannelConfig) => {
-    setChannelConfig(config)
+  const saveChannelConfig = async (config: ChannelConfig) => {
+    const response = await fetch(`${LOCAL_API_BASE}/api/provider`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseUrl: config.baseUrl.trim(), apiKey: config.apiKey }),
+    })
+    const body = await response.json() as ApiErrorBody & { baseUrl?: string }
+    if (!response.ok) throw new Error(body.error?.message || 'Provider 配置保存失败')
+    // 保存成功后清空前端内存副本，后续任务由本地服务读取已保存配置。
+    setChannelConfig({ baseUrl: config.baseUrl, apiKey: '' })
     try {
-      // 只记住地址，API Key 不写入浏览器存储，避免超出本地服务安全边界。
+      // 只记住地址，API Key 由本地服务保存，避免写入浏览器存储。
       window.localStorage.setItem('lingtu-channel-config', JSON.stringify({ baseUrl: config.baseUrl }))
     } catch {
       // 无痕模式等场景可能禁用存储，仍保留当前会话配置。
@@ -255,42 +366,61 @@ function App() {
       id: job.id,
       title,
       // 队列仅展示可公开的任务摘要，provider.apiKey 永不写入队列状态。
-      meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 个任务项 · ${layout}`,
+      meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 个任务项 · ${layout}${job.error?.message ? ` · ${job.error.message}` : ''}`,
       status,
       progress,
       time,
+      ...(job.error?.message ? { error: job.error.message } : {}),
     }
     setQueue((items) => [item, ...items.filter((existing) => existing.id !== job.id)])
+    if (status === 'done' && Array.isArray(job.results)) {
+      const newAssets = assetsFromJob(job)
+      setGalleryAssets((items) => [...newAssets, ...items.filter((asset) => !newAssets.some((next) => next.src === asset.src))])
+    }
     return status
   }
 
   const refreshQueue = async () => {
     try {
       const response = await fetch(`${LOCAL_API_BASE}/api/jobs`)
-      if (!response.ok) return
+      if (!response.ok) {
+        // 服务失败时清空本地投影，避免把旧的演示或过期任务继续展示给用户。
+        setQueue([])
+        setGalleryAssets([])
+        return
+      }
       const body = await response.json() as { items?: ApiJob[] }
-      if (!Array.isArray(body.items)) return
-      const completedAssets = body.items.flatMap((job) => (job.status === 'completed' && Array.isArray((job as ApiJob & { results?: Array<{ index: number }> }).results)
-        ? ((job as ApiJob & { results: Array<{ index: number }> }).results).map((result) => ({
-          src: `${LOCAL_API_BASE}/api/jobs/${encodeURIComponent(job.id)}/results/${result.index}`,
-          title: `${modes.find((item) => item.id === (job.mode === 'text_to_image' ? 'text' : job.mode))?.label ?? '生图'} · ${job.id.slice(-8)}`,
-          tag: 'PASS',
-          tone: 'pass',
-        }))
-        : []))
+      if (!Array.isArray(body.items)) {
+        setQueue([])
+        setGalleryAssets([])
+        return
+      }
+      const completedAssets = body.items.flatMap(assetsFromJob)
       setGalleryAssets(completedAssets)
       setQueue(body.items.map((job) => {
         return {
           id: job.id,
           title: `${modes.find((item) => item.id === (job.mode === 'text_to_image' ? 'text' : job.mode))?.label ?? '生图'} · 任务`,
-          meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 个任务项 · ${layout}`,
+          meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 个任务项 · ${layout}${job.error?.message ? ` · ${job.error.message}` : ''}`,
           status: job.status === 'completed' ? 'done' : job.status === 'failed' ? 'failed' : job.status === 'cancelled' ? 'cancelled' : job.status === 'running' ? 'running' : 'queued',
           progress: job.progress ?? (job.status === 'completed' ? 100 : 0),
           time: job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : job.status === 'cancelled' ? '已取消' : '进行中',
+          ...(job.error?.message ? { error: job.error.message } : {}),
         } satisfies QueueItem
       }))
     } catch {
-      // 本地服务未启动时保留已有队列，避免刷新动作清空用户当前视图。
+      // 本地服务未启动时清空投影，空态比伪造或保留旧任务更准确。
+      setQueue([])
+      setGalleryAssets([])
+    }
+  }
+
+  const refreshStats = async () => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/api/stats`)
+      if (response.ok) setStats(await response.json() as DashboardStats)
+    } catch {
+      // 统计刷新失败时保留当前已知值，避免任务队列被统计接口拖断。
     }
   }
 
@@ -328,7 +458,8 @@ function App() {
         const body = JSON.parse((event as MessageEvent<string>).data) as ApiJob & { completed?: number; total?: number }
         const eventJob = body.job ?? body
         if (!eventJob.id) return
-        const status = updateQueueFromJob({ ...eventJob, progress: body.total ? Math.round((body.completed ?? 0) / body.total * 100) : eventJob.progress })
+      const status = updateQueueFromJob({ ...eventJob, progress: body.total ? Math.round((body.completed ?? 0) / body.total * 100) : eventJob.progress })
+        void refreshStats()
         if (status === 'done' || status === 'review' || status === 'failed' || status === 'cancelled') {
           source.close()
           if (eventSourceRef.current === source) eventSourceRef.current = null
@@ -354,7 +485,7 @@ function App() {
       setSubmitError('请先选择一张源图后再开始改图')
       return
     }
-    const prompt = mode === 'one-to-many' ? enabledWindows[0]?.prompt.trim() ?? '' : textPrompt.trim() || selectedPromptItem.text
+    const prompt = mode === 'one-to-many' ? enabledWindows[0]?.prompt.trim() ?? '' : textPrompt.trim() || selectedPromptItem?.text || ''
     if (!prompt) {
       setSubmitError('请输入提示词后再开始任务')
       return
@@ -379,7 +510,7 @@ function App() {
           sourceImage,
           provider: {
             baseUrl: channelConfig.baseUrl.trim(),
-            apiKey: channelConfig.apiKey,
+            ...(channelConfig.apiKey.trim() ? { apiKey: channelConfig.apiKey } : {}),
           },
           idempotencyKey: `lingtu-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         }),
@@ -389,6 +520,7 @@ function App() {
         throw new Error(('error' in body && body.error?.message) || '本地服务拒绝了任务提交')
       }
       updateQueueFromJob(body)
+      void refreshStats()
       setRunning(false)
       subscribeJob(body.id)
       // POST 成功后立即回读详情，覆盖响应不完整或 SSE 尚未连接的情况。
@@ -412,7 +544,6 @@ function App() {
     { id: 'queue', label: '任务队列', icon: ListChecks, badge: `${queue.filter((item) => item.status === 'running').length}` },
     { id: 'gallery', label: '生成画廊', icon: GalleryHorizontalEnd },
     { id: 'prompts', label: '提示词库', icon: BookOpen },
-    { id: 'compliance', label: '合规中心', icon: ShieldCheck },
   ]
 
   return (
@@ -436,7 +567,7 @@ function App() {
           })}
         </nav>
         <div className="sidebar-bottom">
-          {sidebarOpen && <div className="storage-meter"><div className="storage-line"><span>工作区存储</span><span>2.4 / 20 GB</span></div><div className="meter"><i style={{ width: '12%' }} /></div></div>}
+          {sidebarOpen && <div className="storage-meter"><div className="storage-line"><span>结果文件</span><span>{statsLoading ? '加载中' : formatBytes(stats?.storageBytes ?? 0)}</span></div><div className="meter"><i style={{ width: stats ? '100%' : '0%' }} /></div></div>}
           <button className="nav-item" onClick={() => setShowSettings(true)} title="设置"><Settings2 size={18} /><span>{sidebarOpen && '设置'}</span></button>
           <button className="nav-item" onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? '收起侧栏' : '展开侧栏'}>{sidebarOpen ? <PanelLeftClose size={18} /> : <PanelLeftOpen size={18} />}<span>{sidebarOpen && '收起侧栏'}</span></button>
         </div>
@@ -452,11 +583,10 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFile={sourceFile} setSourceFile={setSourceFile} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} channelConfig={channelConfig} submitError={submitError} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFile={sourceFile} setSourceFile={setSourceFile} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} channelConfig={channelConfig} submitError={submitError} />}
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={refreshQueue} onCancel={cancelJob} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} />}
-        {page === 'prompts' && <PromptsPage selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} />}
-        {page === 'compliance' && <CompliancePage />}
+        {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} />}
       </main>
 
       {showSettings && <SettingsModal config={channelConfig} onSave={saveChannelConfig} onClose={() => setShowSettings(false)} />}
@@ -481,7 +611,10 @@ type WorkbenchProps = {
   sourceFile: File | null
   setSourceFile: (value: File | null) => void
   selectedPrompt: PromptSelection
-  selectedPromptItem: BuiltinPrompt
+  selectedPromptItem?: PromptItem
+  prompts: PromptItem[]
+  promptsLoading: boolean
+  promptsError: string
   textPrompt: string
   setTextPrompt: (value: string) => void
   setSelectedPrompt: (value: PromptSelection) => void
@@ -491,25 +624,35 @@ type WorkbenchProps = {
   enabledWindows: PromptWindow[]
   running: boolean
   startJob: () => void | Promise<void>
-  queue: typeof queueSeed
+  queue: QueueItem[]
+  galleryAssets: GalleryAsset[]
+  stats: DashboardStats | null
+  statsLoading: boolean
+  statsError: string
+  serviceOnline: boolean
   channelConfig: ChannelConfig
   submitError: string
 }
 
 function Workbench(props: WorkbenchProps) {
-  const { mode, setMode, activeMode, layout, setLayout, size, setSize, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFile, setSourceFile, selectedPrompt, selectedPromptItem, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, channelConfig, submitError } = props
+  const { mode, setMode, activeMode, layout, setLayout, size, setSize, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFile, setSourceFile, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, channelConfig, submitError } = props
+  const statValue = (value: number | undefined) => statsLoading ? '...' : value === undefined ? '--' : String(value)
+  const storageText = statsLoading ? '...' : formatBytes(stats?.storageBytes ?? 0)
+  const healthScore = serviceOnline && stats ? 100 : 0
+  const today = formatToday()
   return <div className="page-content workbench-page">
     <section className="page-heading heading-row">
-      <div><div className="eyebrow"><span className="eyebrow-line" />今日生产 <span className="mono">2026.08.30</span></div><h1>开始一轮新的生产</h1><p>从源图、模板到合规归档，在一个本地工作区完成闭环。</p></div>
+      <div><div className="eyebrow"><span className="eyebrow-line" />今日生产 <span className="mono">{today}</span></div><h1>开始一轮新的生产</h1><p>从源图、模板到合规归档，在一个本地工作区完成闭环。</p></div>
       <div className="heading-actions"><button className="button button-ghost"><FolderOpen size={16} />打开工作区</button><button className="button button-ghost"><RefreshCw size={16} />刷新状态</button></div>
     </section>
 
     <section className="metrics-grid">
-      <MetricCard label="今日已完成" value="38" unit="张" change="+14.2%" icon={<CheckCircle2 size={18} />} tone="green" />
-      <MetricCard label="运行中任务" value="01" unit="批" change="预计 07:18" icon={<LoaderCircle size={18} />} tone="orange" />
-      <MetricCard label="待合规复核" value="06" unit="张" change="需要关注" icon={<ShieldCheck size={18} />} tone="purple" />
-      <MetricCard label="本地空间" value="2.4" unit="GB" change="剩余 17.6 GB" icon={<Archive size={18} />} tone="blue" />
+      <MetricCard label="已完成任务" value={statValue(stats?.completed)} unit="批" change="本地数据库" icon={<CheckCircle2 size={18} />} tone="green" />
+      <MetricCard label="运行中任务" value={statValue(stats?.running)} unit="批" change="本地数据库" icon={<LoaderCircle size={18} />} tone="orange" />
+      <MetricCard label="待处理任务" value={statValue(stats?.review)} unit="项" change="本地数据库" icon={<ListChecks size={18} />} tone="purple" />
+      <MetricCard label="结果文件" value={storageText} unit="" change="工作区实际文件" icon={<Archive size={18} />} tone="blue" />
     </section>
+    {statsError && <div className="form-error stats-error" role="status"><AlertTriangle size={14} />{statsError}，工作台统计暂不可用</div>}
 
     <section className="workbench-layout">
       <div className="composer-panel panel">
@@ -522,17 +665,17 @@ function Workbench(props: WorkbenchProps) {
 
         {mode === 'text' && <div className="field-block"><div className="field-label"><label htmlFor="text-prompt">创作描述</label><span className="field-required">必填</span></div><textarea id="text-prompt" className="prompt-editor" value={textPrompt} onChange={(event) => setTextPrompt(event.target.value)} /></div>}
 
-        {mode === 'one-to-many' ? <div className="field-block one-to-many-block"><div className="field-label"><div><label>一裂多提示词窗口</label><span className="field-hint">已启用 {enabledWindows.length} 个</span></div><button className="button button-small button-ghost" onClick={addPromptWindow}><Plus size={14} />添加窗口</button></div><div className="prompt-window-list">{promptWindows.map((item, index) => <div className={`prompt-window ${item.enabled ? 'enabled' : ''}`} key={item.id}><div className="window-grip"><GripVertical size={15} /></div><button className={`toggle ${item.enabled ? 'on' : ''}`} onClick={() => updatePromptWindow(item.id, { enabled: !item.enabled })} aria-label={`${item.name} ${item.enabled ? '已启用' : '未启用'}`}><span /></button><div className="window-fields"><input aria-label={`窗口 ${index + 1} 名称`} value={item.name} onChange={(event) => updatePromptWindow(item.id, { name: event.target.value })} /><textarea aria-label={`${item.name}提示词`} placeholder="输入这个方向的提示词" value={item.prompt} onChange={(event) => updatePromptWindow(item.id, { prompt: event.target.value })} /></div><button className="icon-button danger-icon" title="删除窗口" onClick={() => updatePromptWindow(item.id, { prompt: '', enabled: false })}><Trash2 size={15} /></button></div>)}</div>{enabledWindows.length < 2 && <div className="inline-warning"><AlertTriangle size={14} />至少启用两个非空窗口后才能开始</div>}</div> : <div className="field-block"><div className="field-label"><label htmlFor="template-select">提示词模板</label><button className="text-link" onClick={() => setSelectedPrompt(defaultPrompt.id)}>浏览全部 <ArrowUpRight size={13} /></button></div><div className="select-wrap"><select id="template-select" value={selectedPrompt} onChange={(event) => setSelectedPrompt(event.target.value)}>{builtinPrompts.map((item) => <option key={item.id} value={item.id}>{item.category} · {item.title}</option>)}</select><ChevronDown size={16} /></div><div className="prompt-preview"><span className="prompt-type">{mode === 'text' ? '文字' : '图片'} / 模板</span><p>{selectedPromptItem.text.slice(0, 320)}{selectedPromptItem.text.length > 320 ? '…' : ''}</p><button className="icon-button subtle" title="复制提示词"><Copy size={15} /></button></div></div>}
+        {mode === 'one-to-many' ? <div className="field-block one-to-many-block"><div className="field-label"><div><label>一裂多提示词窗口</label><span className="field-hint">已启用 {enabledWindows.length} 个</span></div><button className="button button-small button-ghost" onClick={addPromptWindow}><Plus size={14} />添加窗口</button></div><div className="prompt-window-list">{promptWindows.map((item, index) => <div className={`prompt-window ${item.enabled ? 'enabled' : ''}`} key={item.id}><div className="window-grip"><GripVertical size={15} /></div><button className={`toggle ${item.enabled ? 'on' : ''}`} onClick={() => updatePromptWindow(item.id, { enabled: !item.enabled })} aria-label={`${item.name} ${item.enabled ? '已启用' : '未启用'}`}><span /></button><div className="window-fields"><input aria-label={`窗口 ${index + 1} 名称`} value={item.name} onChange={(event) => updatePromptWindow(item.id, { name: event.target.value })} /><textarea aria-label={`${item.name}提示词`} placeholder="输入这个方向的提示词" value={item.prompt} onChange={(event) => updatePromptWindow(item.id, { prompt: event.target.value })} /></div><button className="icon-button danger-icon" title="删除窗口" onClick={() => updatePromptWindow(item.id, { prompt: '', enabled: false })}><Trash2 size={15} /></button></div>)}</div>{enabledWindows.length < 2 && <div className="inline-warning"><AlertTriangle size={14} />至少启用两个非空窗口后才能开始</div>}</div> : <div className="field-block"><div className="field-label"><label htmlFor="template-select">提示词模板</label><button className="text-link" onClick={() => {}} disabled={promptsLoading || prompts.length === 0}>浏览全部 <ArrowUpRight size={13} /></button></div><div className="select-wrap"><select id="template-select" value={selectedPrompt} onChange={(event) => setSelectedPrompt(event.target.value)} disabled={promptsLoading || prompts.length === 0}><option value="">{promptsLoading ? '提示词加载中…' : promptsError ? '提示词加载失败' : '暂无可用提示词'}</option>{prompts.map((item) => <option key={item.id} value={item.id}>{item.category} · {item.title}</option>)}</select><ChevronDown size={16} /></div><div className="prompt-preview"><span className="prompt-type">{mode === 'text' ? '文字' : '图片'} / 模板</span><p>{selectedPromptItem ? `${selectedPromptItem.text.slice(0, 320)}${selectedPromptItem.text.length > 320 ? '…' : ''}` : promptsLoading ? '提示词加载中…' : promptsError ? '提示词暂时无法加载，请检查本地服务。' : '后端暂无可用提示词。'}</p><button className="icon-button subtle" title="复制提示词" disabled={!selectedPromptItem}><Copy size={15} /></button></div>{promptsError && <div className="form-error" role="status"><AlertTriangle size={14} />{promptsError}</div>}</div>}
 
         <div className="settings-divider"><button className="advanced-trigger" onClick={() => {}}><SlidersHorizontal size={15} />高级参数 <span>默认生产规范</span><ChevronDown size={15} /></button></div>
         <div className="settings-grid"><div className="compact-field"><label htmlFor="layout-select">输出布局</label><div className="select-wrap"><select id="layout-select" value={layout} onChange={(event) => setLayout(event.target.value)}><option>4K 四宫格</option><option>1K 二宫格</option><option>4K 十五宫格（测试）</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="size-select">生图尺寸</label><div className="select-wrap"><select id="size-select" value={size} onChange={(event) => setSize(event.target.value)}><option>3840 × 2160</option><option>1129 × 1254</option><option>1024 × 1024</option><option>1536 × 1024</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="quality-select">质量</label><div className="select-wrap"><select id="quality-select" value={quality} onChange={(event) => setQuality(event.target.value)}><option>高</option><option>中</option><option>自动</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="repeat-input">重复次数</label><div className="number-control"><input id="repeat-input" type="number" min="1" max="20" value={repeat} onChange={(event) => setRepeat(Math.min(20, Math.max(1, Number(event.target.value) || 1)))} /><span>次</span></div></div></div>
         <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>默认通道已配置 <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />创建任务中</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
       </div>
 
-      <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div className="preview-actions"><button className="icon-button subtle" title="刷新预览"><RefreshCw size={16} /></button><button className="icon-button subtle" title="更多操作"><MoreHorizontal size={17} /></button></div></div><div className={`layout-preview ${layout.includes('二宫格') ? 'layout-two' : layout.includes('十五') ? 'layout-fifteen' : ''}`}><div className="preview-cell cell-a"><span>A</span><small>主视觉区域</small></div><div className="preview-cell cell-b"><span>B</span><small>卖点信息区域</small></div>{layout.includes('四宫格') && <><div className="preview-cell cell-c"><span>C</span><small>细节变体</small></div><div className="preview-cell cell-d"><span>D</span><small>场景变体</small></div></>}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{size.replace(' × ', ':')}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link">查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryImages.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={image.title}><img src={image.src} alt="" /><span className={`mini-status ${image.tone}`} /></button>)}<button className="recent-thumb add-thumb" title="导入图片"><Plus size={17} /></button></div></div></div>
+      <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div className="preview-actions"><button className="icon-button subtle" title="刷新预览"><RefreshCw size={16} /></button><button className="icon-button subtle" title="更多操作"><MoreHorizontal size={17} /></button></div></div><div className={`layout-preview ${layout.includes('二宫格') ? 'layout-two' : layout.includes('十五') ? 'layout-fifteen' : ''}`}><div className="preview-cell cell-a"><span>A</span><small>主视觉区域</small></div><div className="preview-cell cell-b"><span>B</span><small>卖点信息区域</small></div>{layout.includes('四宫格') && <><div className="preview-cell cell-c"><span>C</span><small>细节变体</small></div><div className="preview-cell cell-d"><span>D</span><small>场景变体</small></div></>}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{size.replace(' × ', ':')}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link">查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryAssets.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={image.title}><img src={image.src} alt={image.title} /><span className={`mini-status ${image.tone}`} /></button>)}{galleryAssets.length === 0 && <span className="empty-inline">暂无生成结果</span>}<button className="recent-thumb add-thumb" title="导入图片"><Plus size={17} /></button></div></div></div>
     </section>
 
-    <section className="bottom-grid"><div className="activity-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">活动</span><h2>最近任务</h2></div><button className="text-link">打开队列 <ArrowUpRight size={13} /></button></div><div className="activity-list">{queue.slice(0, 3).map((item) => <div className="activity-item" key={item.id}><div className={`activity-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="activity-copy"><strong>{item.title}</strong><span>{item.id} · {item.meta}</span></div><div className="activity-state"><StatusLabel status={item.status} /><small>{item.time}</small></div></div>)}</div></div><div className="health-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">服务状态</span><h2>本地运行健康度</h2></div><span className="healthy-pill"><span />正常</span></div><div className="health-content"><div className="health-ring"><div><strong>98</strong><span>健康分</span></div></div><div className="health-list"><HealthRow label="本地任务引擎" value="运行中" tone="good" /><HealthRow label="本地数据库" value="已连接" tone="good" /><HealthRow label="合规引擎" value="待命" tone="idle" /><HealthRow label="工作区" value="2.4 GB / 20 GB" tone="good" /></div></div></div></section>
+    <section className="bottom-grid"><div className="activity-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">活动</span><h2>最近任务</h2></div><button className="text-link">打开队列 <ArrowUpRight size={13} /></button></div><div className="activity-list">{queue.slice(0, 3).map((item) => <div className="activity-item" key={item.id}><div className={`activity-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="activity-copy"><strong>{item.title}</strong><span>{item.id} · {item.meta}</span></div><div className="activity-state"><StatusLabel status={item.status} /><small>{item.time}</small></div></div>)}{queue.length === 0 && <div className="empty-state">暂无任务记录</div>}</div></div><div className="health-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">服务状态</span><h2>本地运行健康度</h2></div><span className={`healthy-pill ${serviceOnline ? '' : 'offline'} `}><span />{serviceOnline ? '正常' : '未连接'}</span></div><div className="health-content"><div className="health-ring" style={{ '--health-score': `${healthScore}%` } as React.CSSProperties}><div><strong>{statsLoading ? '...' : healthScore}</strong><span>健康分</span></div></div><div className="health-list"><HealthRow label="本地任务引擎" value={serviceOnline ? '运行中' : '未连接'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="本地数据" value={serviceOnline ? '已就绪' : '不可用'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="工作区" value={storageText + (stats?.storageTotalGb ? ` / ${stats.storageTotalGb} GB` : '')} tone={stats?.storageUsedGb === undefined ? 'idle' : 'good'} /></div></div></div></section>
   </div>
 }
 
@@ -558,46 +701,46 @@ function HealthRow({ label, value, tone }: { label: string; value: string; tone:
   return <div className="health-row"><span><i className={`health-dot ${tone}`} />{displayLabel}</span><strong>{displayValue}</strong></div>
 }
 
-function QueuePage({ queue, setQueue, onRefresh, onCancel }: { queue: typeof queueSeed; setQueue: Dispatch<SetStateAction<typeof queueSeed>>; onRefresh: () => Promise<void>; onCancel: (jobId: string) => Promise<void> }) {
-  const [filter, setFilter] = useState<'全部' | 'running' | 'review' | 'failed'>('全部')
+type QueueFilter = '全部' | 'running' | 'review' | 'failed'
+
+function QueueFilterBar({ queue, filter, setFilter, search, setSearch }: { queue: QueueItem[]; filter: QueueFilter; setFilter: (value: QueueFilter) => void; search: string; setSearch: (value: string) => void }) {
+  return <div className="queue-toolbar panel"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{queue.length}</span></button><button className={filter === 'running' ? 'active' : ''} onClick={() => setFilter('running')}>运行中 <span>{queue.filter((item) => item.status === 'running').length}</span></button><button className={filter === 'review' ? 'active' : ''} onClick={() => setFilter('review')}>待复核 <span>{queue.filter((item) => item.status === 'review').length}</span></button><button className={filter === 'failed' ? 'active' : ''} onClick={() => setFilter('failed')}>失败 <span>{queue.filter((item) => item.status === 'failed').length}</span></button></div><div className="queue-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务名称或编号" /></div></div>
+}
+
+function QueuePage({ queue, setQueue, onRefresh, onCancel }: { queue: QueueItem[]; setQueue: Dispatch<SetStateAction<QueueItem[]>>; onRefresh: () => Promise<void>; onCancel: (jobId: string) => Promise<void> }) {
+  const [filter, setFilter] = useState<QueueFilter>('全部')
   const [search, setSearch] = useState('')
   const visible = queue.filter((item) => (filter === '全部' || item.status === filter) && (!search.trim() || `${item.title}${item.id}${item.meta}`.toLowerCase().includes(search.trim().toLowerCase())))
+  if (visible.length === 0) return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions"><button className="button button-ghost" onClick={() => void onRefresh()}><RefreshCw size={16} />刷新</button><button className="button button-primary" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}><Plus size={16} />创建任务</button></div></section><QueueFilterBar queue={queue} filter={filter} setFilter={setFilter} search={search} setSearch={setSearch} /><div className="empty-state panel">暂无任务记录</div></div>
   return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions"><button className="button button-ghost" onClick={() => void onRefresh()}><RefreshCw size={16} />刷新</button><button className="button button-primary" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}><Plus size={16} />创建任务</button></div></section><div className="queue-toolbar panel"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{queue.length}</span></button><button className={filter === 'running' ? 'active' : ''} onClick={() => setFilter('running')}>运行中 <span>{queue.filter((item) => item.status === 'running').length}</span></button><button className={filter === 'review' ? 'active' : ''} onClick={() => setFilter('review')}>待复核 <span>{queue.filter((item) => item.status === 'review').length}</span></button><button className={filter === 'failed' ? 'active' : ''} onClick={() => setFilter('failed')}>失败 <span>{queue.filter((item) => item.status === 'failed').length}</span></button></div><div className="queue-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务名称或编号" /></div></div><div className="queue-list panel">{visible.map((item) => <div className="queue-row" key={item.id}><div className={`queue-status-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="queue-main"><div className="queue-title-line"><strong>{item.title}</strong><span className="mono">{item.id}</span></div><span>{item.meta}</span><div className="progress-track"><i className={item.status} style={{ width: `${item.progress}%` }} /></div></div><div className="queue-progress"><strong>{item.progress}%</strong><span>{item.time}</span></div><StatusLabel status={item.status} />{(item.status === 'queued' || item.status === 'running') ? <button className="icon-button subtle" title="取消任务" onClick={() => void onCancel(item.id)}><Square size={15} /></button> : <button className="icon-button subtle" title="更多操作"><MoreHorizontal size={17} /></button>}</div>)}</div><div className="queue-footnote"><CircleHelp size={15} />生图接口超时会进入“待确认”，不会自动重复计费请求。</div></div>
 }
 
 function GalleryPage({ assets }: { assets: GalleryAsset[] }) {
   const [filter, setFilter] = useState('全部')
-  const source = assets.length ? assets : galleryImages
+  if (assets.length === 0) return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />本地资产</div><h1>生成画廊</h1><p>浏览最近产物，按任务结果查看本地文件。</p></div></section><div className="empty-state panel">暂无生成结果</div></div>
+  const source = assets
   const visible = filter === '全部' ? source : source.filter((item) => item.tag === filter)
   return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />本地资产</div><h1>生成画廊</h1><p>浏览最近产物，按合规状态快速筛选和打开本地文件。</p></div><div className="heading-actions"><button className="button button-ghost"><FolderOpen size={16} />打开输出目录</button><button className="button button-primary"><DownloadIcon />导入资产</button></div></section><div className="gallery-toolbar"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{source.length}</span></button><button className={filter === 'PASS' ? 'active' : ''} onClick={() => setFilter('PASS')}>可用 <span>{source.filter((item) => item.tag === 'PASS').length}</span></button><button className={filter === 'REVIEW' ? 'active' : ''} onClick={() => setFilter('REVIEW')}>待复核 <span>{source.filter((item) => item.tag === 'REVIEW').length}</span></button><button className={filter === 'BLOCK' ? 'active' : ''} onClick={() => setFilter('BLOCK')}>高风险 <span>{source.filter((item) => item.tag === 'BLOCK').length}</span></button></div><div className="gallery-view-toggle"><button className="active" title="网格视图"><LayoutGrid size={16} /></button><button title="列表视图"><ListChecks size={16} /></button></div></div><div className="gallery-grid">{visible.map((image) => <article className="gallery-card" key={`${image.title}-${image.src}`}><div className="gallery-image"><img src={image.src} alt={image.title} /><span className={`gallery-tag ${image.tone}`}>{statusNames[image.tag] ?? image.tag}</span><button className="image-more" title="更多操作"><MoreHorizontal size={17} /></button></div><div className="gallery-card-body"><strong>{image.title}</strong><span>{assets.length ? '本地任务结果' : '演示资产 · 4K 四宫格'}</span></div></article>)}</div></div>
 }
 
-function PromptsPage({ selectedPrompt, setSelectedPrompt }: { selectedPrompt: string; setSelectedPrompt: (value: string) => void }) {
+function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPrompt }: { prompts: PromptItem[]; loading: boolean; error: string; selectedPrompt: string; setSelectedPrompt: (value: string) => void }) {
   const [search, setSearch] = useState('')
   const [category, setCategory] = useState('全部提示词')
-  const categoryCounts = useMemo(() => builtinPrompts.reduce<Record<string, number>>((counts, item) => ({ ...counts, [item.category]: (counts[item.category] ?? 0) + 1 }), {}), [])
-  const categories = ['全部提示词', ...Array.from(new Set(builtinPrompts.map((item) => item.category)))]
-  const filtered = builtinPrompts.filter((item) => {
+  const categories = ['全部提示词', ...Array.from(new Set(prompts.map((item) => item.category)))]
+  const filtered = prompts.filter((item) => {
     const matchesCategory = category === '全部提示词' || item.category === category
     const query = search.trim().toLowerCase()
     return matchesCategory && (!query || `${item.title}${item.category}${item.text}`.toLowerCase().includes(query))
   })
-  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>已内置参考软件 v2.3.9 的 79 条非空生成提示词，可直接用于工作台。</p></div><button className="button button-primary"><Plus size={16} />新建提示词</button></section><div className="prompt-toolbar"><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" /></div><button className="button button-ghost"><SlidersHorizontal size={16} />筛选</button><button className="button button-ghost"><Archive size={16} />导入库</button></div><div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? builtinPrompts.length : categoryCounts[item] ?? 0}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => <article className={`prompt-card panel ${selectedPrompt === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedPrompt(item.id)}><div className="prompt-card-top"><span className="category-chip">{item.category}</span><button className="icon-button subtle" title="更多操作"><MoreHorizontal size={16} /></button></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.layout === 'four_up' ? '4K 四宫格' : item.layout === 'fifteen_up_test' ? '4K 十五宫格测试' : '两宫格'} · 内置</span>{selectedPrompt === item.id ? <span className="selected-label"><Check size={13} />已选中</span> : <button className="text-link">用于工作台 <ArrowUpRight size={13} /></button>}</div></article>)}</div></div></div>
+  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>提示词由本地服务初始化并从数据库读取。</p></div></section><div className="prompt-toolbar"><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" /></div></div>{error && <div className="form-error" role="status"><AlertTriangle size={14} />{error}</div>}{loading ? <div className="empty-state">提示词加载中…</div> : filtered.length === 0 ? <div className="empty-state">暂无可用提示词</div> : <div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? prompts.length : prompts.filter((prompt) => prompt.category === item).length}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => <article className={`prompt-card panel ${selectedPrompt === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedPrompt(item.id)}><div className="prompt-card-top"><span className="category-chip">{item.category}</span></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.layout === 'four_up' ? '4K 四宫格' : item.layout === 'fifteen_up_test' ? '4K 十五宫格测试' : '两宫格'} · 后端初始化</span>{selectedPrompt === item.id && <span className="selected-label"><Check size={13} />已选中</span>}</div></article>)}</div></div>}</div>
 }
 
-function CompliancePage() {
-  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />风险控制</div><h1>合规中心</h1><p>在图片进入裁切和上架前，集中查看初筛结果和人工复核项。</p></div><div className="heading-actions"><button className="button button-ghost"><DownloadIcon />导出报告</button><button className="button button-primary"><ShieldCheck size={16} />开始复核</button></div></section><div className="compliance-metrics"><div className="compliance-stat pass"><span><CheckCircle2 size={16} />可用</span><strong>18</strong><small>低风险，可进入裁切</small></div><div className="compliance-stat review"><span><Clock3 size={16} />待复核</span><strong>04</strong><small>需要人工确认</small></div><div className="compliance-stat block"><span><AlertTriangle size={16} />高风险</span><strong>02</strong><small>高风险，禁止使用</small></div><div className="compliance-stat unknown"><span><CircleHelp size={16} />待确认</span><strong>01</strong><small>模型返回不完整</small></div></div><div className="compliance-layout"><div className="review-table panel"><div className="panel-heading compact"><div><span className="section-kicker">待处理</span><h2>人工复核清单</h2></div><div className="table-actions"><button className="icon-button subtle" title="刷新"><RefreshCw size={16} /></button><button className="icon-button subtle" title="筛选"><SlidersHorizontal size={16} /></button></div></div><div className="table-head"><span>资产</span><span>风险等级</span><span>命中项</span><span>时间</span><span /></div>{galleryImages.filter((image) => image.tag !== 'PASS').map((image, index) => <div className="table-row" key={image.title}><div className="table-asset"><img src={image.src} alt="" /><div><strong>{image.title}</strong><span>run_20260830_00{index + 1}</span></div></div><span className={`risk-pill ${image.tone}`}>{statusNames[image.tag] ?? image.tag}</span><span className="hit-copy">{image.tag === 'BLOCK' ? '品牌/字符疑似命中' : '文字可读性 · 需确认'}</span><span className="table-time">10:{32 - index * 4}</span><button className="button button-small button-ghost">查看</button></div>)}</div><div className="compliance-side panel"><div className="panel-heading compact"><div><span className="section-kicker">策略</span><h2>当前筛查设置</h2></div><button className="icon-button subtle" title="编辑策略"><Settings2 size={16} /></button></div><div className="policy-list"><PolicyRow label="预检" value="已开启" enabled /><PolicyRow label="后检" value="已关闭" enabled={false} /><PolicyRow label="文字识别" value="已开启" enabled /><PolicyRow label="视觉审核模型" value="轻量模式" enabled /><PolicyRow label="高风险阈值" value="70 分" enabled /></div><div className="policy-note"><ShieldCheck size={15} /><span>合规结果是风险初筛，不替代人工版权判断。</span></div></div></div></div>
-}
-
-function PolicyRow({ label, value, enabled }: { label: string; value: string; enabled: boolean }) {
-  return <div className="policy-row"><span><i className={`health-dot ${enabled ? 'good' : 'idle'}`} />{label}</span><strong>{value}</strong></div>
-}
-
-function SettingsModal({ config, onSave, onClose }: { config: ChannelConfig; onSave: (config: ChannelConfig) => void; onClose: () => void }) {
+function SettingsModal({ config, onSave, onClose }: { config: ChannelConfig; onSave: (config: ChannelConfig) => Promise<void>; onClose: () => void }) {
   const [draft, setDraft] = useState(config)
   const [showKey, setShowKey] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
 
   const updateDraft = (patch: Partial<ChannelConfig>) => {
     setSaved(false)
@@ -605,7 +748,8 @@ function SettingsModal({ config, onSave, onClose }: { config: ChannelConfig; onS
     setDraft((current) => ({ ...current, ...patch }))
   }
 
-  const handleSave = () => {
+  const handleSave = async () => {
+    if (saving) return
     if (!draft.baseUrl.trim() || !draft.apiKey.trim()) {
       setError('请填写接口地址和 API Key。')
       return
@@ -617,9 +761,15 @@ function SettingsModal({ config, onSave, onClose }: { config: ChannelConfig; onS
       setError('接口地址需填写完整的 http:// 或 https:// 地址。')
       return
     }
-    // 原型阶段先更新本地状态；接入 FastAPI 后由同名动作写入 SQLite。
-    onSave(draft)
-    setSaved(true)
+    setSaving(true)
+    try {
+      await onSave(draft)
+      setSaved(true)
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Provider 配置保存失败')
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -641,11 +791,11 @@ function SettingsModal({ config, onSave, onClose }: { config: ChannelConfig; onS
             </div>
             <div className="setting-field">
               <label htmlFor="channel-api-key">API Key</label>
-              <div className="secret-input">
-                <input id="channel-api-key" type={showKey ? 'text' : 'password'} value={draft.apiKey} onChange={(event) => updateDraft({ apiKey: event.target.value })} placeholder="输入当前通道的 API Key" autoComplete="off" />
+      <div className="secret-input">
+                <input id="channel-api-key" className={showKey ? 'api-key-input' : 'api-key-input masked'} type="text" value={draft.apiKey} onChange={(event) => updateDraft({ apiKey: event.target.value })} placeholder="输入当前通道的 API Key" autoComplete="off" />
                 <button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API Key' : '显示 API Key'} aria-label={showKey ? '隐藏 API Key' : '显示 API Key'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button>
               </div>
-              <span className="field-help">密钥仅在本地服务调用时使用，不展示在任务、日志或导出文件中。</span>
+              <span className="field-help">密钥仅保存到本地服务配置表并用于 Provider 调用，不展示在任务、日志或导出文件中。</span>
             </div>
             {error && <div className="form-error" role="alert"><AlertTriangle size={14} />{error}</div>}
           </div>
@@ -661,7 +811,7 @@ function SettingsModal({ config, onSave, onClose }: { config: ChannelConfig; onS
         <div className="modal-footer">
           <span className={`save-feedback ${saved ? 'visible' : ''}`} role="status">{saved ? <><CheckCircle2 size={14} />已保存到本地配置</> : '修改后点击保存'}</span>
           <button className="button button-ghost" onClick={onClose}>取消</button>
-          <button className="button button-primary" onClick={handleSave}><Check size={16} />保存设置</button>
+          <button className="button button-primary" onClick={() => void handleSave()} disabled={saving}><Check size={16} />{saving ? '保存中…' : '保存设置'}</button>
         </div>
       </div>
     </div>
