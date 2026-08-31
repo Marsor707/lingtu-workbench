@@ -1,0 +1,34 @@
+{
+  "name": "lingtu-local-workbench",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "build:all": "npm run build && npm run backend:build",
+    "build:desktop": "npm run build:all && npm run backend:sidecar",
+    "preview": "vite preview",
+    "tauri": "cargo tauri",
+    "backend:build": "tsc -p tsconfig.server.json",
+    "backend:sidecar": "node scripts/build-sidecar.mjs",
+    "backend:dev": "npm run backend:build && node --watch dist-server/index.js",
+    "backend:test": "npm run backend:build && node --test server/index.test.mjs server/provider.test.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@vitejs/plugin-react": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6"
+  }
+}

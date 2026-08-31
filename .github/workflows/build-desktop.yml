@@ -1,0 +1,64 @@
+name: 构建桌面安装包
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: ${{ matrix.os }} 桌面包
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            bundle: app,dmg
+            target: aarch64-apple-darwin
+          - os: macos-13
+            bundle: app,dmg
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            bundle: nsis
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 安装 Tauri CLI
+        run: npm install --no-save --no-package-lock '@tauri-apps/cli@^2'
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 测试后端
+        run: npm run backend:test
+
+      - name: 构建桌面资源
+        env:
+          TAURI_TARGET: ${{ matrix.target }}
+        run: npm run build:desktop
+
+      - name: 构建 Tauri 安装包
+        env:
+          TAURI_TARGET: ${{ matrix.target }}
+        run: npx --no-install tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundle }}
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: lingtu-${{ matrix.os }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/**
+          if-no-files-found: error

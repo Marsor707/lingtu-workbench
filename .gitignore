@@ -1,0 +1,44 @@
+# Node / Vite
+node_modules/
+dist/
+dist-server/
+.sidecar-build/
+.vite/
+*.tsbuildinfo
+
+# Local test and tooling state
+.playwright-cli/
+.tmp/
+coverage/
+
+# macOS / editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python sidecar/runtime caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local application data and generated output
+*.db
+*.sqlite
+*.sqlite3
+*.log
+workspace/
+output/
+data/
+!src/data/
+!src/data/builtin-prompts.ts
+
+# Tauri sidecar 二进制由各平台 CI 构建生成
+src-tauri/binaries/
