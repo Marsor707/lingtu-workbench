@@ -35,8 +35,13 @@ writeFileSync(configPath, JSON.stringify({
 execFileSync(process.execPath, ['--experimental-sea-config', configPath], { stdio: 'inherit' })
 if (process.platform === 'darwin') {
   const architecture = target.startsWith('aarch64-') ? 'arm64' : 'x86_64'
-  // Universal Node 包含两个 SEA fuse；先裁成目标架构再注入，避免 postject 命中多个位置。
-  execFileSync('lipo', ['-thin', architecture, process.execPath, '-output', executablePath], { stdio: 'inherit' })
+  // 只有 Universal Node 才需要裁剪；CI 的 Node 通常已是单一架构，直接复制即可。
+  const nodeArchitectures = execFileSync('lipo', ['-archs', process.execPath], { encoding: 'utf8' }).trim().split(/\s+/)
+  if (nodeArchitectures.length > 1) {
+    execFileSync('lipo', ['-thin', architecture, process.execPath, '-output', executablePath], { stdio: 'inherit' })
+  } else {
+    cpSync(process.execPath, executablePath, { force: true })
+  }
 } else {
   cpSync(process.execPath, executablePath, { force: true })
 }

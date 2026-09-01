@@ -332,7 +332,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         providerStage = 'materialize'
         const imageBytes = await materializeImageResult(result, runtime.controller.signal)
         appendExecutionLog(workspaceDir, 'provider_result_materialized', { jobId: id, itemIndex: results.length, resultKind: result.kind, bytes: imageBytes.byteLength, durationMs: Date.now() - requestStartedAt })
-        const index = results.length; const relativePath = join(RESULTS_DIRECTORY, `${id}-${String(index + 1).padStart(3, '0')}.png`); writeFileSync(join(workspaceDir, relativePath), imageBytes); results.push({ path: relativePath, index })
+        const index = results.length; const relativePath = join(RESULTS_DIRECTORY, `${id}-${String(index + 1).padStart(3, '0')}.png`).replaceAll('\\', '/'); writeFileSync(join(workspaceDir, relativePath), imageBytes); results.push({ path: relativePath, index })
         providerStage = undefined
         const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) return
         emit(id, 'progress', { completed: index + 1, total, result: results[index], job: current })
