@@ -136,7 +136,6 @@ jobs:
             release-assets/**/*.dmg
             release-assets/**/*.exe
             release-assets/**/*.zip
-            release-assets/**/*.tar.gz
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
