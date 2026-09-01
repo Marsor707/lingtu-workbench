@@ -6,23 +6,37 @@ on:
     tags:
       - 'v*'
 
+# 避免同一分支或标签的重复构建占用 runner。
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   build:
-    name: ${{ matrix.os }} 桌面包
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - name: macOS ARM64
+            os: macos-14
             bundle: app,dmg
             target: aarch64-apple-darwin
-          - os: macos-13
+            artifact: lingtu-macos-arm64
+          - name: macOS x64
+            os: macos-13
             bundle: app,dmg
             target: x86_64-apple-darwin
-          - os: windows-2022
+            artifact: lingtu-macos-x64
+          - name: Windows x64
+            os: windows-2022
             bundle: nsis
             target: x86_64-pc-windows-msvc
+            artifact: lingtu-windows-x64
 
     steps:
       - name: 检出源码
@@ -34,23 +48,27 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存 Rust 构建
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
       - name: 安装前端依赖
         run: npm ci
 
       - name: 安装 Tauri CLI
         run: npm install --no-save --no-package-lock '@tauri-apps/cli@^2'
 
-      - name: 安装 Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: 测试后端
         run: npm run backend:test
 
-      - name: 构建桌面资源
-        env:
-          TAURI_TARGET: ${{ matrix.target }}
-        run: npm run build:desktop
-
+      # build:desktop 会按 TAURI_TARGET 生成对应架构的 Node sidecar；
+      # tauri build 随后执行 tauri.conf.json 中的 beforeBuildCommand。
       - name: 构建 Tauri 安装包
         env:
           TAURI_TARGET: ${{ matrix.target }}
@@ -59,6 +77,37 @@ jobs:
       - name: 上传安装包
         uses: actions/upload-artifact@v4
         with:
-          name: lingtu-${{ matrix.os }}
+          name: ${{ matrix.artifact }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/**
           if-no-files-found: error
+          retention-days: 14
+
+  # 只有版本 tag 才创建 Release；workflow_dispatch 仍可用于验证构建并下载 artifact。
+  release:
+    name: 发布 GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 下载全部平台安装包
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/**/*.dmg
+            release-assets/**/*.exe
+            release-assets/**/*.msi
+            release-assets/**/*.zip
+            release-assets/**/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
