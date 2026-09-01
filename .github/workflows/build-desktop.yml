@@ -127,7 +127,6 @@ jobs:
           files: |
             release-assets/**/*.dmg
             release-assets/**/*.exe
-            release-assets/**/*.msi
             release-assets/**/*.zip
             release-assets/**/*.tar.gz
           generate_release_notes: true
