@@ -211,7 +211,7 @@ async function encodeFile(file: File): Promise<string> {
 }
 
 const modes: Array<{ id: Mode; label: string; detail: string }> = [
-  { id: 'generate', label: '正常生图', detail: '批量输入 · 多模板生产' },
+  { id: 'generate', label: '正常生图', detail: '提示词模板 · 快速生产' },
   { id: 'edit', label: '改图', detail: '单图附件 · 定向修改' },
   { id: 'text', label: '文生图', detail: '无附件 · 独立尺寸' },
   { id: 'one-to-many', label: '一裂多', detail: '一张源图 · 多方向变体' },
@@ -818,7 +818,8 @@ function Workbench(props: WorkbenchProps) {
           {modes.map((item) => <button key={item.id} className={`mode-tab ${mode === item.id ? 'active' : ''}`} onClick={() => setMode(item.id)} role="tab" aria-selected={mode === item.id}><span>{item.label}</span><small>{item.detail}</small></button>)}
         </div>
 
-        {mode !== 'text' && <div className="field-block"><div className="field-label"><label htmlFor="source-input">{mode === 'edit' ? '源图附件' : mode === 'one-to-many' ? '裂变源图' : '输入文件夹'}</label><span className="field-required">必填</span></div><div className={`dropzone ${inputName !== '未选择输入文件夹' ? 'has-file' : ''}`}><input id="source-input" type="file" hidden accept="image/*" multiple={mode !== 'edit'} onChange={(event) => { const file = event.target.files?.[0]; if (mode === 'edit') { if (!file) { setSourceFile(null); setInputName('未选择源图'); return }; if (!SOURCE_IMAGE_TYPES.has(file.type) || file.size > MAX_SOURCE_IMAGE_BYTES) { setSourceFile(null); setInputName('源图需为 PNG / JPG / WEBP 且不超过 8 MB'); return }; setSourceFile(file); setInputName(file.name); return }; setInputName(event.target.files?.length ? `${event.target.files.length} 个文件已选择` : '未选择输入文件夹') }} /><div className="dropzone-icon"><CloudUpload size={19} /></div><div className="dropzone-copy"><strong>{inputName}</strong><span>{mode === 'edit' ? '支持 PNG / JPG / WEBP，单张不超过 8 MB' : '拖拽图片至此，或点击选择本地文件夹'}</span></div><label className="button button-small button-dark" htmlFor="source-input"><Upload size={14} />选择</label></div></div>}
+        {/* 普通生图只提交提示词和高级参数；源图输入仅用于改图与一裂多。 */}
+        {(mode === 'edit' || mode === 'one-to-many') && <div className="field-block"><div className="field-label"><label htmlFor="source-input">{mode === 'edit' ? '源图附件' : '裂变源图'}</label><span className="field-required">必填</span></div><div className={`dropzone ${inputName !== '未选择输入文件夹' ? 'has-file' : ''}`}><input id="source-input" type="file" hidden accept="image/*" multiple={mode !== 'edit'} onChange={(event) => { const file = event.target.files?.[0]; if (mode === 'edit') { if (!file) { setSourceFile(null); setInputName('未选择源图'); return }; if (!SOURCE_IMAGE_TYPES.has(file.type) || file.size > MAX_SOURCE_IMAGE_BYTES) { setSourceFile(null); setInputName('源图需为 PNG / JPG / WEBP 且不超过 8 MB'); return }; setSourceFile(file); setInputName(file.name); return }; setInputName(event.target.files?.length ? `${event.target.files.length} 个文件已选择` : '未选择输入文件夹') }} /><div className="dropzone-icon"><CloudUpload size={19} /></div><div className="dropzone-copy"><strong>{inputName}</strong><span>{mode === 'edit' ? '支持 PNG / JPG / WEBP，单张不超过 8 MB' : '拖拽图片至此，或点击选择本地图片'}</span></div><label className="button button-small button-dark" htmlFor="source-input"><Upload size={14} />选择</label></div></div>}
 
         {mode === 'text' && <div className="field-block"><div className="field-label"><label htmlFor="text-prompt">创作描述</label><span className="field-required">必填</span></div><textarea id="text-prompt" className="prompt-editor" value={textPrompt} onChange={(event) => setTextPrompt(event.target.value)} /></div>}
 
