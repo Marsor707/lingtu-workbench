@@ -23,7 +23,7 @@
 
 ## 本地开发
 
-需要 Node.js 24+ 和 npm。后端使用 Node 的环境代理支持读取 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`。
+需要 Node.js 24+ 和 npm。后端使用 Node 的环境代理支持读取 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`；Windows/macOS 桌面版在对应环境变量未设置时还会读取当前用户的系统代理，因此 Clash Verge 等工具开启“系统代理”后无需手工配置环境变量。代理在应用启动时读取，修改 Clash 代理端口后需重启灵图工作台。
 
 Provider 建议由后端进程读取灵图项目环境变量，不需要用户在页面中修改端点：
 

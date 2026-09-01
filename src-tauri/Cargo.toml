@@ -1,6 +1,6 @@
 [package]
 name = "lingtu-workbench"
-version = "1.0.0"
+version = "1.0.1"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
@@ -24,3 +24,6 @@ log = "0.4"
 tauri = { version = "2.11.3", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 tauri-plugin-shell = "2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
