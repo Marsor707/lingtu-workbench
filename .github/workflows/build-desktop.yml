@@ -2,6 +2,12 @@ name: 构建桌面安装包
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 发布到已有标签（留空则仅构建 artifact）
+        required: false
+        default: ''
+        type: string
   push:
     tags:
       - 'v*'
@@ -105,10 +111,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # 只有版本 tag 才创建 Release；workflow_dispatch 仍可用于验证构建并下载 artifact。
+  # 版本 tag 或带 release_tag 的手动运行才创建 Release；留空时手动运行仅验证构建。
   release:
     name: 发布 GitHub Release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -129,6 +137,7 @@ jobs:
             release-assets/**/*.exe
             release-assets/**/*.zip
             release-assets/**/*.tar.gz
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           generate_release_notes: true
           fail_on_unmatched_files: true
         env:
