@@ -73,6 +73,7 @@ type QueueItem = {
   status: QueueStatus
   progress: number
   time: string
+  resultCount?: number
   error?: string
 }
 
@@ -81,6 +82,7 @@ type GalleryAsset = {
   title: string
   tag: string
   tone: string
+  jobId?: string
 }
 
 type ApiJob = {
@@ -111,8 +113,26 @@ type ApiErrorBody = {
 }
 
 const LOCAL_API_BASE = 'http://127.0.0.1:8765'
+const SELECTED_PROMPT_STORAGE_KEY = 'lingtu-selected-prompt'
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024
 const SOURCE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
+
+function readStoredPromptId(): string {
+  try {
+    return window.localStorage.getItem(SELECTED_PROMPT_STORAGE_KEY)?.trim() ?? ''
+  } catch {
+    // 浏览器禁用本地存储时仍允许当前会话选择模板。
+    return ''
+  }
+}
+
+function storePromptId(id: string): void {
+  try {
+    window.localStorage.setItem(SELECTED_PROMPT_STORAGE_KEY, id)
+  } catch {
+    // 无痕模式等场景可能禁用存储，不影响当前页面使用。
+  }
+}
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
@@ -154,9 +174,10 @@ function assetsFromJob(job: ApiJob): GalleryAsset[] {
   const modeLabel = modes.find((item) => item.id === (job.mode === 'text_to_image' ? 'text' : job.mode))?.label ?? '生图'
   return job.results.map((result) => ({
     src: `${LOCAL_API_BASE}/api/jobs/${encodeURIComponent(job.id)}/results/${result.index}`,
-    title: `${modeLabel} · ${job.id.slice(-8)}`,
+    title: `${modeLabel} · ${job.id.slice(-8)} · ${String(result.index + 1).padStart(2, '0')}`,
     tag: 'PASS',
     tone: 'pass',
+    jobId: job.id,
   }))
 }
 
@@ -184,7 +205,7 @@ function App() {
   const [prompts, setPrompts] = useState<PromptItem[]>([])
   const [promptsLoading, setPromptsLoading] = useState(true)
   const [promptsError, setPromptsError] = useState('')
-  const [selectedPrompt, setSelectedPrompt] = useState<PromptSelection>('')
+  const [selectedPrompt, setSelectedPrompt] = useState<PromptSelection>(() => readStoredPromptId())
   const [textPrompt, setTextPrompt] = useState('')
   const [layout, setLayout] = useState('4K 四宫格')
   const [size, setSize] = useState('3840 × 2160')
@@ -195,6 +216,7 @@ function App() {
   const [promptWindows, setPromptWindows] = useState<PromptWindow[]>([])
   const [queue, setQueue] = useState<QueueItem[]>([])
   const [galleryAssets, setGalleryAssets] = useState<GalleryAsset[]>([])
+  const [galleryJobId, setGalleryJobId] = useState<string | null>(null)
   const [stats, setStats] = useState<DashboardStats | null>(null)
   const [statsLoading, setStatsLoading] = useState(true)
   const [statsError, setStatsError] = useState('')
@@ -245,8 +267,12 @@ function App() {
         setPrompts(items)
         if (items.length > 0) {
           const first = items.find((item) => item.layout.includes('four') || item.layout.includes('四')) ?? items[0]
-          setSelectedPrompt(first.id)
-          setTextPrompt(first.text)
+          const storedId = readStoredPromptId()
+          const selectedId = items.some((item) => item.id === storedId) ? storedId : first.id
+          const selectedItem = items.find((item) => item.id === selectedId) ?? first
+          setSelectedPrompt(selectedId)
+          setTextPrompt(selectedItem.text)
+          storePromptId(selectedId)
           setPromptWindows(items.slice(0, 2).map((item, index) => ({ id: index + 1, name: item.title, prompt: item.text, enabled: true })))
         } else {
           setSelectedPrompt('')
@@ -313,6 +339,7 @@ function App() {
   const handlePromptSelect = (id: PromptSelection) => {
     const item = prompts.find((prompt) => prompt.id === id)
     setSelectedPrompt(id)
+    storePromptId(id)
     if (item) setTextPrompt(item.text)
   }
 
@@ -367,6 +394,7 @@ function App() {
       status,
       progress,
       time,
+      resultCount: Array.isArray(job.results) ? job.results.length : undefined,
       ...(job.error?.message ? { error: job.error.message } : {}),
     }
     setQueue((items) => [item, ...items.filter((existing) => existing.id !== job.id)])
@@ -410,6 +438,7 @@ function App() {
           status,
           progress,
           time: job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : job.status === 'cancelled' ? '已取消' : '进行中',
+          resultCount: Array.isArray(job.results) ? job.results.length : undefined,
           ...(job.error?.message ? { error: job.error.message } : {}),
         } satisfies QueueItem
       }))
@@ -440,6 +469,17 @@ function App() {
     } catch {
       setSubmitError('取消任务失败，请检查本地服务状态')
     }
+  }
+
+  const openJobResults = (jobId: string) => {
+    // 任务结果通过画廊统一查看，并保留任务 ID 作为可见筛选上下文。
+    setGalleryJobId(jobId)
+    setPage('gallery')
+  }
+
+  const navigateTo = (nextPage: Page) => {
+    if (nextPage !== 'gallery') setGalleryJobId(null)
+    setPage(nextPage)
   }
 
   useEffect(() => {
@@ -570,7 +610,7 @@ function App() {
         <nav className="main-nav" aria-label="主导航">
           {navItems.map((item) => {
             const Icon = item.icon
-            return <button key={item.id} className={`nav-item ${page === item.id ? 'active' : ''}`} onClick={() => setPage(item.id)} title={item.label}>
+            return <button key={item.id} className={`nav-item ${page === item.id ? 'active' : ''}`} onClick={() => navigateTo(item.id)} title={item.label}>
               <Icon size={18} strokeWidth={1.8} /><span>{sidebarOpen && item.label}</span>{sidebarOpen && item.badge && <span className="nav-badge">{item.badge}</span>}
             </button>
           })}
@@ -591,9 +631,9 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFile={sourceFile} setSourceFile={setSourceFile} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} channelConfig={channelConfig} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={setPage} />}
-        {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={refreshQueue} onCancel={cancelJob} onCreate={() => { setPage('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} />}
-        {page === 'gallery' && <GalleryPage assets={galleryAssets} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFile={sourceFile} setSourceFile={setSourceFile} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} channelConfig={channelConfig} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
+        {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={refreshQueue} onCancel={cancelJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
+        {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} />}
       </main>
 
@@ -642,10 +682,11 @@ type WorkbenchProps = {
   submitError: string
   onRefresh: () => Promise<void>
   onNavigate: (page: Page) => void
+  onViewResults: (jobId: string) => void
 }
 
 function Workbench(props: WorkbenchProps) {
-  const { mode, setMode, activeMode, layout, setLayout, size, setSize, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFile, setSourceFile, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, channelConfig, submitError, onRefresh, onNavigate } = props
+  const { mode, setMode, activeMode, layout, setLayout, size, setSize, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFile, setSourceFile, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, channelConfig, submitError, onRefresh, onNavigate, onViewResults } = props
   const [showAdvanced, setShowAdvanced] = useState(true)
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -721,7 +762,7 @@ function Workbench(props: WorkbenchProps) {
       <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div aria-hidden="true" /></div><div className={`layout-preview ${layout.includes('二宫格') ? 'layout-two' : layout.includes('十五') ? 'layout-fifteen' : ''}`}><div className="preview-cell cell-a"><span>A</span><small>主视觉区域</small></div><div className="preview-cell cell-b"><span>B</span><small>卖点信息区域</small></div>{layout.includes('四宫格') && <><div className="preview-cell cell-c"><span>C</span><small>细节变体</small></div><div className="preview-cell cell-d"><span>D</span><small>场景变体</small></div></>}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{size.replace(' × ', ':')}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link" onClick={() => onNavigate('gallery')}>查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryAssets.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={`打开 ${image.title}`} aria-label={`打开 ${image.title}`} onClick={() => openRecentAsset(image)}><img src={image.src} alt={image.title} /><span className={`mini-status ${image.tone}`} /></button>)}{galleryAssets.length === 0 && <span className="empty-inline">暂无生成结果</span>}</div></div></div>
     </section>
 
-    <section className="bottom-grid"><div className="activity-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">活动</span><h2>最近任务</h2></div><button className="text-link" onClick={() => onNavigate('queue')}>打开队列 <ArrowUpRight size={13} /></button></div><div className="activity-list">{queue.slice(0, 3).map((item) => <div className="activity-item" key={item.id}><div className={`activity-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="activity-copy"><strong>{item.title}</strong><span>{item.id} · {item.meta}</span></div><div className="activity-state"><StatusLabel status={item.status} /><small>{item.time}</small></div></div>)}{queue.length === 0 && <div className="empty-state">暂无任务记录</div>}</div></div><div className="health-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">服务状态</span><h2>本地运行健康度</h2></div><span className={`healthy-pill ${serviceOnline ? '' : 'offline'} `}><span />{serviceOnline ? '正常' : '未连接'}</span></div><div className="health-content"><div className="health-ring" style={{ '--health-score': `${healthScore}%` } as React.CSSProperties}><div><strong>{statsLoading ? '...' : healthScore}</strong><span>健康分</span></div></div><div className="health-list"><HealthRow label="本地任务引擎" value={serviceOnline ? '运行中' : '未连接'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="本地数据" value={serviceOnline ? '已就绪' : '不可用'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="工作区" value={storageText + (stats?.storageTotalGb ? ` / ${stats.storageTotalGb} GB` : '')} tone={stats?.storageUsedGb === undefined ? 'idle' : 'good'} /></div></div></div></section>
+    <section className="bottom-grid"><div className="activity-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">活动</span><h2>最近任务</h2></div><button className="text-link" onClick={() => onNavigate('queue')}>打开队列 <ArrowUpRight size={13} /></button></div><div className="activity-list">{queue.slice(0, 3).map((item) => <div className={`activity-item ${item.status === 'done' && item.resultCount ? 'has-result' : ''}`} key={item.id}><div className={`activity-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="activity-copy"><strong>{item.title}</strong><span>{item.id} · {item.meta}</span></div>{item.status === 'done' && item.resultCount ? <div className="activity-state"><button className="activity-result-button" type="button" aria-label={`查看任务 ${item.id} 的 ${item.resultCount} 张结果`} onClick={() => onViewResults(item.id)}><Eye size={14} />查看结果</button></div> : null}</div>)}{queue.length === 0 && <div className="empty-state">暂无任务记录</div>}</div></div><div className="health-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">服务状态</span><h2>本地运行健康度</h2></div><span className={`healthy-pill ${serviceOnline ? '' : 'offline'} `}><span />{serviceOnline ? '正常' : '未连接'}</span></div><div className="health-content"><div className="health-ring" style={{ '--health-score': `${healthScore}%` } as React.CSSProperties}><div><strong>{statsLoading ? '...' : healthScore}</strong><span>健康分</span></div></div><div className="health-list"><HealthRow label="本地任务引擎" value={serviceOnline ? '运行中' : '未连接'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="本地数据" value={serviceOnline ? '已就绪' : '不可用'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="工作区" value={storageText + (stats?.storageTotalGb ? ` / ${stats.storageTotalGb} GB` : '')} tone={stats?.storageUsedGb === undefined ? 'idle' : 'good'} /></div></div></div></section>
   {feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}
   </div>
 }
@@ -755,7 +796,7 @@ function QueueFilterBar({ queue, filter, setFilter, search, setSearch }: { queue
   return <div className="queue-toolbar panel"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{queue.length}</span></button><button className={filter === 'running' ? 'active' : ''} onClick={() => setFilter('running')}>运行中 <span>{queue.filter((item) => item.status === 'running').length}</span></button><button className={filter === 'review' ? 'active' : ''} onClick={() => setFilter('review')}>待复核 <span>{queue.filter((item) => item.status === 'review').length}</span></button><button className={filter === 'done' ? 'active' : ''} onClick={() => setFilter('done')}>已完成 <span>{queue.filter((item) => item.status === 'done').length}</span></button><button className={filter === 'failed' ? 'active' : ''} onClick={() => setFilter('failed')}>失败 <span>{queue.filter((item) => item.status === 'failed').length}</span></button><button className={filter === 'cancelled' ? 'active' : ''} onClick={() => setFilter('cancelled')}>已取消 <span>{queue.filter((item) => item.status === 'cancelled').length}</span></button></div><div className="queue-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务名称或编号" /></div></div>
 }
 
-function QueuePage({ queue, setQueue, onRefresh, onCancel, onCreate }: { queue: QueueItem[]; setQueue: Dispatch<SetStateAction<QueueItem[]>>; onRefresh: () => Promise<void>; onCancel: (jobId: string) => Promise<void>; onCreate: () => void }) {
+function QueuePage({ queue, setQueue, onRefresh, onCancel, onCreate, onViewResults }: { queue: QueueItem[]; setQueue: Dispatch<SetStateAction<QueueItem[]>>; onRefresh: () => Promise<void>; onCancel: (jobId: string) => Promise<void>; onCreate: () => void; onViewResults: (jobId: string) => void }) {
   const [filter, setFilter] = useState<QueueFilter>('全部')
   const [search, setSearch] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -772,10 +813,10 @@ function QueuePage({ queue, setQueue, onRefresh, onCancel, onCreate }: { queue: 
   const refreshButton = <button className="button button-ghost" onClick={() => void handleRefresh()} disabled={refreshing} aria-label="刷新任务队列" aria-busy={refreshing}><RefreshCw size={16} className={refreshing ? 'spin' : ''} />{refreshing ? '刷新中' : '刷新'}</button>
   const createButton = <button className="button button-primary" onClick={onCreate}><Plus size={16} />创建任务</button>
   if (visible.length === 0) return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions">{refreshButton}{createButton}</div></section><QueueFilterBar queue={queue} filter={filter} setFilter={setFilter} search={search} setSearch={setSearch} /><div className="empty-state panel">暂无任务记录</div></div>
-  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions">{refreshButton}{createButton}</div></section><div className="queue-toolbar panel"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{queue.length}</span></button><button className={filter === 'running' ? 'active' : ''} onClick={() => setFilter('running')}>运行中 <span>{queue.filter((item) => item.status === 'running').length}</span></button><button className={filter === 'review' ? 'active' : ''} onClick={() => setFilter('review')}>待复核 <span>{queue.filter((item) => item.status === 'review').length}</span></button><button className={filter === 'done' ? 'active' : ''} onClick={() => setFilter('done')}>已完成 <span>{queue.filter((item) => item.status === 'done').length}</span></button><button className={filter === 'failed' ? 'active' : ''} onClick={() => setFilter('failed')}>失败 <span>{queue.filter((item) => item.status === 'failed').length}</span></button><button className={filter === 'cancelled' ? 'active' : ''} onClick={() => setFilter('cancelled')}>已取消 <span>{queue.filter((item) => item.status === 'cancelled').length}</span></button></div><div className="queue-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务名称或编号" /></div></div><div className="queue-list panel">{visible.map((item) => <div className="queue-row" key={item.id}><div className={`queue-status-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="queue-main"><div className="queue-title-line"><strong>{item.title}</strong><span className="mono">{item.id}</span></div><span>{item.meta}</span><div className="progress-track" role="progressbar" aria-label={`${item.title}进度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.progress}><i className={item.status} style={{ width: `${item.progress}%` }} /></div></div><div className="queue-summary"><div className="queue-progress"><strong>{item.progress}%</strong></div><StatusLabel status={item.status} />{(item.status === 'queued' || item.status === 'running') && <button className="queue-cancel-button" title="取消任务" aria-label={`取消任务 ${item.title}`} onClick={() => void onCancel(item.id)}><X size={15} /><span>取消</span></button>}</div></div>)}</div><div className="queue-footnote"><CircleHelp size={15} />生图接口超时会进入“待确认”，不会自动重复计费请求。</div></div>
+  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions">{refreshButton}{createButton}</div></section><div className="queue-toolbar panel"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{queue.length}</span></button><button className={filter === 'running' ? 'active' : ''} onClick={() => setFilter('running')}>运行中 <span>{queue.filter((item) => item.status === 'running').length}</span></button><button className={filter === 'review' ? 'active' : ''} onClick={() => setFilter('review')}>待复核 <span>{queue.filter((item) => item.status === 'review').length}</span></button><button className={filter === 'done' ? 'active' : ''} onClick={() => setFilter('done')}>已完成 <span>{queue.filter((item) => item.status === 'done').length}</span></button><button className={filter === 'failed' ? 'active' : ''} onClick={() => setFilter('failed')}>失败 <span>{queue.filter((item) => item.status === 'failed').length}</span></button><button className={filter === 'cancelled' ? 'active' : ''} onClick={() => setFilter('cancelled')}>已取消 <span>{queue.filter((item) => item.status === 'cancelled').length}</span></button></div><div className="queue-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务名称或编号" /></div></div><div className="queue-list panel">{visible.map((item) => <div className={`queue-row ${item.status === 'done' && item.resultCount ? 'has-result' : ''}`} key={item.id}><div className={`queue-status-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="queue-main"><div className="queue-title-line"><strong>{item.title}</strong><span className="mono">{item.id}</span></div><span>{item.meta}</span><div className="progress-track" role="progressbar" aria-label={`${item.title}进度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.progress}><i className={item.status} style={{ width: `${item.progress}%` }} /></div></div><div className="queue-summary"><div className="queue-progress"><strong>{item.progress}%</strong></div><StatusLabel status={item.status} />{item.status === 'done' && item.resultCount ? <button className="queue-result-button" type="button" aria-label={`查看任务 ${item.id} 的 ${item.resultCount} 张结果`} onClick={() => onViewResults(item.id)}><Eye size={15} />查看结果<span>{item.resultCount} 张</span></button> : null}{(item.status === 'queued' || item.status === 'running') && <button className="queue-cancel-button" title="取消任务" aria-label={`取消任务 ${item.title}`} onClick={() => void onCancel(item.id)}><X size={15} /><span>取消</span></button>}</div></div>)}</div><div className="queue-footnote"><CircleHelp size={15} />生图接口超时会进入“待确认”，不会自动重复计费请求。</div></div>
 }
 
-function GalleryPage({ assets }: { assets: GalleryAsset[] }) {
+function GalleryPage({ assets, focusJobId, onClearFocus }: { assets: GalleryAsset[]; focusJobId: string | null; onClearFocus: () => void }) {
   const [filter, setFilter] = useState('全部')
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid')
   const [importedAssets, setImportedAssets] = useState<GalleryAsset[]>([])
@@ -788,7 +829,8 @@ function GalleryPage({ assets }: { assets: GalleryAsset[] }) {
   }, [])
 
   const source = [...importedAssets, ...assets]
-  const visible = filter === '全部' ? source : source.filter((item) => item.tag === filter)
+  const focusedSource = focusJobId ? source.filter((item) => item.jobId === focusJobId) : source
+  const visible = filter === '全部' ? focusedSource : focusedSource.filter((item) => item.tag === filter)
 
   useEffect(() => {
     if (!feedback) return
@@ -836,7 +878,7 @@ function GalleryPage({ assets }: { assets: GalleryAsset[] }) {
     event.target.value = ''
   }
 
-  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />本地资产</div><h1>生成画廊</h1><p>浏览最近产物，按合规状态快速筛选和打开本地文件。</p></div><div className="heading-actions"><label className="button button-primary" htmlFor="gallery-import"><DownloadIcon />导入资产</label><input id="gallery-import" className="gallery-import-input" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={importAssets} /></div></section><div className="gallery-toolbar"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{source.length}</span></button><button className={filter === 'PASS' ? 'active' : ''} onClick={() => setFilter('PASS')}>可用 <span>{source.filter((item) => item.tag === 'PASS').length}</span></button><button className={filter === 'REVIEW' ? 'active' : ''} onClick={() => setFilter('REVIEW')}>待复核 <span>{source.filter((item) => item.tag === 'REVIEW').length}</span></button><button className={filter === 'BLOCK' ? 'active' : ''} onClick={() => setFilter('BLOCK')}>高风险 <span>{source.filter((item) => item.tag === 'BLOCK').length}</span></button></div><div className="gallery-view-toggle" role="group" aria-label="画廊视图"><button className={viewMode === 'grid' ? 'active' : ''} title="网格视图" aria-label="网格视图" aria-pressed={viewMode === 'grid'} onClick={() => setViewMode('grid')}><LayoutGrid size={16} /></button><button className={viewMode === 'list' ? 'active' : ''} title="列表视图" aria-label="列表视图" aria-pressed={viewMode === 'list'} onClick={() => setViewMode('list')}><ListChecks size={16} /></button></div></div>{visible.length === 0 ? <div className="empty-state panel">暂无生成结果，点击“导入资产”添加本地图片。</div> : <div className={`gallery-grid ${viewMode === 'list' ? 'list-view' : ''}`}>{visible.map((image) => <article className="gallery-card" key={`${image.title}-${image.src}`}><button className="gallery-card-open" type="button" onClick={() => openAsset(image)} aria-label={`打开 ${image.title}`}><div className="gallery-image"><img src={image.src} alt={image.title} /><span className={`gallery-tag ${image.tone}`}>{statusNames[image.tag] ?? image.tag}</span></div><div className="gallery-card-body"><strong>{image.title}</strong><span>{importedAssets.some((item) => item.src === image.src) ? '已导入本地图片' : '本地任务结果'}</span></div></button><div className="gallery-card-actions"><button className="image-more" type="button" title="更多操作" aria-label={`更多操作：${image.title}`} aria-expanded={openMenu === image.src} onClick={() => setOpenMenu((current) => current === image.src ? null : image.src)}><MoreHorizontal size={17} /></button>{openMenu === image.src && <div className="image-menu" role="menu"><button type="button" role="menuitem" onClick={() => openAsset(image)}><Eye size={14} />打开原图</button><button type="button" role="menuitem" onClick={() => void copyAssetUrl(image)}><Copy size={14} />复制图片地址</button></div>}</div></article>)}</div>}{feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}</div>
+  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />本地资产</div><h1>生成画廊</h1><p>{focusJobId ? <>当前查看任务 <span className="mono">{focusJobId}</span> 的生成结果。</> : '浏览最近产物，按合规状态快速筛选和打开本地文件。'}</p></div><div className="heading-actions"><label className="button button-primary" htmlFor="gallery-import"><DownloadIcon />导入资产</label><input id="gallery-import" className="gallery-import-input" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={importAssets} /></div></section>{focusJobId && <div className="gallery-focus-bar" role="status"><div><Eye size={15} /><span>任务结果筛选</span><strong className="mono">{focusJobId}</strong><small>{focusedSource.length} 张图片</small></div><button className="button button-ghost button-small" type="button" onClick={onClearFocus}><X size={14} />查看全部画廊</button></div>}<div className="gallery-toolbar"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{focusedSource.length}</span></button><button className={filter === 'PASS' ? 'active' : ''} onClick={() => setFilter('PASS')}>可用 <span>{focusedSource.filter((item) => item.tag === 'PASS').length}</span></button><button className={filter === 'REVIEW' ? 'active' : ''} onClick={() => setFilter('REVIEW')}>待复核 <span>{focusedSource.filter((item) => item.tag === 'REVIEW').length}</span></button><button className={filter === 'BLOCK' ? 'active' : ''} onClick={() => setFilter('BLOCK')}>高风险 <span>{focusedSource.filter((item) => item.tag === 'BLOCK').length}</span></button></div><div className="gallery-view-toggle" role="group" aria-label="画廊视图"><button className={viewMode === 'grid' ? 'active' : ''} title="网格视图" aria-label="网格视图" aria-pressed={viewMode === 'grid'} onClick={() => setViewMode('grid')}><LayoutGrid size={16} /></button><button className={viewMode === 'list' ? 'active' : ''} title="列表视图" aria-label="列表视图" aria-pressed={viewMode === 'list'} onClick={() => setViewMode('list')}><ListChecks size={16} /></button></div></div>{visible.length === 0 ? <div className="empty-state panel">{focusJobId ? '该任务暂无可展示的生成结果。' : '暂无生成结果，点击“导入资产”添加本地图片。'}</div> : <div className={`gallery-grid ${viewMode === 'list' ? 'list-view' : ''}`}>{visible.map((image) => <article className="gallery-card" key={`${image.title}-${image.src}`}><button className="gallery-card-open" type="button" onClick={() => openAsset(image)} aria-label={`打开 ${image.title}`}><div className="gallery-image"><img src={image.src} alt={image.title} loading="lazy" /><span className={`gallery-tag ${image.tone}`}>{statusNames[image.tag] ?? image.tag}</span></div><div className="gallery-card-body"><strong>{image.title}</strong><span>{importedAssets.some((item) => item.src === image.src) ? '已导入本地图片' : '本地任务结果'}</span></div></button><div className="gallery-card-actions"><button className="image-more" type="button" title="更多操作" aria-label={`更多操作：${image.title}`} aria-expanded={openMenu === image.src} onClick={() => setOpenMenu((current) => current === image.src ? null : image.src)}><MoreHorizontal size={17} /></button>{openMenu === image.src && <div className="image-menu" role="menu"><button type="button" role="menuitem" onClick={() => openAsset(image)}><Eye size={14} />打开原图</button><button type="button" role="menuitem" onClick={() => void copyAssetUrl(image)}><Copy size={14} />复制图片地址</button></div>}</div></article>)}</div>}{feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}</div>
 }
 
 function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPrompt }: { prompts: PromptItem[]; loading: boolean; error: string; selectedPrompt: string; setSelectedPrompt: (value: string) => void }) {

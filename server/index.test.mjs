@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { after } from 'node:test'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -393,6 +393,8 @@ test('Mock Provider 完成异步生图、SSE 推送并将 base64 结果落盘', 
     const detail = await detailResponse.json()
     assert.equal(detail.status, 'completed')
     assert.equal(detail.results.length, 2)
+    assert.deepEqual(detail.results.map((result) => result.path), [`jobs/${created.id}-001.png`, `jobs/${created.id}-002.png`])
+    assert.deepEqual(readdirSync(join(directory, 'jobs')).sort(), [`${created.id}-001.png`, `${created.id}-002.png`])
     assert.equal(readFileSync(join(directory, detail.results[0].path), 'utf8'), 'fake-image')
     const resultResponse = await fetch(`${mockBaseUrl}/api/jobs/${created.id}/results/0`)
     assert.equal(resultResponse.status, 200)

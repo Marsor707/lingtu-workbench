@@ -39,6 +39,7 @@ const DEFAULT_PORT = 8765
 const MAX_BODY_BYTES = 12 * 1024 * 1024
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024
 const MAX_SOURCE_IMAGE_BASE64_LENGTH = Math.ceil(MAX_SOURCE_IMAGE_BYTES / 3) * 4
+const RESULTS_DIRECTORY = 'jobs'
 const VALID_MODES = new Set<JobMode>(['generate', 'edit', 'text_to_image', 'one_to_many'])
 const MODE_ALIASES: Record<string, JobMode> = { text: 'text_to_image', 'one-to-many': 'one_to_many' }
 function now(): string { return new Date().toISOString() }
@@ -269,7 +270,8 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     const total = prompts.length * request.repeat; const results: JobResult[] = []
     let providerStage: 'request' | 'materialize' | undefined
     try {
-      mkdirSync(join(workspaceDir, 'jobs', id), { recursive: true })
+      // 所有结果平铺到统一目录，文件名带任务 ID 以避免不同任务互相覆盖。
+      mkdirSync(join(workspaceDir, RESULTS_DIRECTORY), { recursive: true })
       for (const prompt of prompts) for (let repeatIndex = 0; repeatIndex < request.repeat; repeatIndex += 1) {
         if (runtime.controller.signal.aborted) throw new DOMException('任务已取消', 'AbortError')
         const provider = store.provider(id) ?? request.provider
@@ -284,7 +286,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         providerStage = 'materialize'
         const imageBytes = await materializeImageResult(result, runtime.controller.signal)
         appendExecutionLog(workspaceDir, 'provider_result_materialized', { jobId: id, itemIndex: results.length, resultKind: result.kind, bytes: imageBytes.byteLength, durationMs: Date.now() - requestStartedAt })
-        const index = results.length; const relativePath = join('jobs', id, `${String(index + 1).padStart(3, '0')}.png`); writeFileSync(join(workspaceDir, relativePath), imageBytes); results.push({ path: relativePath, index })
+        const index = results.length; const relativePath = join(RESULTS_DIRECTORY, `${id}-${String(index + 1).padStart(3, '0')}.png`); writeFileSync(join(workspaceDir, relativePath), imageBytes); results.push({ path: relativePath, index })
         providerStage = undefined
         const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) return
         emit(id, 'progress', { completed: index + 1, total, result: results[index], job: current })
