@@ -21,14 +21,14 @@ export type Prompt = { id: string; category: string; title: string; text: string
 export type AppStats = { completed: number; running: number; review: number; failed: number; total: number; storageBytes: number }
 export type SourceImage = { data: string; mimeType: string; name: string }
 export type Job = {
-  id: string; mode: JobMode; status: JobStatus; idempotencyKey?: string; prompt?: string; layout?: string; size?: string; quality?: string; repeat: number
+  id: string; mode: JobMode; status: JobStatus; idempotencyKey?: string; prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number
   windows?: PromptWindow[]; results?: JobResult[]; error?: { code: string; message: string }
   provider: { status: 'not_implemented' | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'; invoked: boolean }
   createdAt: string; updatedAt: string; cancelledAt?: string
 }
 type ProviderConfig = { baseUrl: string; apiKey: string }
-type JobInput = { mode?: unknown; idempotencyKey?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown }
-type StoredRequest = { prompt?: string; layout?: string; size?: string; quality?: string; repeat: number; provider: ProviderConfig; sourceImage?: SourceImage }
+type JobInput = { mode?: unknown; idempotencyKey?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; resolution?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown }
+type StoredRequest = { prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; provider: ProviderConfig; sourceImage?: SourceImage }
 type Runtime = { controller: AbortController; listeners: Set<HttpResponse> }
 type GenerateImage = typeof generateImage
 type EditImage = typeof editImage
@@ -42,6 +42,45 @@ const MAX_SOURCE_IMAGE_BASE64_LENGTH = Math.ceil(MAX_SOURCE_IMAGE_BYTES / 3) * 4
 const RESULTS_DIRECTORY = 'jobs'
 const VALID_MODES = new Set<JobMode>(['generate', 'edit', 'text_to_image', 'one_to_many'])
 const MODE_ALIASES: Record<string, JobMode> = { text: 'text_to_image', 'one-to-many': 'one_to_many' }
+
+type OutputLayoutSpec = { name: string; arrangement: string }
+const OUTPUT_LAYOUTS: Record<string, OutputLayoutSpec> = {
+  '四宫格': { name: '四宫格', arrangement: '四个彼此独立的成品区域，固定为 2 列 × 2 行排列' },
+  '4K 四宫格': { name: '四宫格', arrangement: '四个彼此独立的成品区域，固定为 2 列 × 2 行排列' },
+  four_up: { name: '四宫格', arrangement: '四个彼此独立的成品区域，固定为 2 列 × 2 行排列' },
+  '二宫格': { name: '二宫格', arrangement: '两个彼此独立的成品区域，固定为上下两行排列' },
+  '1K 二宫格': { name: '二宫格', arrangement: '两个彼此独立的成品区域，固定为上下两行排列' },
+  two_up: { name: '二宫格', arrangement: '两个彼此独立的成品区域，固定为上下两行排列' },
+  '九宫格': { name: '九宫格', arrangement: '九个彼此独立的成品区域，固定为 3 列 × 3 行排列' },
+  nine_up: { name: '九宫格', arrangement: '九个彼此独立的成品区域，固定为 3 列 × 3 行排列' },
+  // 仅兼容历史任务，前端不再提供十五宫格选项。
+  '4K 十五宫格（测试）': { name: '十五宫格', arrangement: '十五个彼此独立的成品区域，固定为 3 列 × 5 行排列' },
+  fifteen_up_test: { name: '十五宫格', arrangement: '十五个彼此独立的成品区域，固定为 3 列 × 5 行排列' },
+}
+function outputAspectRatio(size?: string): string | undefined {
+  if (!size) return undefined
+  const match = size.trim().match(/(\d+)\s*[×xX]\s*(\d+)/)
+  if (!match) return undefined
+  const width = Number(match[1]); const height = Number(match[2])
+  if (!width || !height) return undefined
+  const gcd = (a: number, b: number): number => b ? gcd(b, a % b) : a
+  const divisor = gcd(width, height)
+  return `${width / divisor}:${height / divisor}`
+}
+export function buildEffectivePrompt(prompt: string, layout?: string, size?: string, resolution?: string): string {
+  const layoutSpec = layout ? OUTPUT_LAYOUTS[layout.trim()] : undefined
+  const ratio = outputAspectRatio(size)
+  const resolutionLevel = resolution?.trim()
+  const parameterLines = [
+    '[灵图高级输出参数（最高优先级）]',
+    '- 忽略提示词中关于输出宫格数量、行列排列、画布尺寸、分辨率和长宽比例的旧指令；主题、内容结构、风格和安全要求仍然有效。',
+    ...(layoutSpec ? [`- 输出布局：${layoutSpec.name}；${layoutSpec.arrangement}。`] : []),
+    ...(ratio ? [`- 目标画布长宽比：${ratio}（来自高级参数 ${size}）；Provider 可选择其支持的实际分辨率，但应尽量保持该比例。`] : []),
+    ...(resolutionLevel ? [`- 目标分辨率等级：${resolutionLevel}；Provider 可按模型能力返回最接近的实际分辨率。`] : []),
+    '- 不要输出宫格编号、说明文字、参考板、进度图、产品 mockup 或额外画布。',
+  ]
+  return `${prompt.trim()}\n\n${parameterLines.join('\n')}`
+}
 function now(): string { return new Date().toISOString() }
 function executionLogTimestamp(): string {
   // 业务日志面向本地操作者，使用东八区并保留明确的时区偏移；数据库时间仍保持 UTC。
@@ -148,12 +187,18 @@ export class JobStore {
     const seedPrompt = this.db.prepare('INSERT OR IGNORE INTO prompts (id, category, title, text, layout, builtin, source_name) VALUES (?, ?, ?, ?, ?, ?, ?)')
     // 提示词随数据库首次初始化写入，后续启动只补齐缺失项，不覆盖用户已有记录。
     for (const prompt of builtinPrompts) seedPrompt.run(prompt.id, prompt.category, prompt.title, prompt.text, prompt.layout, prompt.builtin ? 1 : 0, prompt.sourceName)
+    const migratePrompt = this.db.prepare(`UPDATE prompts
+      SET category = ?, title = ?, text = ?, layout = ?, source_name = ?
+      WHERE id = ? AND builtin = 1
+        AND (text LIKE '%Output rules:%' OR text LIKE '%Output contract:%' OR text LIKE '%LT_4K_%' OR text LIKE '%Final 4K structure check:%')`)
+    // 仅迁移仍含旧输出契约的内置记录，避免覆盖人工新增或自定义提示词。
+    for (const prompt of builtinPrompts) migratePrompt.run(prompt.category, prompt.title, prompt.text, prompt.layout, prompt.sourceName, prompt.id)
     this.db.exec('CREATE TABLE IF NOT EXISTS provider_config (id INTEGER PRIMARY KEY CHECK (id = 1), base_url TEXT NOT NULL, api_key TEXT NOT NULL, updated_at TEXT NOT NULL)')
   }
   close(): void { this.db.close() }
   private fromRow(row: Record<string, unknown>): Job {
     const request = row.request_json ? JSON.parse(String(row.request_json)) as StoredRequest : undefined
-    return { id: String(row.id), mode: row.mode as JobMode, status: row.status as JobStatus, ...(row.idempotency_key ? { idempotencyKey: String(row.idempotency_key) } : {}), ...(request?.prompt ? { prompt: request.prompt } : {}), ...(request?.layout ? { layout: request.layout } : {}), ...(request?.size ? { size: request.size } : {}), ...(request?.quality ? { quality: request.quality } : {}), repeat: request?.repeat ?? 1, ...(row.windows_json ? { windows: JSON.parse(String(row.windows_json)) as PromptWindow[] } : {}), ...(row.results_json ? { results: JSON.parse(String(row.results_json)) as JobResult[] } : {}), ...(row.error_json ? { error: JSON.parse(String(row.error_json)) as Job['error'] } : {}), provider: JSON.parse(String(row.provider_json)) as Job['provider'], createdAt: String(row.created_at), updatedAt: String(row.updated_at), ...(row.cancelled_at ? { cancelledAt: String(row.cancelled_at) } : {}) }
+    return { id: String(row.id), mode: row.mode as JobMode, status: row.status as JobStatus, ...(row.idempotency_key ? { idempotencyKey: String(row.idempotency_key) } : {}), ...(request?.prompt ? { prompt: request.prompt } : {}), ...(request?.layout ? { layout: request.layout } : {}), ...(request?.size ? { size: request.size } : {}), ...(request?.resolution ? { resolution: request.resolution } : {}), ...(request?.quality ? { quality: request.quality } : {}), repeat: request?.repeat ?? 1, ...(row.windows_json ? { windows: JSON.parse(String(row.windows_json)) as PromptWindow[] } : {}), ...(row.results_json ? { results: JSON.parse(String(row.results_json)) as JobResult[] } : {}), ...(row.error_json ? { error: JSON.parse(String(row.error_json)) as Job['error'] } : {}), provider: JSON.parse(String(row.provider_json)) as Job['provider'], createdAt: String(row.created_at), updatedAt: String(row.updated_at), ...(row.cancelled_at ? { cancelledAt: String(row.cancelled_at) } : {}) }
   }
   create(input: JobInput, idempotencyKey?: string, defaults: Partial<ProviderConfig> = {}): { job: Job; created: boolean } {
     if (idempotencyKey) { const existing = this.db.prepare('SELECT * FROM jobs WHERE idempotency_key = ?').get(idempotencyKey) as Record<string, unknown> | undefined; if (existing) return { job: this.fromRow(existing), created: false } }
@@ -164,8 +209,8 @@ export class JobStore {
     const sourceImage = sourceImageValue(input.sourceImage)
     if (mode === 'edit' && !sourceImage) throw new RequestValidationError('invalid_source_image', 'edit 模式必须提供 sourceImage')
     if (mode === 'edit' && !prompt) throw new RequestValidationError('invalid_prompt', 'edit 模式必须提供 prompt')
-    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), provider: providerConfig(input.provider, { ...this.getProviderConfig(), ...defaults }), ...(sourceImage ? { sourceImage } : {}) }
-    const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.quality ? { quality: request.quality } : {}), repeat: request.repeat, ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
+    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), resolution: optionalString(input.resolution, 'resolution'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), provider: providerConfig(input.provider, { ...this.getProviderConfig(), ...defaults }), ...(sourceImage ? { sourceImage } : {}) }
+    const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.resolution ? { resolution: request.resolution } : {}), ...(request.quality ? { quality: request.quality } : {}), repeat: request.repeat, ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
     const persistedRequest = { ...request, provider: { baseUrl: request.provider.baseUrl, apiKey: '' } }
     this.db.prepare('INSERT INTO jobs (id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, request_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(job.id, idempotencyKey ?? null, job.mode, job.status, job.windows ? JSON.stringify(job.windows) : null, JSON.stringify(job.provider), job.createdAt, job.updatedAt, JSON.stringify(persistedRequest))
     this.runtimeProviders.set(job.id, request.provider)
@@ -262,7 +307,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   const execute = async (id: string): Promise<void> => {
     const request = store.request(id); const initial = store.get(id); if (!request || !initial || initial.status !== 'queued') return
     const jobStartedAt = Date.now()
-    appendExecutionLog(workspaceDir, 'job_started', { jobId: id, mode: initial.mode, repeat: request.repeat, size: request.size, quality: request.quality, promptCount: initial.mode === 'one_to_many' ? initial.windows?.length ?? 0 : request.prompt ? 1 : 0 })
+    appendExecutionLog(workspaceDir, 'job_started', { jobId: id, mode: initial.mode, repeat: request.repeat, size: request.size, resolution: request.resolution, quality: request.quality, promptCount: initial.mode === 'one_to_many' ? initial.windows?.length ?? 0 : request.prompt ? 1 : 0 })
     const runtime: Runtime = { controller: new AbortController(), listeners: new Set() }; runtimes.set(id, runtime); const running = store.update(id, 'running', { provider: { status: 'running', invoked: false } }); if (!running) return; emit(id, 'snapshot', running)
     const prompts = initial.mode === 'one_to_many' ? (initial.windows ?? []).map((window) => window.prompt) : request.prompt ? [request.prompt] : []
     // 无提示词的旧版请求作为草稿保留，避免凭空调用 Provider。
@@ -277,10 +322,11 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         const provider = store.provider(id) ?? request.provider
         const requestStartedAt = Date.now()
         providerStage = 'request'
-        appendExecutionLog(workspaceDir, 'provider_request_started', { jobId: id, mode: initial.mode, itemIndex: results.length, providerHost: providerHost(provider.baseUrl), size: request.size, quality: request.quality })
+        appendExecutionLog(workspaceDir, 'provider_request_started', { jobId: id, mode: initial.mode, itemIndex: results.length, providerHost: providerHost(provider.baseUrl), size: request.size, resolution: request.resolution, quality: request.quality })
+        const effectivePrompt = buildEffectivePrompt(prompt, request.layout, request.size, request.resolution)
         const result: GenerationResult = initial.mode === 'edit'
-          ? await imageEditor({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, prompt, sourceImage: request.sourceImage!, size: request.size, quality: request.quality, signal: runtime.controller.signal })
-          : await imageGenerator({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, prompt, size: request.size, quality: request.quality, signal: runtime.controller.signal })
+          ? await imageEditor({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, prompt: effectivePrompt, sourceImage: request.sourceImage!, size: request.size, quality: request.quality, signal: runtime.controller.signal })
+          : await imageGenerator({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, prompt: effectivePrompt, size: request.size, quality: request.quality, signal: runtime.controller.signal })
         appendExecutionLog(workspaceDir, 'provider_response_received', { jobId: id, itemIndex: results.length, resultKind: result.kind, durationMs: Date.now() - requestStartedAt })
         // Provider 可能返回 base64，也可能返回短时效图片 URL；URL 必须在任务执行期间下载后再落盘。
         providerStage = 'materialize'

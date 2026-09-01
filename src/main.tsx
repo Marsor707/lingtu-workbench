@@ -92,6 +92,9 @@ type ApiJob = {
   progress?: number
   createdAt?: string
   updatedAt?: string
+  layout?: string
+  size?: string
+  resolution?: string
   job?: ApiJob
   results?: Array<{ index: number }>
   error?: { message?: string }
@@ -116,6 +119,32 @@ const LOCAL_API_BASE = 'http://127.0.0.1:8765'
 const SELECTED_PROMPT_STORAGE_KEY = 'lingtu-selected-prompt'
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024
 const SOURCE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
+const SIZE_OPTIONS = [
+  { value: '3840 × 2160', label: '16:9' },
+  { value: '1129 × 1254', label: '9:10' },
+  { value: '1024 × 1024', label: '1:1' },
+  { value: '1536 × 1024', label: '3:2' },
+] as const
+const ADVANCED_SETTINGS_STORAGE_KEY = 'lingtu-advanced-settings'
+type AdvancedSettings = { layout: string; size: string; resolution: string; quality: string; repeat: number }
+const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = { layout: '四宫格', size: '3840 × 2160', resolution: '1K', quality: '高', repeat: 1 }
+
+function readStoredAdvancedSettings(): AdvancedSettings {
+  try {
+    const saved = window.localStorage.getItem(ADVANCED_SETTINGS_STORAGE_KEY)
+    if (!saved) return { ...DEFAULT_ADVANCED_SETTINGS }
+    const parsed = JSON.parse(saved) as Partial<AdvancedSettings>
+    const layout = parsed.layout === '四宫格' || parsed.layout === '二宫格' || parsed.layout === '九宫格' ? parsed.layout : DEFAULT_ADVANCED_SETTINGS.layout
+    const size = SIZE_OPTIONS.some((option) => option.value === parsed.size) ? parsed.size! : DEFAULT_ADVANCED_SETTINGS.size
+    const resolution = parsed.resolution === '1K' || parsed.resolution === '2K' || parsed.resolution === '4K' ? parsed.resolution : DEFAULT_ADVANCED_SETTINGS.resolution
+    const quality = parsed.quality === '高' || parsed.quality === '中' || parsed.quality === '自动' ? parsed.quality : DEFAULT_ADVANCED_SETTINGS.quality
+    const repeat = typeof parsed.repeat === 'number' && Number.isFinite(parsed.repeat) ? Math.min(20, Math.max(1, Math.round(parsed.repeat))) : DEFAULT_ADVANCED_SETTINGS.repeat
+    return { layout, size, resolution, quality, repeat }
+  } catch {
+    // 浏览器存储损坏或不可用时回退到稳定默认值，不阻塞工作台使用。
+    return { ...DEFAULT_ADVANCED_SETTINGS }
+  }
+}
 
 function readStoredPromptId(): string {
   try {
@@ -143,6 +172,32 @@ function formatBytes(bytes: number): string {
 
 function formatToday(): string {
   return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()).replaceAll('/', '.')
+}
+
+function formatLayoutLabel(layout?: string): string {
+  switch (layout?.trim()) {
+    case '4K 四宫格':
+    case 'four_up':
+      return '四宫格'
+    case '1K 二宫格':
+    case 'two_up':
+      return '二宫格'
+    case '4K 十五宫格（测试）':
+    case 'fifteen_up_test':
+      return '十五宫格'
+    case 'nine_up':
+      return '九宫格'
+    default:
+      return layout?.trim() || '四宫格'
+  }
+}
+
+function formatSizeRatio(size?: string): string {
+  return SIZE_OPTIONS.find((option) => option.value === size)?.label ?? size ?? '16:9'
+}
+
+function formatSizeAspectRatio(size?: string): string {
+  return formatSizeRatio(size).replace(':', ' / ')
 }
 
 async function encodeFile(file: File): Promise<string> {
@@ -207,10 +262,12 @@ function App() {
   const [promptsError, setPromptsError] = useState('')
   const [selectedPrompt, setSelectedPrompt] = useState<PromptSelection>(() => readStoredPromptId())
   const [textPrompt, setTextPrompt] = useState('')
-  const [layout, setLayout] = useState('4K 四宫格')
-  const [size, setSize] = useState('3840 × 2160')
-  const [quality, setQuality] = useState('高')
-  const [repeat, setRepeat] = useState(1)
+  const [advancedSettings] = useState<AdvancedSettings>(() => readStoredAdvancedSettings())
+  const [layout, setLayout] = useState(advancedSettings.layout)
+  const [size, setSize] = useState(advancedSettings.size)
+  const [resolution, setResolution] = useState(advancedSettings.resolution)
+  const [quality, setQuality] = useState(advancedSettings.quality)
+  const [repeat, setRepeat] = useState(advancedSettings.repeat)
   const [inputName, setInputName] = useState('未选择输入文件夹')
   const [sourceFile, setSourceFile] = useState<File | null>(null)
   const [promptWindows, setPromptWindows] = useState<PromptWindow[]>([])
@@ -223,6 +280,15 @@ function App() {
   const [serviceOnline, setServiceOnline] = useState(false)
   const [submitError, setSubmitError] = useState('')
   const eventSourceRef = useRef<EventSource | null>(null)
+
+  useEffect(() => {
+    // 高级参数属于本机工作偏好，实时保存后刷新页面仍恢复上次选择。
+    try {
+      window.localStorage.setItem(ADVANCED_SETTINGS_STORAGE_KEY, JSON.stringify({ layout, size, resolution, quality, repeat }))
+    } catch {
+      // 存储不可用时保留当前会话状态，不影响提交任务。
+    }
+  }, [layout, size, resolution, quality, repeat])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -390,7 +456,7 @@ function App() {
       id: job.id,
       title,
       // 队列仅展示可公开的任务摘要，provider.apiKey 永不写入队列状态。
-      meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 个任务项 · ${layout}${job.error?.message ? ` · ${job.error.message}` : ''}`,
+      meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 个任务项 · ${formatLayoutLabel(job.layout ?? layout)}${job.resolution ? ` · ${job.resolution}` : ''}${job.error?.message ? ` · ${job.error.message}` : ''}`,
       status,
       progress,
       time,
@@ -434,7 +500,7 @@ function App() {
         return {
           id: job.id,
           title: `${modes.find((item) => item.id === (job.mode === 'text_to_image' ? 'text' : job.mode))?.label ?? '生图'} · 任务`,
-          meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 个任务项 · ${layout}${job.error?.message ? ` · ${job.error.message}` : ''}`,
+          meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 个任务项 · ${formatLayoutLabel(job.layout ?? layout)}${job.resolution ? ` · ${job.resolution}` : ''}${job.error?.message ? ` · ${job.error.message}` : ''}`,
           status,
           progress,
           time: job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : job.status === 'cancelled' ? '已取消' : '进行中',
@@ -554,6 +620,7 @@ function App() {
           windows: mode === 'one-to-many' ? enabledWindows.map(({ id, name, prompt: windowPrompt, enabled }) => ({ id, name, prompt: windowPrompt.trim(), enabled })) : undefined,
           layout,
           size,
+          resolution,
           quality,
           repeat,
           sourceImage,
@@ -631,7 +698,7 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFile={sourceFile} setSourceFile={setSourceFile} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} channelConfig={channelConfig} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFile={sourceFile} setSourceFile={setSourceFile} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} channelConfig={channelConfig} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={refreshQueue} onCancel={cancelJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} />}
@@ -650,6 +717,8 @@ type WorkbenchProps = {
   setLayout: (value: string) => void
   size: string
   setSize: (value: string) => void
+  resolution: string
+  setResolution: (value: string) => void
   quality: string
   setQuality: (value: string) => void
   repeat: number
@@ -686,7 +755,7 @@ type WorkbenchProps = {
 }
 
 function Workbench(props: WorkbenchProps) {
-  const { mode, setMode, activeMode, layout, setLayout, size, setSize, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFile, setSourceFile, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, channelConfig, submitError, onRefresh, onNavigate, onViewResults } = props
+  const { mode, setMode, activeMode, layout, setLayout, size, setSize, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFile, setSourceFile, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, channelConfig, submitError, onRefresh, onNavigate, onViewResults } = props
   const [showAdvanced, setShowAdvanced] = useState(true)
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -694,6 +763,7 @@ function Workbench(props: WorkbenchProps) {
   const storageText = statsLoading ? '...' : formatBytes(stats?.storageBytes ?? 0)
   const healthScore = serviceOnline && stats ? 100 : 0
   const today = formatToday()
+  const previewCount = layout === '二宫格' ? 2 : layout === '九宫格' ? 9 : 4
   useEffect(() => {
     if (!feedback) return
     const timer = window.setTimeout(() => setFeedback(''), 2400)
@@ -755,11 +825,11 @@ function Workbench(props: WorkbenchProps) {
         {mode === 'one-to-many' ? <div className="field-block one-to-many-block"><div className="field-label"><div><label>一裂多提示词窗口</label><span className="field-hint">已启用 {enabledWindows.length} 个</span></div><button className="button button-small button-ghost" onClick={addPromptWindow}><Plus size={14} />添加窗口</button></div><div className="prompt-window-list">{promptWindows.map((item, index) => <div className={`prompt-window ${item.enabled ? 'enabled' : ''}`} key={item.id}><div className="window-grip"><GripVertical size={15} /></div><button className={`toggle ${item.enabled ? 'on' : ''}`} onClick={() => updatePromptWindow(item.id, { enabled: !item.enabled })} aria-label={`${item.name} ${item.enabled ? '已启用' : '未启用'}`}><span /></button><div className="window-fields"><input aria-label={`窗口 ${index + 1} 名称`} value={item.name} onChange={(event) => updatePromptWindow(item.id, { name: event.target.value })} /><textarea aria-label={`${item.name}提示词`} placeholder="输入这个方向的提示词" value={item.prompt} onChange={(event) => updatePromptWindow(item.id, { prompt: event.target.value })} /></div><button className="icon-button danger-icon" title="删除窗口" aria-label={`删除窗口 ${item.name}`} onClick={() => updatePromptWindow(item.id, { prompt: '', enabled: false })}><Trash2 size={15} /></button></div>)}</div>{enabledWindows.length < 2 && <div className="inline-warning"><AlertTriangle size={14} />至少启用两个非空窗口后才能开始</div>}</div> : <div className="field-block"><div className="field-label"><label htmlFor="template-select">提示词模板</label><button className="text-link" onClick={() => onNavigate('prompts')} disabled={promptsLoading || prompts.length === 0}>浏览全部 <ArrowUpRight size={13} /></button></div><div className="select-wrap"><select id="template-select" value={selectedPrompt} onChange={(event) => setSelectedPrompt(event.target.value)} disabled={promptsLoading || prompts.length === 0}><option value="">{promptsLoading ? '提示词加载中…' : promptsError ? '提示词加载失败' : '暂无可用提示词'}</option>{prompts.map((item) => <option key={item.id} value={item.id}>{item.category} · {item.title}</option>)}</select><ChevronDown size={16} /></div><div className="prompt-preview"><span className="prompt-type">{mode === 'text' ? '文字' : '图片'} / 模板</span><p>{selectedPromptItem ? `${selectedPromptItem.text.slice(0, 320)}${selectedPromptItem.text.length > 320 ? '…' : ''}` : promptsLoading ? '提示词加载中…' : promptsError ? '提示词暂时无法加载，请检查本地服务。' : '后端暂无可用提示词。'}</p><button className="icon-button subtle" title="复制提示词" aria-label="复制提示词" onClick={() => void copyPrompt()} disabled={!selectedPromptItem}><Copy size={15} /></button></div>{promptsError && <div className="form-error" role="status"><AlertTriangle size={14} />{promptsError}</div>}</div>}
 
         <div className="settings-divider"><button className="advanced-trigger" onClick={() => setShowAdvanced((open) => !open)} aria-expanded={showAdvanced}><SlidersHorizontal size={15} />高级参数 <span>默认生产规范</span><ChevronDown size={15} className={showAdvanced ? 'rotate-180' : ''} /></button></div>
-        {showAdvanced && <div className="settings-grid"><div className="compact-field"><label htmlFor="layout-select">输出布局</label><div className="select-wrap"><select id="layout-select" value={layout} onChange={(event) => setLayout(event.target.value)}><option>4K 四宫格</option><option>1K 二宫格</option><option>4K 十五宫格（测试）</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="size-select">生图尺寸</label><div className="select-wrap"><select id="size-select" value={size} onChange={(event) => setSize(event.target.value)}><option>3840 × 2160</option><option>1129 × 1254</option><option>1024 × 1024</option><option>1536 × 1024</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="quality-select">质量</label><div className="select-wrap"><select id="quality-select" value={quality} onChange={(event) => setQuality(event.target.value)}><option>高</option><option>中</option><option>自动</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="repeat-input">重复次数</label><div className="number-control"><input id="repeat-input" type="number" min="1" max="20" value={repeat} onChange={(event) => setRepeat(Math.min(20, Math.max(1, Number(event.target.value) || 1)))} /><span>次</span></div></div></div>}
+        {showAdvanced && <div className="settings-grid"><div className="compact-field"><label htmlFor="layout-select">输出布局</label><div className="select-wrap"><select id="layout-select" value={layout} onChange={(event) => setLayout(event.target.value)}><option>四宫格</option><option>二宫格</option><option>九宫格</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="size-select">长宽比例</label><div className="select-wrap"><select id="size-select" value={size} onChange={(event) => setSize(event.target.value)}>{SIZE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="resolution-select">分辨率</label><div className="select-wrap"><select id="resolution-select" value={resolution} onChange={(event) => setResolution(event.target.value)}><option>1K</option><option>2K</option><option>4K</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="quality-select">质量</label><div className="select-wrap"><select id="quality-select" value={quality} onChange={(event) => setQuality(event.target.value)}><option>高</option><option>中</option><option>自动</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="repeat-input">重复次数</label><div className="number-control"><input id="repeat-input" type="number" min="1" max="20" value={repeat} onChange={(event) => setRepeat(Math.min(20, Math.max(1, Number(event.target.value) || 1)))} /><span>次</span></div></div></div>}
         <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>默认通道已配置 <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />创建任务中</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
       </div>
 
-      <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div aria-hidden="true" /></div><div className={`layout-preview ${layout.includes('二宫格') ? 'layout-two' : layout.includes('十五') ? 'layout-fifteen' : ''}`}><div className="preview-cell cell-a"><span>A</span><small>主视觉区域</small></div><div className="preview-cell cell-b"><span>B</span><small>卖点信息区域</small></div>{layout.includes('四宫格') && <><div className="preview-cell cell-c"><span>C</span><small>细节变体</small></div><div className="preview-cell cell-d"><span>D</span><small>场景变体</small></div></>}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{size.replace(' × ', ':')}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link" onClick={() => onNavigate('gallery')}>查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryAssets.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={`打开 ${image.title}`} aria-label={`打开 ${image.title}`} onClick={() => openRecentAsset(image)}><img src={image.src} alt={image.title} /><span className={`mini-status ${image.tone}`} /></button>)}{galleryAssets.length === 0 && <span className="empty-inline">暂无生成结果</span>}</div></div></div>
+      <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div aria-hidden="true" /></div><div className={`layout-preview ${layout === '二宫格' ? 'layout-two' : layout === '九宫格' ? 'layout-nine' : ''}`} style={{ aspectRatio: formatSizeAspectRatio(size) }}>{Array.from({ length: previewCount }, (_, index) => <div className={`preview-cell cell-${String.fromCharCode(97 + index)}`} key={String.fromCharCode(65 + index)}><span>{String.fromCharCode(65 + index)}</span><small>{index === 0 ? '主视觉区域' : index === 1 ? '卖点信息区域' : '细节变体'}</small></div>)}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{formatSizeRatio(size)}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link" onClick={() => onNavigate('gallery')}>查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryAssets.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={`打开 ${image.title}`} aria-label={`打开 ${image.title}`} onClick={() => openRecentAsset(image)}><img src={image.src} alt={image.title} /><span className={`mini-status ${image.tone}`} /></button>)}{galleryAssets.length === 0 && <span className="empty-inline">暂无生成结果</span>}</div></div></div>
     </section>
 
     <section className="bottom-grid"><div className="activity-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">活动</span><h2>最近任务</h2></div><button className="text-link" onClick={() => onNavigate('queue')}>打开队列 <ArrowUpRight size={13} /></button></div><div className="activity-list">{queue.slice(0, 3).map((item) => <div className={`activity-item ${item.status === 'done' && item.resultCount ? 'has-result' : ''}`} key={item.id}><div className={`activity-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="activity-copy"><strong>{item.title}</strong><span>{item.id} · {item.meta}</span></div>{item.status === 'done' && item.resultCount ? <div className="activity-state"><button className="activity-result-button" type="button" aria-label={`查看任务 ${item.id} 的 ${item.resultCount} 张结果`} onClick={() => onViewResults(item.id)}><Eye size={14} />查看结果</button></div> : null}</div>)}{queue.length === 0 && <div className="empty-state">暂无任务记录</div>}</div></div><div className="health-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">服务状态</span><h2>本地运行健康度</h2></div><span className={`healthy-pill ${serviceOnline ? '' : 'offline'} `}><span />{serviceOnline ? '正常' : '未连接'}</span></div><div className="health-content"><div className="health-ring" style={{ '--health-score': `${healthScore}%` } as React.CSSProperties}><div><strong>{statsLoading ? '...' : healthScore}</strong><span>健康分</span></div></div><div className="health-list"><HealthRow label="本地任务引擎" value={serviceOnline ? '运行中' : '未连接'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="本地数据" value={serviceOnline ? '已就绪' : '不可用'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="工作区" value={storageText + (stats?.storageTotalGb ? ` / ${stats.storageTotalGb} GB` : '')} tone={stats?.storageUsedGb === undefined ? 'idle' : 'good'} /></div></div></div></section>

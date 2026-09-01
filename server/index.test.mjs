@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createServer as createHttpServer } from 'node:http'
-import { JobStore, startServer } from '../dist-server/index.js'
+import { buildEffectivePrompt, JobStore, startServer } from '../dist-server/index.js'
 
 const server = await startServer(0)
 const address = server.address()
@@ -43,6 +43,45 @@ test('提示词接口返回安装时初始化的 79 条内置数据', async () =
   assert.equal(body.items[0].id, 'reference-v239-two_up-000')
   assert.equal(body.items[0].builtin, true)
   assert.ok(body.items.every((item) => item.text.length > 0))
+  assert.ok(body.items.every((item) => !/Output rules:|Output contract:|LT_4K_|Final (?:4K|4K square) structure check:|\b(?:two-up|four-panel|fifteen-panel)\b|\b(?:1129x1254|1129x627|3840x2160|1890x1050|3840x3840|1206x670)\b/i.test(item.text)))
+})
+
+test('已有数据库只迁移含旧输出契约的内置提示词', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-prompt-migration-'))
+  const dbPath = join(directory, 'jobs.db')
+  const initial = new JobStore(dbPath)
+  initial.close()
+  const legacyDb = new DatabaseSync(dbPath)
+  legacyDb.prepare('UPDATE prompts SET text = ? WHERE id = ?').run('旧模板\nOutput rules:\n- Return one vertical two-up raw image requested as 1129x1254.', 'reference-v239-two_up-000')
+  legacyDb.close()
+  const migrated = new JobStore(dbPath)
+  try {
+    const prompt = migrated.prompts().find((item) => item.id === 'reference-v239-two_up-000')
+    assert.ok(prompt)
+    assert.doesNotMatch(prompt.text, /Output rules:|1129x1254/)
+  } finally {
+    migrated.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('高级参数追加段覆盖模板输出布局并保留目标长宽比', () => {
+  const result = buildEffectivePrompt('保持原有主题和风格。', '四宫格', '1024 × 1024', '1K')
+  assert.match(result, /灵图高级输出参数（最高优先级）/)
+  assert.match(result, /四个彼此独立的成品区域，固定为 2 列 × 2 行排列/)
+  assert.match(result, /目标画布长宽比：1:1/)
+  assert.match(result, /目标分辨率等级：1K/)
+  assert.match(result, /Provider 可选择其支持的实际分辨率/)
+
+  const nine = buildEffectivePrompt('测试', '九宫格', '1536x1024', '2K')
+  assert.match(nine, /九个彼此独立的成品区域，固定为 3 列 × 3 行排列/)
+  assert.match(nine, /目标画布长宽比：3:2/)
+  assert.match(nine, /目标分辨率等级：2K/)
+
+  const two = buildEffectivePrompt('测试', '二宫格', '未知尺寸', '4K')
+  assert.match(two, /两个彼此独立的成品区域，固定为上下两行排列/)
+  assert.doesNotMatch(two, /目标画布长宽比：/)
+  assert.match(two, /目标分辨率等级：4K/)
 })
 
 test('Provider 配置写入 SQLite，重启后任务创建可复用且不回传密钥', async () => {
@@ -267,7 +306,7 @@ test('edit 模式必须提供源图片，并通过 mock Provider 完成改图任
   let editCalls = 0
   const mockEdit = async ({ prompt, sourceImage, size, quality, signal }) => {
     editCalls += 1
-    assert.equal(prompt, '把背景改成蓝色')
+    assert.match(prompt, /^把背景改成蓝色\n\n\[灵图高级输出参数（最高优先级）\]/)
     assert.deepEqual(sourceImage, { data: 'ZmFrZS1pbWFnZQ==', mimeType: 'image/png', name: 'source.png' })
     assert.equal(size, '1024x1024')
     assert.equal(quality, 'high')
@@ -339,12 +378,12 @@ test('Mock Provider 完成异步生图、SSE 推送并将 base64 结果落盘', 
   const directory = mkdtempSync(join(tmpdir(), 'lingtu-workspace-'))
   const dbPath = join(directory, 'jobs.db')
   const mockImage = async ({ prompt, size, quality, signal }) => {
-    if (prompt === '取消测试') {
+    if (prompt.startsWith('取消测试')) {
       return new Promise((resolve, reject) => {
         signal.addEventListener('abort', () => reject(new DOMException('任务已取消', 'AbortError')), { once: true })
       })
     }
-    assert.equal(prompt, '测试提示词')
+    assert.match(prompt, /^测试提示词\n\n\[灵图高级输出参数（最高优先级）\]/)
     assert.equal(size, '1024x1024')
     assert.equal(quality, 'high')
     assert.equal(signal.aborted, false)
@@ -367,6 +406,7 @@ test('Mock Provider 完成异步生图、SSE 推送并将 base64 结果落盘', 
         prompt: '测试提示词',
         layout: 'four_up',
         size: '1024x1024',
+        resolution: '1K',
         quality: 'high',
         repeat: 2,
         provider: { baseUrl: 'https://provider.invalid', apiKey: 'server-secret' },
@@ -377,6 +417,7 @@ test('Mock Provider 完成异步生图、SSE 推送并将 base64 结果落盘', 
     assert.equal(created.status, 'queued')
     assert.equal(created.repeat, 2)
     assert.equal(created.layout, 'four_up')
+    assert.equal(created.resolution, '1K')
     assert.equal(JSON.stringify(created).includes('server-secret'), false)
     const db = new DatabaseSync(dbPath)
     const persisted = db.prepare('SELECT request_json FROM jobs WHERE id = ?').get(created.id)
