@@ -50,7 +50,8 @@ jobs:
             artifact: lingtu-macos-arm64
           - name: macOS x64
             os: macos-15-intel
-            bundle: app,dmg
+            # Intel runner 的 Tauri bundle_dmg.sh 不稳定，改为上传可直接解压的 .app.zip。
+            bundle: app
             target: x86_64-apple-darwin
             artifact: lingtu-macos-x64
           - name: Windows x64
@@ -91,6 +92,10 @@ jobs:
         env:
           TAURI_TARGET: ${{ matrix.target }}
         run: npx --no-install tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundle }}
+
+      - name: 压缩 macOS x64 应用
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: ditto -c -k --sequesterRsrc --keepParent "src-tauri/target/${{ matrix.target }}/release/bundle/macos/灵图工作台.app" "src-tauri/target/${{ matrix.target }}/release/bundle/macos/lingtu-workbench-x64.zip"
 
       - name: 上传安装包
         uses: actions/upload-artifact@v4
