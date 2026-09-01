@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { after } from 'node:test'
 import { createServer } from 'node:http'
-import { editImage, generateImage, ProviderError } from '../dist-server/provider.js'
+import { DEFAULT_PROVIDER_TIMEOUT_MS, editImage, generateImage, materializeImageResult, ProviderError } from '../dist-server/provider.js'
 
 const requests = []
 const mock = createServer(async (req, res) => {
@@ -15,8 +15,21 @@ const mock = createServer(async (req, res) => {
 await new Promise((resolve) => mock.listen(0, '127.0.0.1', resolve))
 const port = mock.address().port
 
+const imageResult = createServer((req, res) => {
+  if (req.url === '/result.png') {
+    res.setHeader('content-type', 'image/png')
+    res.end(Buffer.from('fake-image'))
+    return
+  }
+  res.statusCode = 404
+  res.end()
+})
+await new Promise((resolve) => imageResult.listen(0, '127.0.0.1', resolve))
+const imageResultPort = imageResult.address().port
+
 after(async () => {
   await new Promise((resolve, reject) => mock.close((error) => error ? reject(error) : resolve()))
+  await new Promise((resolve, reject) => imageResult.close((error) => error ? reject(error) : resolve()))
 })
 
 test('Provider 发送 OpenAI 兼容请求并解析 base64 图片', async () => {
@@ -34,7 +47,6 @@ test('Provider 发送 OpenAI 兼容请求并解析 base64 图片', async () => {
     prompt: '一张测试图片',
     size: '1024x1024',
     quality: 'high',
-    response_format: 'b64_json',
     n: 1,
   })
 })
@@ -44,6 +56,39 @@ test('Provider 未配置 Key 时在本地校验失败', async () => {
     generateImage({ baseUrl: `http://127.0.0.1:${port}`, apiKey: '', prompt: '测试' }),
     (error) => error instanceof ProviderError && error.code === 'provider_not_configured',
   )
+})
+
+test('Provider 默认请求超时为 3 分钟', () => {
+  assert.equal(DEFAULT_PROVIDER_TIMEOUT_MS, 180000)
+})
+
+test('Provider 主请求网络异常时返回可诊断错误码', async () => {
+  await assert.rejects(
+    generateImage({ baseUrl: 'http://127.0.0.1:1', apiKey: 'test-secret', prompt: '网络异常测试' }),
+    (error) => error instanceof ProviderError && error.code === 'provider_network_error',
+  )
+})
+
+test('Provider 返回图片 URL 时下载为可落盘的图片字节', async () => {
+  const bytes = await materializeImageResult({ kind: 'url', value: `http://127.0.0.1:${imageResultPort}/result.png` })
+  assert.deepEqual(Buffer.from(bytes), Buffer.from('fake-image'))
+})
+
+test('Provider 图片 URL 响应体读取异常时返回下载错误码', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: true,
+    headers: { get: () => 'image/png' },
+    arrayBuffer: async () => { throw new Error('response body terminated') },
+  })
+  try {
+    await assert.rejects(
+      materializeImageResult({ kind: 'url', value: 'https://provider.example/result.png' }),
+      (error) => error instanceof ProviderError && error.code === 'provider_result_download_failed',
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('Provider 已包含 v1 路径时不会重复拼接', async () => {
@@ -75,4 +120,5 @@ test('Provider 使用 multipart 调用改图接口并上传源图片', async () 
   assert.match(request.body, /filename="source\.png"/)
   assert.match(request.body, /name="image"/)
   assert.match(request.body, /fake-image/)
+  assert.doesNotMatch(request.body, /name="response_format"/)
 })

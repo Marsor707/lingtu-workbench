@@ -148,7 +148,9 @@ pub fn run() {
         .sidecar("lingtu-server")?
         .env("LINGTU_PORT", "8765")
         .env("LINGTU_DB_PATH", database_path.to_string_lossy().to_string())
-        .env("LINGTU_STATIC_DIR", static_directory.to_string_lossy().to_string());
+        .env("LINGTU_STATIC_DIR", static_directory.to_string_lossy().to_string())
+        // 让 sidecar 使用系统 HTTP_PROXY/HTTPS_PROXY/NO_PROXY 环境变量访问 Provider。
+        .env("NODE_USE_ENV_PROXY", "1");
       let (mut events, child) = sidecar.spawn()?;
       app.manage(SidecarState {
         child: Mutex::new(Some(child)),

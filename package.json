@@ -12,7 +12,7 @@
     "tauri": "cargo tauri",
     "backend:build": "tsc -p tsconfig.server.json",
     "backend:sidecar": "node scripts/build-sidecar.mjs",
-    "backend:dev": "npm run backend:build && node --watch dist-server/index.js",
+    "backend:dev": "npm run backend:build && node --use-env-proxy --watch dist-server/index.js",
     "backend:test": "npm run backend:build && node --test server/index.test.mjs server/provider.test.mjs"
   },
   "dependencies": {

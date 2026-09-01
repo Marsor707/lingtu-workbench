@@ -4,14 +4,22 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { createServer as createHttpServer } from 'node:http'
 import { JobStore, startServer } from '../dist-server/index.js'
 
 const server = await startServer(0)
 const address = server.address()
 const baseUrl = `http://127.0.0.1:${address.port}`
+const environmentKeys = ['LINGTU_PROVIDER_BASE_URL', 'LINGTU_API_KEY']
+const ambientEnvironment = Object.fromEntries(environmentKeys.map((name) => [name, process.env[name]]))
+for (const name of environmentKeys) delete process.env[name]
 
 after(async () => {
   await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+  for (const name of environmentKeys) {
+    if (ambientEnvironment[name] === undefined) delete process.env[name]
+    else process.env[name] = ambientEnvironment[name]
+  }
 })
 
 async function request(path, options = {}) {
@@ -67,6 +75,54 @@ test('Provider 配置写入 SQLite，重启后任务创建可复用且不回传�
   } finally {
     restoredStore.close()
     rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('后端 Provider 环境变量覆盖请求体和 SQLite 配置', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-provider-env-'))
+  const dbPath = join(directory, 'jobs.db')
+  const previous = Object.fromEntries(environmentKeys.map((name) => [name, process.env[name]]))
+  process.env.LINGTU_PROVIDER_BASE_URL = 'https://env-provider.example'
+  process.env.LINGTU_API_KEY = 'env-secret'
+  let receivedProvider
+  const store = new JobStore(dbPath)
+  store.saveProviderConfig({ baseUrl: 'https://sqlite-provider.example', apiKey: 'sqlite-secret' })
+  const mockServer = await startServer(0, '127.0.0.1', store, {
+    workspaceDir: directory,
+    generateImage: async ({ baseUrl: requestBaseUrl, apiKey }) => {
+      receivedProvider = { baseUrl: requestBaseUrl, apiKey }
+      return { kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' }
+    },
+  })
+  const mockAddress = mockServer.address()
+  const mockBaseUrl = `http://127.0.0.1:${mockAddress.port}`
+  try {
+    const metadataResponse = await fetch(`${mockBaseUrl}/api/provider`)
+    assert.deepEqual(await metadataResponse.json(), { baseUrl: 'https://env-provider.example', configured: true })
+    const createResponse = await fetch(`${mockBaseUrl}/api/jobs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'generate', prompt: '环境变量测试', provider: { baseUrl: 'https://request-provider.example', apiKey: 'request-secret' } }),
+    })
+    assert.equal(createResponse.status, 201)
+    const created = await createResponse.json()
+    await fetch(`${mockBaseUrl}/api/jobs/${created.id}/events`)
+    assert.deepEqual(receivedProvider, { baseUrl: 'https://env-provider.example', apiKey: 'env-secret' })
+    const saveResponse = await fetch(`${mockBaseUrl}/api/provider`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ baseUrl: 'https://request-provider.example', apiKey: 'request-secret' }),
+    })
+    assert.deepEqual(await saveResponse.json(), { baseUrl: 'https://env-provider.example', configured: true })
+    assert.equal(store.getProviderConfig()?.baseUrl, 'https://sqlite-provider.example')
+  } finally {
+    await new Promise((resolve, reject) => mockServer.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+    for (const name of environmentKeys) {
+      if (previous[name] === undefined) delete process.env[name]
+      else process.env[name] = previous[name]
+    }
   }
 })
 
@@ -358,6 +414,53 @@ test('Mock Provider 完成异步生图、SSE 推送并将 base64 结果落盘', 
   } finally {
     await new Promise((resolve, reject) => mockServer.close((error) => error ? reject(error) : resolve()))
     mockStore.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('Mock Provider 返回图片 URL 时由后端下载并落盘', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-url-workspace-'))
+  const resultServer = createHttpServer((req, res) => {
+    if (req.url === '/result.png') {
+      res.setHeader('content-type', 'image/png')
+      res.end(Buffer.from('url-image'))
+      return
+    }
+    res.statusCode = 404
+    res.end()
+  })
+  await new Promise((resolve) => resultServer.listen(0, '127.0.0.1', resolve))
+  const resultPort = resultServer.address().port
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const app = await startServer(0, '127.0.0.1', store, {
+    workspaceDir: directory,
+    generateImage: async () => ({ kind: 'url', value: `http://127.0.0.1:${resultPort}/result.png` }),
+  })
+  const appBaseUrl = `http://127.0.0.1:${app.address().port}`
+  try {
+    const createResponse = await fetch(`${appBaseUrl}/api/jobs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'generate', prompt: 'URL 结果测试' }),
+    })
+    assert.equal(createResponse.status, 201)
+    const created = await createResponse.json()
+    const events = await (await fetch(`${appBaseUrl}/api/jobs/${created.id}/events`)).text()
+    assert.match(events, /event: completed/)
+    const detail = await (await fetch(`${appBaseUrl}/api/jobs/${created.id}`)).json()
+    assert.equal(detail.status, 'completed')
+    assert.equal(readFileSync(join(directory, detail.results[0].path), 'utf8'), 'url-image')
+    const executionLog = readFileSync(join(directory, 'logs', 'execution.log'), 'utf8')
+    assert.match(executionLog, /"timestamp":"[^\"]+\+08:00"/)
+    assert.match(executionLog, new RegExp(`"event":"job_started".*"jobId":"${created.id}"`))
+    assert.match(executionLog, /"event":"provider_response_received".*"resultKind":"url"/)
+    assert.match(executionLog, /"event":"provider_result_materialized".*"bytes":9/)
+    assert.match(executionLog, /"event":"job_completed"/)
+    assert.equal(executionLog.includes('URL 结果测试'), false)
+  } finally {
+    await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
+    await new Promise((resolve, reject) => resultServer.close((error) => error ? reject(error) : resolve()))
+    store.close()
     rmSync(directory, { recursive: true, force: true })
   }
 })

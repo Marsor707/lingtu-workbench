@@ -1,10 +1,10 @@
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { isSea } from 'node:sea'
-import { editImage, generateImage, ProviderError } from './provider.js'
+import { editImage, generateImage, materializeImageResult, ProviderError } from './provider.js'
 import type { GenerationResult } from './provider.js'
 import { builtinPrompts } from './prompts.js'
 
@@ -42,9 +42,29 @@ const MAX_SOURCE_IMAGE_BASE64_LENGTH = Math.ceil(MAX_SOURCE_IMAGE_BYTES / 3) * 4
 const VALID_MODES = new Set<JobMode>(['generate', 'edit', 'text_to_image', 'one_to_many'])
 const MODE_ALIASES: Record<string, JobMode> = { text: 'text_to_image', 'one-to-many': 'one_to_many' }
 function now(): string { return new Date().toISOString() }
+function executionLogTimestamp(): string {
+  // 业务日志面向本地操作者，使用东八区并保留明确的时区偏移；数据库时间仍保持 UTC。
+  return new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().replace('Z', '+08:00')
+}
 function json(res: HttpResponse, statusCode: number, body: unknown): void { res.statusCode = statusCode; res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.setHeader('Cache-Control', 'no-store'); res.end(JSON.stringify(body)) }
 function errorResponse(res: HttpResponse, statusCode: number, code: string, message: string): void { json(res, statusCode, { error: { code, message } }) }
 function headerValue(value: string | string[] | undefined): string | undefined { return Array.isArray(value) ? value[0] : value }
+function safeLogText(value: string): string { return value.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/https?:\/\/[^\s)]+/gi, '[url]').slice(0, 500) }
+function providerHost(baseUrl: string): string | undefined { try { return new URL(baseUrl).hostname } catch { return undefined } }
+function logErrorFields(error: unknown): Record<string, unknown> {
+  if (error instanceof ProviderError) return { errorCode: error.code, ...(error.status === undefined ? {} : { httpStatus: error.status }), errorMessage: error.message, ...(error.detail ? { errorDetail: error.detail } : {}) }
+  if (error instanceof Error) return { errorName: error.name, errorMessage: safeLogText(error.message) }
+  return { errorName: typeof error }
+}
+function appendExecutionLog(workspaceDir: string, event: string, fields: Record<string, unknown> = {}): void {
+  try {
+    const logDirectory = join(workspaceDir, 'logs')
+    mkdirSync(logDirectory, { recursive: true })
+    appendFileSync(join(logDirectory, 'execution.log'), `${JSON.stringify({ timestamp: executionLogTimestamp(), event, ...fields })}\n`, 'utf8')
+  } catch {
+    // 日志属于旁路诊断能力，目录不可写时不能改变任务本身的成功或失败结果。
+  }
+}
 
 async function readBody(req: HttpRequest): Promise<unknown> {
   return new Promise((resolveBody, reject) => {
@@ -92,10 +112,26 @@ function sourceImageValue(value: unknown): SourceImage | undefined {
   if (bytes === 0 || bytes > MAX_SOURCE_IMAGE_BYTES) throw new RequestValidationError('source_image_too_large', 'sourceImage 大小不能超过 8 MB')
   return { data, mimeType, name: name.slice(0, 200) }
 }
+function environmentProvider(): Partial<ProviderConfig> {
+  // 灵图后端配置只使用项目自己的环境变量，避免耦合外部 Skill 的命名约定。
+  const baseUrl = process.env.LINGTU_PROVIDER_BASE_URL?.trim()
+  const apiKey = process.env.LINGTU_API_KEY?.trim()
+  return { ...(baseUrl ? { baseUrl } : {}), ...(apiKey ? { apiKey } : {}) }
+}
 function providerConfig(value: unknown, defaults: Partial<ProviderConfig>): ProviderConfig {
   if (value !== undefined && (!value || typeof value !== 'object' || Array.isArray(value))) throw new RequestValidationError('invalid_provider', 'provider 必须是配置对象')
   const item = (value ?? {}) as Record<string, unknown>
-  return { baseUrl: optionalString(item.baseUrl ?? defaults.baseUrl ?? process.env.LINGTU_PROVIDER_BASE_URL, 'provider_base_url') ?? '', apiKey: optionalString(item.apiKey ?? defaults.apiKey ?? process.env.LINGTU_API_KEY, 'provider_api_key') ?? '' }
+  const env = environmentProvider()
+  return {
+    // 后端环境变量是最终生效配置；请求体只在未配置环境变量时作为兼容回退。
+    baseUrl: env.baseUrl ?? optionalString(item.baseUrl ?? defaults.baseUrl, 'provider_base_url') ?? '',
+    apiKey: env.apiKey ?? optionalString(item.apiKey ?? defaults.apiKey, 'provider_api_key') ?? '',
+  }
+}
+function effectiveProviderMetadata(store: JobStore): { baseUrl: string; configured: boolean } {
+  const env = environmentProvider()
+  const stored = store.getProviderConfig()
+  return { baseUrl: env.baseUrl ?? stored?.baseUrl ?? '', configured: Boolean(env.apiKey ?? stored?.apiKey) }
 }
 
 export class JobStore {
@@ -224,31 +260,44 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   const emit = (id: string, event: string, data: unknown): void => { const runtime = runtimes.get(id); if (!runtime) return; const message = dataEvent(event, data); for (const listener of runtime.listeners) { try { listener.write(message) } catch { runtime.listeners.delete(listener) } }; if (event === 'completed' || event === 'failed') { for (const listener of runtime.listeners) listener.end(); runtime.listeners.clear() } }
   const execute = async (id: string): Promise<void> => {
     const request = store.request(id); const initial = store.get(id); if (!request || !initial || initial.status !== 'queued') return
+    const jobStartedAt = Date.now()
+    appendExecutionLog(workspaceDir, 'job_started', { jobId: id, mode: initial.mode, repeat: request.repeat, size: request.size, quality: request.quality, promptCount: initial.mode === 'one_to_many' ? initial.windows?.length ?? 0 : request.prompt ? 1 : 0 })
     const runtime: Runtime = { controller: new AbortController(), listeners: new Set() }; runtimes.set(id, runtime); const running = store.update(id, 'running', { provider: { status: 'running', invoked: false } }); if (!running) return; emit(id, 'snapshot', running)
     const prompts = initial.mode === 'one_to_many' ? (initial.windows ?? []).map((window) => window.prompt) : request.prompt ? [request.prompt] : []
     // 无提示词的旧版请求作为草稿保留，避免凭空调用 Provider。
     if (prompts.length === 0) { runtimes.delete(id); return }
     const total = prompts.length * request.repeat; const results: JobResult[] = []
+    let providerStage: 'request' | 'materialize' | undefined
     try {
       mkdirSync(join(workspaceDir, 'jobs', id), { recursive: true })
       for (const prompt of prompts) for (let repeatIndex = 0; repeatIndex < request.repeat; repeatIndex += 1) {
         if (runtime.controller.signal.aborted) throw new DOMException('任务已取消', 'AbortError')
         const provider = store.provider(id) ?? request.provider
+        const requestStartedAt = Date.now()
+        providerStage = 'request'
+        appendExecutionLog(workspaceDir, 'provider_request_started', { jobId: id, mode: initial.mode, itemIndex: results.length, providerHost: providerHost(provider.baseUrl), size: request.size, quality: request.quality })
         const result: GenerationResult = initial.mode === 'edit'
           ? await imageEditor({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, prompt, sourceImage: request.sourceImage!, size: request.size, quality: request.quality, signal: runtime.controller.signal })
           : await imageGenerator({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, prompt, size: request.size, quality: request.quality, signal: runtime.controller.signal })
-        if (result.kind !== 'base64') throw new Error('Provider 返回的图片不是 base64')
-        const index = results.length; const relativePath = join('jobs', id, `${String(index + 1).padStart(3, '0')}.png`); writeFileSync(join(workspaceDir, relativePath), Buffer.from(result.value, 'base64')); results.push({ path: relativePath, index })
+        appendExecutionLog(workspaceDir, 'provider_response_received', { jobId: id, itemIndex: results.length, resultKind: result.kind, durationMs: Date.now() - requestStartedAt })
+        // Provider 可能返回 base64，也可能返回短时效图片 URL；URL 必须在任务执行期间下载后再落盘。
+        providerStage = 'materialize'
+        const imageBytes = await materializeImageResult(result, runtime.controller.signal)
+        appendExecutionLog(workspaceDir, 'provider_result_materialized', { jobId: id, itemIndex: results.length, resultKind: result.kind, bytes: imageBytes.byteLength, durationMs: Date.now() - requestStartedAt })
+        const index = results.length; const relativePath = join('jobs', id, `${String(index + 1).padStart(3, '0')}.png`); writeFileSync(join(workspaceDir, relativePath), imageBytes); results.push({ path: relativePath, index })
+        providerStage = undefined
         const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) return
         emit(id, 'progress', { completed: index + 1, total, result: results[index], job: current })
       }
-      const current = store.get(id); if (current?.status === 'cancelled') return; const completed = store.update(id, 'completed', { provider: { status: 'completed', invoked: true }, results }); if (completed) emit(id, 'completed', completed)
+      const current = store.get(id); if (current?.status === 'cancelled') return; const completed = store.update(id, 'completed', { provider: { status: 'completed', invoked: true }, results }); if (completed) { appendExecutionLog(workspaceDir, 'job_completed', { jobId: id, resultCount: results.length, durationMs: Date.now() - jobStartedAt }); emit(id, 'completed', completed) }
     } catch (error) {
       const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) { if (current) emit(id, 'failed', current); return }
       // 仅向前端返回可操作的诊断方向，不透传 Provider 原始响应或请求内容。
       const safeError = error instanceof ProviderError
         ? { code: error.code, message: error.message }
         : { code: 'generation_failed', message: 'Provider 请求未完成，请检查接口地址、网络或 API Key' }
+      if (providerStage) appendExecutionLog(workspaceDir, 'provider_stage_failed', { jobId: id, stage: providerStage, ...logErrorFields(error) })
+      appendExecutionLog(workspaceDir, 'job_failed', { jobId: id, mode: initial.mode, durationMs: Date.now() - jobStartedAt, ...logErrorFields(error) })
       const failed = store.update(id, 'failed', { provider: { status: 'failed', invoked: true }, error: safeError }); if (failed) emit(id, 'failed', failed)
     } finally { if (runtimes.get(id) === runtime) runtimes.delete(id); store.forgetProvider(id) }
   }
@@ -259,8 +308,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     if (req.method === 'GET' && path === '/api/stats') { json(res, 200, store.stats(workspaceDir)); return }
     if (req.method === 'GET' && path === '/api/prompts') { const items = store.prompts(); json(res, 200, { items, total: items.length }); return }
     if (req.method === 'GET' && path === '/api/provider') {
-      const config = store.getProviderConfig()
-      json(res, 200, { baseUrl: config?.baseUrl ?? '', configured: Boolean(config?.apiKey) })
+      json(res, 200, effectiveProviderMetadata(store))
       return
     }
     if (req.method === 'PUT' && path === '/api/provider') {
@@ -270,6 +318,11 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         const config = providerConfig(body, {})
         if (!config.baseUrl) throw new RequestValidationError('invalid_provider_base_url', 'provider_base_url 必须是非空字符串')
         if (!config.apiKey) throw new RequestValidationError('invalid_provider_api_key', 'provider_api_key 必须是非空字符串')
+        if (environmentProvider().baseUrl || environmentProvider().apiKey) {
+          // 环境变量管理模式下不把用户输入写回 SQLite，避免产生“看似保存但实际不生效”的端点。
+          json(res, 200, effectiveProviderMetadata(store))
+          return
+        }
         store.saveProviderConfig(config)
         json(res, 200, { baseUrl: config.baseUrl, configured: true })
       } catch (error) {

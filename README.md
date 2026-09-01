@@ -16,14 +16,29 @@
 
 - React/Vite/TypeScript 前端已通过 `POST /api/jobs` 提交真实任务，并通过 SSE 接收状态；队列、画廊和工作台统计均从本地服务读取，真实 Provider 仍需用户自行配置后验证。
 - Tauri 2 已配置 `externalBin`、托盘菜单和 Shell 插件；macOS 本机已验证 `.app` 能启动包内 sidecar、托管 `dist` 并打开浏览器，Windows runner 尚未在本机验证。
-- `server/` 已提供 SQLite 任务元数据、异步任务编排、REST/SSE、OpenAI 兼容 Provider 适配器和 base64 图片落盘；API Key 仅保存在本地 Provider 配置表中，不写入任务快照、任务列表或接口响应。
+- `server/` 已提供 SQLite 任务元数据、异步任务编排、REST/SSE、OpenAI 兼容 Provider 适配器，并兼容 Provider 返回的 base64 或图片 URL（URL 会由后端下载后落盘）；API Key 仅保存在本地 Provider 配置表中，不写入任务快照、任务列表或接口响应。
 - 工作区设置通过 `PUT /api/provider` 写入本地 Provider 配置；页面刷新后通过 `GET /api/provider` 恢复地址，生图任务只需传地址，由后端从本地配置表补回 API Key。
 - `server/prompts.ts` 提供参考软件 v2.3.9 配置快照中的 79 条非空生成提示词，首次初始化 SQLite 时写入 `prompts` 表，前端通过 `GET /api/prompts` 读取。
 - 迁移期间保留的 `backend/` Python 健康检查代码仅作为过渡证据，不属于目标生产技术栈；新增业务代码统一放在 `server/` 并使用 TypeScript。
 
 ## 本地开发
 
-需要 Node.js LTS 和 npm。首次安装依赖：
+需要 Node.js 24+ 和 npm。后端使用 Node 的环境代理支持读取 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`。
+
+Provider 建议由后端进程读取灵图项目环境变量，不需要用户在页面中修改端点：
+
+```bash
+export LINGTU_PROVIDER_BASE_URL="https://example.com/v1"
+export LINGTU_API_KEY="..."
+```
+
+`LINGTU_PROVIDER_BASE_URL` / `LINGTU_API_KEY` 会覆盖 SQLite 和前端请求体中的 Provider 配置。API Key 不会返回给前端。启动 Node 服务时会启用环境代理，桌面版 sidecar 也会继承同一代理开关。
+
+后端执行日志写入 `workspace/logs/execution.log`（JSON Lines，时间为东八区 `+08:00`），记录任务阶段、Provider 响应类型、结果下载、耗时和安全错误信息；不会记录 API Key、提示词、源图 Base64 或完整结果 URL。
+
+Provider 单次请求和结果 URL 下载的默认超时均为 3 分钟；外部 Provider 或网络代理若设置了更短的超时，仍可能在此之前断开连接。
+
+首次安装依赖：
 
 ```bash
 npm ci
