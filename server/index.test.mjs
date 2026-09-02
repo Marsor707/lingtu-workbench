@@ -84,6 +84,28 @@ test('高级参数追加段覆盖模板输出布局并保留目标长宽比', ()
   assert.match(two, /目标分辨率等级：4K/)
 })
 
+test('旧版单 Provider 配置首次启动自动迁移为默认启用供应商', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-provider-migration-'))
+  const dbPath = join(directory, 'jobs.db')
+  const legacyDb = new DatabaseSync(dbPath)
+  legacyDb.exec('CREATE TABLE provider_config (id INTEGER PRIMARY KEY CHECK (id = 1), base_url TEXT NOT NULL, api_key TEXT NOT NULL, updated_at TEXT NOT NULL)')
+  legacyDb.prepare('INSERT INTO provider_config (id, base_url, api_key, updated_at) VALUES (1, ?, ?, ?)').run('https://legacy.example/v1', 'legacy-secret', '2026-09-01T00:00:00.000Z')
+  legacyDb.close()
+  const store = new JobStore(dbPath)
+  try {
+    const providers = store.listProviders()
+    assert.equal(providers.length, 1)
+    assert.deepEqual(providers[0], {
+      id: 'legacy-default', name: '默认供应商', baseUrl: 'https://legacy.example/v1', configured: true, enabled: true, successCount: 0, failureCount: 0,
+      createdAt: '2026-09-01T00:00:00.000Z', updatedAt: providers[0].updatedAt,
+    })
+    assert.equal(JSON.stringify(providers).includes('legacy-secret'), false)
+  } finally {
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
 test('Provider 配置写入 SQLite，重启后任务创建可复用且不回传密钥', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'lingtu-provider-config-'))
   const dbPath = join(directory, 'jobs.db')
@@ -162,6 +184,120 @@ test('后端 Provider 环境变量覆盖请求体和 SQLite 配置', async () =>
       if (previous[name] === undefined) delete process.env[name]
       else process.env[name] = previous[name]
     }
+  }
+})
+
+test('模型供应商支持新增、编辑、唯一启用和受约束删除，且接口不回传密钥', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-model-providers-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const server = await startServer(0, '127.0.0.1', store, { workspaceDir: directory })
+  const base = `http://127.0.0.1:${server.address().port}`
+  try {
+    const create = async (name, baseUrl, apiKey) => {
+      const response = await fetch(`${base}/api/providers`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name, baseUrl, apiKey }),
+      })
+      assert.equal(response.status, 201)
+      return response.json()
+    }
+    const first = await create('主力模型', 'https://primary.example/v1', 'primary-secret')
+    const second = await create('备用模型', 'https://backup.example/v1', 'backup-secret')
+    assert.equal(first.enabled, true)
+    assert.equal(second.enabled, false)
+    assert.equal(JSON.stringify(first).includes('primary-secret'), false)
+
+    const editResponse = await fetch(`${base}/api/providers/${second.id}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: '备用模型 2', baseUrl: 'https://backup-2.example/v1', apiKey: '' }),
+    })
+    assert.equal(editResponse.status, 200)
+    assert.equal(store.getProvider(second.id)?.apiKey, 'backup-secret')
+
+    const enableResponse = await fetch(`${base}/api/providers/${second.id}/enable`, { method: 'POST' })
+    assert.equal(enableResponse.status, 200)
+    const providers = (await (await fetch(`${base}/api/providers`)).json()).items
+    assert.equal(providers.filter((provider) => provider.enabled).length, 1)
+    assert.equal(providers.find((provider) => provider.id === second.id).enabled, true)
+    assert.equal(JSON.stringify(providers).includes('backup-secret'), false)
+
+    const activeDelete = await fetch(`${base}/api/providers/${second.id}`, { method: 'DELETE' })
+    assert.equal(activeDelete.status, 409)
+    assert.equal((await activeDelete.json()).error.code, 'provider_enabled')
+    const inactiveDelete = await fetch(`${base}/api/providers/${first.id}`, { method: 'DELETE' })
+    assert.equal(inactiveDelete.status, 204)
+    const lastDelete = await fetch(`${base}/api/providers/${second.id}`, { method: 'DELETE' })
+    assert.equal(lastDelete.status, 409)
+    assert.equal((await lastDelete.json()).error.code, 'provider_last_one')
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('运行任务锁定供应商切换，任务终态按创建时绑定的供应商统计', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-provider-lock-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  let releaseFirst
+  let requestCount = 0
+  const server = await startServer(0, '127.0.0.1', store, {
+    workspaceDir: directory,
+    generateImage: async () => {
+      requestCount += 1
+      if (requestCount === 1) await new Promise((resolve) => { releaseFirst = resolve })
+      else throw new Error('mock provider failure')
+      return { kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' }
+    },
+  })
+  const base = `http://127.0.0.1:${server.address().port}`
+  try {
+    const createProvider = async (name) => {
+      const response = await fetch(`${base}/api/providers`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, baseUrl: `https://${name}.example/v1`, apiKey: `${name}-secret` }),
+      })
+      return response.json()
+    }
+    const first = await createProvider('first')
+    const second = await createProvider('second')
+    const firstJobResponse = await fetch(`${base}/api/jobs`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'generate', prompt: '统计成功' }),
+    })
+    const firstJob = await firstJobResponse.json()
+    assert.equal(firstJob.providerId, first.id)
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if ((await (await fetch(`${base}/api/jobs/${firstJob.id}`)).json()).status === 'running') break
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+
+    const locked = await fetch(`${base}/api/providers/${second.id}/enable`, { method: 'POST' })
+    assert.equal(locked.status, 409)
+    assert.equal((await locked.json()).error.code, 'provider_switch_locked')
+    releaseFirst()
+    assert.match(await (await fetch(`${base}/api/jobs/${firstJob.id}/events`)).text(), /event: completed/)
+
+    assert.equal((await fetch(`${base}/api/providers/${second.id}/enable`, { method: 'POST' })).status, 200)
+    const failedJobResponse = await fetch(`${base}/api/jobs`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'generate', prompt: '统计失败' }),
+    })
+    const failedJob = await failedJobResponse.json()
+    assert.equal(failedJob.providerId, second.id)
+    assert.match(await (await fetch(`${base}/api/jobs/${failedJob.id}/events`)).text(), /event: failed/)
+
+    const providers = (await (await fetch(`${base}/api/providers`)).json()).items
+    assert.deepEqual(
+      providers.map((provider) => ({ id: provider.id, success: provider.successCount, failure: provider.failureCount })),
+      [
+        { id: first.id, success: 1, failure: 0 },
+        { id: second.id, success: 0, failure: 1 },
+      ],
+    )
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
   }
 })
 
@@ -544,6 +680,7 @@ test('Mock Provider 返回图片 URL 时由后端下载并落盘', async () => {
     assert.match(executionLog, /"timestamp":"[^\"]+\+08:00"/)
     assert.match(executionLog, new RegExp(`"event":"job_started".*"jobId":"${created.id}"`))
     assert.match(executionLog, /"event":"provider_response_received".*"resultKind":"url"/)
+    assert.match(executionLog, new RegExp(`"event":"provider_response_received".*"resultUrl":"http://127\\.0\\.0\\.1:${resultPort}/result\\.png"`))
     assert.match(executionLog, /"event":"provider_result_materialized".*"bytes":9/)
     assert.match(executionLog, /"event":"job_completed"/)
     assert.equal(executionLog.includes('URL 结果测试'), false)

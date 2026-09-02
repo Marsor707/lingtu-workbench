@@ -22,13 +22,15 @@ export type AppStats = { completed: number; running: number; review: number; fai
 export type SourceImage = { data: string; mimeType: string; name: string }
 export type Job = {
   id: string; mode: JobMode; status: JobStatus; idempotencyKey?: string; prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number
-  windows?: PromptWindow[]; results?: JobResult[]; error?: { code: string; message: string }
+  windows?: PromptWindow[]; results?: JobResult[]; error?: { code: string; message: string }; providerId?: string
   provider: { status: 'not_implemented' | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'; invoked: boolean }
   createdAt: string; updatedAt: string; cancelledAt?: string
 }
 type ProviderConfig = { baseUrl: string; apiKey: string }
+export type ModelProvider = { id: string; name: string; baseUrl: string; configured: boolean; enabled: boolean; successCount: number; failureCount: number; createdAt: string; updatedAt: string }
+type StoredProvider = ModelProvider & { apiKey: string }
 type JobInput = { mode?: unknown; idempotencyKey?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; resolution?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown; maxConcurrency?: unknown }
-type StoredRequest = { prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; provider: ProviderConfig; sourceImage?: SourceImage }
+type StoredRequest = { prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; provider: ProviderConfig; providerId?: string; sourceImage?: SourceImage }
 type Runtime = { controller: AbortController; listeners: Set<HttpResponse> }
 type GenerateImage = typeof generateImage
 type EditImage = typeof editImage
@@ -172,7 +174,7 @@ function providerConfig(value: unknown, defaults: Partial<ProviderConfig>): Prov
 }
 function effectiveProviderMetadata(store: JobStore): { baseUrl: string; configured: boolean } {
   const env = environmentProvider()
-  const stored = store.getProviderConfig()
+  const stored = store.activeProviderConfig() ?? store.getProviderConfig()
   return { baseUrl: env.baseUrl ?? stored?.baseUrl ?? '', configured: Boolean(env.apiKey ?? stored?.apiKey) }
 }
 
@@ -183,8 +185,8 @@ export class JobStore {
   constructor(dbPath = ':memory:') {
     if (dbPath !== ':memory:' && !dbPath.startsWith('file:')) mkdirSync(dirname(resolve(dbPath)), { recursive: true })
     this.db = new DatabaseSync(dbPath)
-    this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE, mode TEXT NOT NULL, status TEXT NOT NULL, windows_json TEXT, provider_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, cancelled_at TEXT, request_json TEXT, results_json TEXT, error_json TEXT);`)
-    for (const column of ['request_json TEXT', 'results_json TEXT', 'error_json TEXT']) { try { this.db.exec(`ALTER TABLE jobs ADD COLUMN ${column}`) } catch { /* 兼容已包含列的旧数据库 */ } }
+    this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE, mode TEXT NOT NULL, status TEXT NOT NULL, windows_json TEXT, provider_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, cancelled_at TEXT, request_json TEXT, results_json TEXT, error_json TEXT, provider_id TEXT);`)
+    for (const column of ['request_json TEXT', 'results_json TEXT', 'error_json TEXT', 'provider_id TEXT']) { try { this.db.exec(`ALTER TABLE jobs ADD COLUMN ${column}`) } catch { /* 兼容已包含列的旧数据库 */ } }
     this.db.exec('CREATE TABLE IF NOT EXISTS prompts (id TEXT PRIMARY KEY, category TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, layout TEXT NOT NULL, builtin INTEGER NOT NULL, source_name TEXT NOT NULL)')
     const seedPrompt = this.db.prepare('INSERT OR IGNORE INTO prompts (id, category, title, text, layout, builtin, source_name) VALUES (?, ?, ?, ?, ?, ?, ?)')
     // 提示词随数据库首次初始化写入，后续启动只补齐缺失项，不覆盖用户已有记录。
@@ -196,14 +198,24 @@ export class JobStore {
     // 仅迁移仍含旧输出契约的内置记录，避免覆盖人工新增或自定义提示词。
     for (const prompt of builtinPrompts) migratePrompt.run(prompt.category, prompt.title, prompt.text, prompt.layout, prompt.sourceName, prompt.id)
     this.db.exec('CREATE TABLE IF NOT EXISTS provider_config (id INTEGER PRIMARY KEY CHECK (id = 1), base_url TEXT NOT NULL, api_key TEXT NOT NULL, updated_at TEXT NOT NULL)')
+    this.db.exec('CREATE TABLE IF NOT EXISTS model_providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
     this.db.exec('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)')
+    this.migrateLegacyProvider()
   }
   close(): void { this.db.close() }
   private fromRow(row: Record<string, unknown>): Job {
     const request = row.request_json ? JSON.parse(String(row.request_json)) as StoredRequest : undefined
-    return { id: String(row.id), mode: row.mode as JobMode, status: row.status as JobStatus, ...(row.idempotency_key ? { idempotencyKey: String(row.idempotency_key) } : {}), ...(request?.prompt ? { prompt: request.prompt } : {}), ...(request?.layout ? { layout: request.layout } : {}), ...(request?.size ? { size: request.size } : {}), ...(request?.resolution ? { resolution: request.resolution } : {}), ...(request?.quality ? { quality: request.quality } : {}), repeat: request?.repeat ?? 1, ...(row.windows_json ? { windows: JSON.parse(String(row.windows_json)) as PromptWindow[] } : {}), ...(row.results_json ? { results: JSON.parse(String(row.results_json)) as JobResult[] } : {}), ...(row.error_json ? { error: JSON.parse(String(row.error_json)) as Job['error'] } : {}), provider: JSON.parse(String(row.provider_json)) as Job['provider'], createdAt: String(row.created_at), updatedAt: String(row.updated_at), ...(row.cancelled_at ? { cancelledAt: String(row.cancelled_at) } : {}) }
+    return { id: String(row.id), mode: row.mode as JobMode, status: row.status as JobStatus, ...(row.idempotency_key ? { idempotencyKey: String(row.idempotency_key) } : {}), ...(request?.prompt ? { prompt: request.prompt } : {}), ...(request?.layout ? { layout: request.layout } : {}), ...(request?.size ? { size: request.size } : {}), ...(request?.resolution ? { resolution: request.resolution } : {}), ...(request?.quality ? { quality: request.quality } : {}), repeat: request?.repeat ?? 1, ...(request?.providerId || row.provider_id ? { providerId: request?.providerId ?? String(row.provider_id) } : {}), ...(row.windows_json ? { windows: JSON.parse(String(row.windows_json)) as PromptWindow[] } : {}), ...(row.results_json ? { results: JSON.parse(String(row.results_json)) as JobResult[] } : {}), ...(row.error_json ? { error: JSON.parse(String(row.error_json)) as Job['error'] } : {}), provider: JSON.parse(String(row.provider_json)) as Job['provider'], createdAt: String(row.created_at), updatedAt: String(row.updated_at), ...(row.cancelled_at ? { cancelledAt: String(row.cancelled_at) } : {}) }
   }
-  create(input: JobInput, idempotencyKey?: string, defaults: Partial<ProviderConfig> = {}): { job: Job; created: boolean } {
+  private migrateLegacyProvider(): void {
+    const count = Number((this.db.prepare('SELECT COUNT(*) AS count FROM model_providers').get() as { count?: number }).count ?? 0)
+    if (count > 0) return
+    const legacy = this.db.prepare('SELECT base_url, api_key, updated_at FROM provider_config WHERE id = 1').get() as { base_url?: string; api_key?: string; updated_at?: string } | undefined
+    if (!legacy?.base_url || !legacy.api_key) return
+    const timestamp = now()
+    this.db.prepare('INSERT INTO model_providers (id, name, base_url, api_key, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)').run('legacy-default', '默认供应商', String(legacy.base_url), String(legacy.api_key), legacy.updated_at ?? timestamp, timestamp)
+  }
+  create(input: JobInput, idempotencyKey?: string, defaults: Partial<ProviderConfig> = {}, providerId?: string): { job: Job; created: boolean } {
     if (idempotencyKey) { const existing = this.db.prepare('SELECT * FROM jobs WHERE idempotency_key = ?').get(idempotencyKey) as Record<string, unknown> | undefined; if (existing) return { job: this.fromRow(existing), created: false } }
     const mode = normalizeMode(input.mode); if (!mode) throw new RequestValidationError('invalid_mode', 'mode 必须是 generate、edit、text_to_image 或 one_to_many')
     const windows = mode === 'one_to_many' ? validWindows(input.windows ?? input.promptWindows) : undefined
@@ -212,10 +224,10 @@ export class JobStore {
     const sourceImage = sourceImageValue(input.sourceImage)
     if (mode === 'edit' && !sourceImage) throw new RequestValidationError('invalid_source_image', 'edit 模式必须提供 sourceImage')
     if (mode === 'edit' && !prompt) throw new RequestValidationError('invalid_prompt', 'edit 模式必须提供 prompt')
-    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), resolution: optionalString(input.resolution, 'resolution'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), provider: providerConfig(input.provider, { ...this.getProviderConfig(), ...defaults }), ...(sourceImage ? { sourceImage } : {}) }
-    const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.resolution ? { resolution: request.resolution } : {}), ...(request.quality ? { quality: request.quality } : {}), repeat: request.repeat, ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
+    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), resolution: optionalString(input.resolution, 'resolution'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), provider: providerConfig(input.provider, { ...this.activeProviderConfig(), ...this.getProviderConfig(), ...defaults }), ...(providerId ? { providerId } : {}), ...(sourceImage ? { sourceImage } : {}) }
+    const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.resolution ? { resolution: request.resolution } : {}), ...(request.quality ? { quality: request.quality } : {}), repeat: request.repeat, ...(request.providerId ? { providerId: request.providerId } : {}), ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
     const persistedRequest = { ...request, provider: { baseUrl: request.provider.baseUrl, apiKey: '' } }
-    this.db.prepare('INSERT INTO jobs (id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, request_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(job.id, idempotencyKey ?? null, job.mode, job.status, job.windows ? JSON.stringify(job.windows) : null, JSON.stringify(job.provider), job.createdAt, job.updatedAt, JSON.stringify(persistedRequest))
+    this.db.prepare('INSERT INTO jobs (id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, request_json, provider_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(job.id, idempotencyKey ?? null, job.mode, job.status, job.windows ? JSON.stringify(job.windows) : null, JSON.stringify(job.provider), job.createdAt, job.updatedAt, JSON.stringify(persistedRequest), request.providerId ?? null)
     this.runtimeProviders.set(job.id, request.provider)
     return { job, created: true }
   }
@@ -225,6 +237,56 @@ export class JobStore {
     const row = this.db.prepare('SELECT base_url, api_key FROM provider_config WHERE id = 1').get() as { base_url?: string; api_key?: string } | undefined
     return row?.base_url && row.api_key ? { baseUrl: String(row.base_url), apiKey: String(row.api_key) } : undefined
   }
+  private providerFromRow(row: Record<string, unknown>): StoredProvider {
+    return { id: String(row.id), name: String(row.name), baseUrl: String(row.base_url), apiKey: String(row.api_key), configured: Boolean(String(row.api_key)), enabled: Number(row.enabled) === 1, successCount: Number(row.success_count ?? 0), failureCount: Number(row.failure_count ?? 0), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }
+  }
+  listProviders(): ModelProvider[] {
+    // 启用状态只影响标识和任务路由，列表始终保持供应商首次添加的顺序。
+    return (this.db.prepare('SELECT id, name, base_url, api_key, enabled, success_count, failure_count, created_at, updated_at FROM model_providers ORDER BY rowid ASC').all() as Record<string, unknown>[]).map((row) => {
+      const provider = this.providerFromRow(row)
+      const { apiKey: _apiKey, ...publicProvider } = provider
+      return publicProvider
+    })
+  }
+  getProvider(id: string): StoredProvider | undefined {
+    const row = this.db.prepare('SELECT id, name, base_url, api_key, enabled, success_count, failure_count, created_at, updated_at FROM model_providers WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    return row ? this.providerFromRow(row) : undefined
+  }
+  activeProvider(): StoredProvider | undefined {
+    const row = this.db.prepare('SELECT id, name, base_url, api_key, enabled, success_count, failure_count, created_at, updated_at FROM model_providers WHERE enabled = 1 LIMIT 1').get() as Record<string, unknown> | undefined
+    return row ? this.providerFromRow(row) : undefined
+  }
+  activeProviderConfig(): ProviderConfig | undefined {
+    const provider = this.activeProvider()
+    return provider?.baseUrl && provider.apiKey ? { baseUrl: provider.baseUrl, apiKey: provider.apiKey } : undefined
+  }
+  createProvider(name: string, config: ProviderConfig): ModelProvider {
+    const id = `provider_${randomUUID()}`; const timestamp = now(); const shouldEnable = !this.activeProvider()
+    if (shouldEnable) this.db.prepare('UPDATE model_providers SET enabled = 0, updated_at = ?').run(timestamp)
+    this.db.prepare('INSERT INTO model_providers (id, name, base_url, api_key, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, name, config.baseUrl, config.apiKey, shouldEnable ? 1 : 0, timestamp, timestamp)
+    return this.listProviders().find((provider) => provider.id === id)!
+  }
+  updateProvider(id: string, name: string, baseUrl: string, apiKey?: string): ModelProvider | undefined {
+    const existing = this.getProvider(id); if (!existing) return undefined
+    const timestamp = now(); const nextKey = apiKey?.trim() ? apiKey.trim() : existing.apiKey
+    this.db.prepare('UPDATE model_providers SET name = ?, base_url = ?, api_key = ?, updated_at = ? WHERE id = ?').run(name, baseUrl, nextKey, timestamp, id)
+    return this.listProviders().find((provider) => provider.id === id)
+  }
+  enableProvider(id: string): ModelProvider | undefined {
+    const existing = this.getProvider(id); if (!existing) return undefined
+    const timestamp = now(); this.db.prepare('UPDATE model_providers SET enabled = 0, updated_at = ?').run(timestamp); this.db.prepare('UPDATE model_providers SET enabled = 1, updated_at = ? WHERE id = ?').run(timestamp, id)
+    return this.listProviders().find((provider) => provider.id === id)
+  }
+  deleteProvider(id: string): boolean {
+    const existing = this.getProvider(id); if (!existing) return false
+    this.db.prepare('DELETE FROM model_providers WHERE id = ?').run(id); return true
+  }
+  recordProviderOutcome(providerId: string | undefined, status: 'completed' | 'failed'): void {
+    if (!providerId) return
+    const column = status === 'completed' ? 'success_count' : 'failure_count'
+    this.db.prepare(`UPDATE model_providers SET ${column} = ${column} + 1, updated_at = ? WHERE id = ?`).run(now(), providerId)
+  }
+  runningCount(): number { return Number((this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE status = 'running'").get() as { count?: number }).count ?? 0) }
   getMaxConcurrency(): number | undefined {
     const row = this.db.prepare('SELECT value FROM app_settings WHERE key = ?').get('max_concurrency') as { value?: string } | undefined
     const value = Number(row?.value)
@@ -235,6 +297,10 @@ export class JobStore {
   }
   saveProviderConfig(config: ProviderConfig): void {
     this.db.prepare('INSERT INTO provider_config (id, base_url, api_key, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET base_url = excluded.base_url, api_key = excluded.api_key, updated_at = excluded.updated_at').run(config.baseUrl, config.apiKey, now())
+    const active = this.activeProvider()
+    if (active) this.updateProvider(active.id, active.name, config.baseUrl, config.apiKey)
+    else if (this.getProvider('legacy-default')) this.enableProvider('legacy-default') && this.updateProvider('legacy-default', '默认供应商', config.baseUrl, config.apiKey)
+    else this.db.prepare('INSERT INTO model_providers (id, name, base_url, api_key, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)').run('legacy-default', '默认供应商', config.baseUrl, config.apiKey, now(), now())
   }
   prompts(): Prompt[] {
     return (this.db.prepare('SELECT id, category, title, text, layout, builtin, source_name FROM prompts ORDER BY rowid').all() as Record<string, unknown>[]).map((row) => ({
@@ -292,7 +358,7 @@ function maxConcurrencyValue(value: unknown, fallback = DEFAULT_MAX_CONCURRENCY)
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_CONCURRENCY) throw new RequestValidationError('invalid_max_concurrency', `maxConcurrency 必须是 1 到 ${MAX_CONCURRENCY} 的整数`)
   return parsed
 }
-function setCors(res: HttpResponse): void { res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS') }
+function setCors(res: HttpResponse): void { res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS') }
 function dataEvent(event: string, data: unknown): string { return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n` }
 const STATIC_CONTENT_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -352,7 +418,8 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       for (const prompt of prompts) for (let repeatIndex = 0; repeatIndex < request.repeat; repeatIndex += 1) {
         if (runtime.controller.signal.aborted) throw new DOMException('任务已取消', 'AbortError')
         // 页面关闭或服务重启后，任务仍可从本地 Provider 配置恢复执行凭据。
-        const provider = store.provider(id) ?? store.getProviderConfig() ?? request.provider
+        const storedProvider = request.providerId ? store.getProvider(request.providerId) : undefined
+        const provider = store.provider(id) ?? (storedProvider ? { baseUrl: request.provider.baseUrl || storedProvider.baseUrl, apiKey: storedProvider.apiKey } : undefined) ?? store.activeProviderConfig() ?? store.getProviderConfig() ?? request.provider
         const requestStartedAt = Date.now()
         providerStage = 'request'
         appendExecutionLog(workspaceDir, 'provider_request_started', { jobId: id, mode: initial.mode, itemIndex: results.length, providerHost: providerHost(provider.baseUrl), size: request.size, resolution: request.resolution, quality: request.quality })
@@ -360,7 +427,14 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         const result: GenerationResult = initial.mode === 'edit'
           ? await imageEditor({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, prompt: effectivePrompt, sourceImage: request.sourceImage!, size: request.size, quality: request.quality, signal: runtime.controller.signal })
           : await imageGenerator({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, prompt: effectivePrompt, size: request.size, quality: request.quality, signal: runtime.controller.signal })
-        appendExecutionLog(workspaceDir, 'provider_response_received', { jobId: id, itemIndex: results.length, resultKind: result.kind, durationMs: Date.now() - requestStartedAt })
+        appendExecutionLog(workspaceDir, 'provider_response_received', {
+          jobId: id,
+          itemIndex: results.length,
+          resultKind: result.kind,
+          // URL 结果需要二次下载；记录实际地址便于用户定位 CDN、代理或有效期问题。该地址可能带签名参数，仅用于本地诊断。
+          ...(result.kind === 'url' ? { resultUrl: result.value } : {}),
+          durationMs: Date.now() - requestStartedAt,
+        })
         // Provider 可能返回 base64，也可能返回短时效图片 URL；URL 必须在任务执行期间下载后再落盘。
         providerStage = 'materialize'
         const imageBytes = await materializeImageResult(result, runtime.controller.signal)
@@ -370,7 +444,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) return
         emit(id, 'progress', { completed: index + 1, total, result: results[index], job: current })
       }
-      const current = store.get(id); if (current?.status === 'cancelled') return; const completed = store.update(id, 'completed', { provider: { status: 'completed', invoked: true }, results }); if (completed) { appendExecutionLog(workspaceDir, 'job_completed', { jobId: id, resultCount: results.length, durationMs: Date.now() - jobStartedAt }); emit(id, 'completed', completed) }
+      const current = store.get(id); if (current?.status === 'cancelled') return; const completed = store.update(id, 'completed', { provider: { status: 'completed', invoked: true }, results }); if (completed) { store.recordProviderOutcome(request.providerId, 'completed'); appendExecutionLog(workspaceDir, 'job_completed', { jobId: id, resultCount: results.length, durationMs: Date.now() - jobStartedAt }); emit(id, 'completed', completed) }
     } catch (error) {
       const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) { if (current) emit(id, 'failed', current); return }
       // 仅向前端返回可操作的诊断方向，不透传 Provider 原始响应或请求内容。
@@ -379,7 +453,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         : { code: 'generation_failed', message: 'Provider 请求未完成，请检查接口地址、网络或 API Key' }
       if (providerStage) appendExecutionLog(workspaceDir, 'provider_stage_failed', { jobId: id, stage: providerStage, ...logErrorFields(error) })
       appendExecutionLog(workspaceDir, 'job_failed', { jobId: id, mode: initial.mode, durationMs: Date.now() - jobStartedAt, ...logErrorFields(error) })
-      const failed = store.update(id, 'failed', { provider: { status: 'failed', invoked: true }, error: safeError }); if (failed) emit(id, 'failed', failed)
+      const failed = store.update(id, 'failed', { provider: { status: 'failed', invoked: true }, error: safeError }); if (failed) { store.recordProviderOutcome(request.providerId, 'failed'); emit(id, 'failed', failed) }
     } finally { if (runtimes.get(id) === runtime) runtimes.delete(id); store.forgetProvider(id) }
   }
   const pump = (): void => {
@@ -427,6 +501,57 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       return
     }
     if (req.method === 'GET' && path === '/api/prompts') { const items = store.prompts(); json(res, 200, { items, total: items.length }); return }
+    if (req.method === 'GET' && path === '/api/providers') {
+      const active = store.activeProvider()
+      json(res, 200, { items: store.listProviders(), activeId: active?.id ?? null, runningCount: store.runningCount() })
+      return
+    }
+    if (req.method === 'POST' && path === '/api/providers') {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      try {
+        const item = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
+        const name = optionalString(item.name, 'provider_name')
+        const baseUrl = optionalString(item.baseUrl, 'provider_base_url')
+        const apiKey = optionalString(item.apiKey, 'provider_api_key')
+        if (!name || !baseUrl || !apiKey) throw new RequestValidationError('invalid_provider', '供应商名称、Base URL 和 API Key 均不能为空')
+        json(res, 201, store.createProvider(name, { baseUrl, apiKey }))
+      } catch (error) { if (error instanceof RequestValidationError) errorResponse(res, 400, error.code, error.message); else errorResponse(res, 500, 'internal_error', '供应商创建失败') }
+      return
+    }
+    const providerMatch = path.match(/^\/api\/providers\/([^/]+)(?:\/(enable))?$/)
+    if (providerMatch && req.method === 'PUT' && !providerMatch[2]) {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      try {
+        const item = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
+        const name = optionalString(item.name, 'provider_name')
+        const baseUrl = optionalString(item.baseUrl, 'provider_base_url')
+        if (!name || !baseUrl) throw new RequestValidationError('invalid_provider', '供应商名称和 Base URL 不能为空')
+        const updated = store.updateProvider(decodeURIComponent(providerMatch[1]), name, baseUrl, typeof item.apiKey === 'string' ? item.apiKey : undefined)
+        if (!updated) { errorResponse(res, 404, 'provider_not_found', '供应商不存在'); return }
+        json(res, 200, updated)
+      } catch (error) { if (error instanceof RequestValidationError) errorResponse(res, 400, error.code, error.message); else errorResponse(res, 500, 'internal_error', '供应商保存失败') }
+      return
+    }
+    if (providerMatch && req.method === 'POST' && providerMatch[2]) {
+      const id = decodeURIComponent(providerMatch[1]); const existing = store.getProvider(id)
+      if (!existing) { errorResponse(res, 404, 'provider_not_found', '供应商不存在'); return }
+      if (!existing.enabled && store.runningCount() > 0) { errorResponse(res, 409, 'provider_switch_locked', `当前有 ${store.runningCount()} 个任务执行中，暂不能切换模型供应商`); return }
+      const enabled = store.enableProvider(id)
+      json(res, 200, enabled)
+      return
+    }
+    if (providerMatch && req.method === 'DELETE' && !providerMatch[2]) {
+      const id = decodeURIComponent(providerMatch[1]); const existing = store.getProvider(id)
+      if (!existing) { errorResponse(res, 404, 'provider_not_found', '供应商不存在'); return }
+      const providers = store.listProviders()
+      if (store.runningCount() > 0) { errorResponse(res, 409, 'provider_delete_locked', '有任务执行中，暂不能删除模型供应商'); return }
+      if (providers.length <= 1) { errorResponse(res, 409, 'provider_last_one', '至少保留一个模型供应商'); return }
+      if (existing.enabled) { errorResponse(res, 409, 'provider_enabled', '请先启用其他模型供应商，再删除当前供应商'); return }
+      store.deleteProvider(id); res.writeHead(204); res.end()
+      return
+    }
     if (req.method === 'GET' && path === '/api/provider') {
       json(res, 200, effectiveProviderMetadata(store))
       return
@@ -455,7 +580,9 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       let body: unknown; try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }; if (!body || typeof body !== 'object' || Array.isArray(body)) { errorResponse(res, 400, 'invalid_body', '请求体必须是 JSON 对象'); return }
       const input = body as JobInput; const bodyKey = input.idempotencyKey; const headerKey = headerValue(req.headers['idempotency-key']); if (bodyKey !== undefined && typeof bodyKey !== 'string') { errorResponse(res, 400, 'invalid_idempotency_key', 'idempotencyKey 必须是字符串'); return }; if (bodyKey && headerKey && bodyKey !== headerKey) { errorResponse(res, 400, 'idempotency_key_mismatch', '请求体与请求头的幂等键不一致'); return }; const idempotencyKey = bodyKey || headerKey; if (idempotencyKey !== undefined && (idempotencyKey.trim() === '' || idempotencyKey.length > 200)) { errorResponse(res, 400, 'invalid_idempotency_key', 'idempotencyKey 长度必须为 1 到 200 个字符'); return }
       try {
-        const result = store.create(input, idempotencyKey, options.defaultProvider)
+        // 新任务绑定当前启用供应商；请求体不再承载密钥，旧版显式 provider 仍保留兼容能力。
+        const activeProvider = input.provider === undefined ? store.activeProvider() : undefined
+        const result = store.create(input, idempotencyKey, activeProvider ? { baseUrl: activeProvider.baseUrl, apiKey: activeProvider.apiKey } : options.defaultProvider, activeProvider?.id)
         json(res, result.created ? 201 : 200, result.job)
         if (result.created && (result.job.prompt || result.job.windows)) queue(result.job.id)
       } catch (error) { if (error instanceof RequestValidationError) { errorResponse(res, 400, error.code, error.message); return }; errorResponse(res, 500, 'internal_error', '创建任务失败') }; return

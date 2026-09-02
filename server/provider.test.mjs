@@ -76,16 +76,89 @@ test('Provider 返回图片 URL 时下载为可落盘的图片字节', async () 
 
 test('Provider 图片 URL 响应体读取异常时返回下载错误码', async () => {
   const originalFetch = globalThis.fetch
+  let attempts = 0
   globalThis.fetch = async () => ({
     ok: true,
     headers: { get: () => 'image/png' },
-    arrayBuffer: async () => { throw new Error('response body terminated') },
+    arrayBuffer: async () => { attempts += 1; throw new Error('response body terminated') },
   })
   try {
     await assert.rejects(
       materializeImageResult({ kind: 'url', value: 'https://provider.example/result.png' }),
       (error) => error instanceof ProviderError && error.code === 'provider_result_download_failed',
     )
+    assert.equal(attempts, 4)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('Provider 图片 URL 非成功响应后最多重试三次并在重试成功时返回图片', async () => {
+  const originalFetch = globalThis.fetch
+  let attempts = 0
+  globalThis.fetch = async () => {
+    attempts += 1
+    if (attempts < 4) return { ok: false, status: 503, headers: { get: () => 'text/plain' } }
+    return { ok: true, headers: { get: () => 'image/png' }, arrayBuffer: async () => Buffer.from('retry-image') }
+  }
+  try {
+    const bytes = await materializeImageResult({ kind: 'url', value: 'https://provider.example/result.png' })
+    assert.deepEqual(Buffer.from(bytes), Buffer.from('retry-image'))
+    assert.equal(attempts, 4)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('Provider 图片 URL 下载异常三次后返回最后一次下载错误', async () => {
+  const originalFetch = globalThis.fetch
+  let attempts = 0
+  globalThis.fetch = async () => {
+    attempts += 1
+    throw new Error(`network failure ${attempts}`)
+  }
+  try {
+    await assert.rejects(
+      materializeImageResult({ kind: 'url', value: 'https://provider.example/result.png' }),
+      (error) => error instanceof ProviderError && error.code === 'provider_result_download_failed' && error.detail?.includes('network failure 4'),
+    )
+    assert.equal(attempts, 4)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('Provider base64 图片不触发 URL 下载重试', async () => {
+  const originalFetch = globalThis.fetch
+  let attempts = 0
+  globalThis.fetch = async () => {
+    attempts += 1
+    throw new Error('不应下载 base64 结果')
+  }
+  try {
+    const bytes = await materializeImageResult({ kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' })
+    assert.deepEqual(Buffer.from(bytes), Buffer.from('fake-image'))
+    assert.equal(attempts, 0)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('Provider 图片下载被调用方取消时不重试', async () => {
+  const originalFetch = globalThis.fetch
+  const controller = new AbortController()
+  let attempts = 0
+  globalThis.fetch = async () => {
+    attempts += 1
+    controller.abort()
+    throw new DOMException('任务已取消', 'AbortError')
+  }
+  try {
+    await assert.rejects(
+      materializeImageResult({ kind: 'url', value: 'https://provider.example/result.png' }, controller.signal),
+      (error) => error instanceof DOMException && error.name === 'AbortError',
+    )
+    assert.equal(attempts, 1)
   } finally {
     globalThis.fetch = originalFetch
   }

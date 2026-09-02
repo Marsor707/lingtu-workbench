@@ -23,6 +23,7 @@ export type GenerationResult = {
 }
 
 export const DEFAULT_PROVIDER_TIMEOUT_MS = 3 * 60 * 1000
+const MAX_RESULT_DOWNLOAD_ATTEMPTS = 4
 
 export class ProviderError extends Error {
   constructor(public readonly code: string, message: string, public readonly status?: number, public readonly detail?: string) {
@@ -102,23 +103,33 @@ export async function materializeImageResult(result: GenerationResult, signal?: 
   }
 
   const requestSignal = timedSignal(signal)
-  try {
-    const response = await fetch(parsed, { signal: requestSignal.signal })
-    if (!response.ok) {
-      throw new ProviderError('provider_result_download_failed', `Provider 图片结果下载失败（HTTP ${response.status}）`, response.status)
+  let lastError: unknown
+  // URL 可能因网络抖动或远端 CDN 短暂异常下载失败，首次失败后最多重试三次。
+  for (let attempt = 0; attempt < MAX_RESULT_DOWNLOAD_ATTEMPTS; attempt += 1) {
+    if (signal?.aborted) throw new DOMException('Provider 图片下载已取消', 'AbortError')
+    try {
+      const response = await fetch(parsed, { signal: requestSignal.signal })
+      if (!response.ok) {
+        throw new ProviderError('provider_result_download_failed', `Provider 图片结果下载失败（HTTP ${response.status}）`, response.status)
+      }
+      const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase()
+      if (contentType && !contentType.startsWith('image/')) {
+        throw new ProviderError('provider_invalid_response', 'Provider 图片 URL 返回的不是图片')
+      }
+      const bytes = new Uint8Array(await response.arrayBuffer())
+      if (bytes.byteLength === 0) throw new ProviderError('provider_invalid_response', 'Provider 图片 URL 返回内容为空')
+      return bytes
+    } catch (error) {
+      if (signal?.aborted) throw new DOMException('Provider 图片下载已取消', 'AbortError')
+      if (requestSignal.timeoutSignal.aborted) throw new ProviderError('provider_timeout', 'Provider 图片结果下载超时（默认 3 分钟）')
+      // 内容类型和空响应属于结果格式错误，重试无法修复；只有下载异常和非成功 HTTP 响应重试。
+      if (error instanceof ProviderError && error.code !== 'provider_result_download_failed') throw error
+      lastError = error
     }
-    const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase()
-    if (contentType && !contentType.startsWith('image/')) {
-      throw new ProviderError('provider_invalid_response', 'Provider 图片 URL 返回的不是图片')
-    }
-    const bytes = new Uint8Array(await response.arrayBuffer())
-    if (bytes.byteLength === 0) throw new ProviderError('provider_invalid_response', 'Provider 图片 URL 返回内容为空')
-    return bytes
-  } catch (error) {
-    if (error instanceof ProviderError) throw error
-    if (requestSignal.timeoutSignal.aborted && !signal?.aborted) throw new ProviderError('provider_timeout', 'Provider 图片结果下载超时（默认 3 分钟）')
-    throw new ProviderError('provider_result_download_failed', 'Provider 图片结果下载失败，请检查结果 URL 可访问性', undefined, errorDetail(error))
   }
+
+  if (lastError instanceof ProviderError) throw lastError
+  throw new ProviderError('provider_result_download_failed', 'Provider 图片结果下载失败，请检查结果 URL 可访问性', undefined, errorDetail(lastError))
 }
 
 export async function generateImage(request: GenerationRequest): Promise<GenerationResult> {

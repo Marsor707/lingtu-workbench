@@ -42,7 +42,7 @@ import {
 import './styles.css'
 
 type Mode = 'generate' | 'edit' | 'text' | 'one-to-many'
-type Page = 'workbench' | 'queue' | 'gallery' | 'prompts'
+type Page = 'workbench' | 'queue' | 'gallery' | 'prompts' | 'models'
 
 type PromptWindow = {
   id: number
@@ -61,9 +61,16 @@ type PromptItem = {
   layout: string
 }
 
-type ChannelConfig = {
+type ModelProvider = {
+  id: string
+  name: string
   baseUrl: string
-  apiKey: string
+  configured: boolean
+  enabled: boolean
+  successCount: number
+  failureCount: number
+  createdAt: string
+  updatedAt: string
 }
 
 type QueueStatus = 'queued' | 'running' | 'done' | 'review' | 'failed' | 'cancelled'
@@ -296,21 +303,8 @@ function App() {
   const [running, setRunning] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [maxConcurrency, setMaxConcurrency] = useState(() => readStoredMaxConcurrency())
-  const [channelConfig, setChannelConfig] = useState<ChannelConfig>(() => {
-    try {
-      const saved = window.localStorage.getItem('lingtu-channel-config')
-      if (saved) {
-        const parsed = JSON.parse(saved) as Partial<ChannelConfig>
-        if (typeof parsed.baseUrl === 'string') {
-          window.localStorage.setItem('lingtu-channel-config', JSON.stringify({ baseUrl: parsed.baseUrl }))
-          return { baseUrl: parsed.baseUrl, apiKey: '' }
-        }
-      }
-    } catch {
-      // 本地存储不可用时回退到默认空配置。
-    }
-    return { baseUrl: 'https://api.example.com/v1', apiKey: '' }
-  })
+  const [modelProviders, setModelProviders] = useState<ModelProvider[]>([])
+  const [providerRunningCount, setProviderRunningCount] = useState(0)
   const [prompts, setPrompts] = useState<PromptItem[]>([])
   const [promptsLoading, setPromptsLoading] = useState(true)
   const [promptsError, setPromptsError] = useState('')
@@ -380,10 +374,11 @@ function App() {
 
   useEffect(() => {
     const controller = new AbortController()
-    fetch(`${LOCAL_API_BASE}/api/provider`, { signal: controller.signal })
-      .then((response) => response.ok ? response.json() as Promise<{ baseUrl?: string }> : Promise.reject(new Error('provider config unavailable')))
+    fetch(`${LOCAL_API_BASE}/api/providers`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() as Promise<{ items?: ModelProvider[]; runningCount?: number }> : Promise.reject(new Error('provider config unavailable')))
       .then((body) => {
-        if (typeof body.baseUrl === 'string' && body.baseUrl.trim()) setChannelConfig((current) => ({ ...current, baseUrl: body.baseUrl!.trim() }))
+        setModelProviders(Array.isArray(body.items) ? body.items : [])
+        setProviderRunningCount(typeof body.runningCount === 'number' ? body.runningCount : 0)
       })
       .catch(() => undefined)
     return () => controller.abort()
@@ -475,6 +470,7 @@ function App() {
       queue: '任务队列',
       gallery: '生成画廊',
       prompts: '提示词库',
+      models: '模型设置',
     }
     return titles[page]
   }, [page])
@@ -486,24 +482,7 @@ function App() {
     if (item) setTextPrompt(item.text)
   }
 
-  const saveWorkspaceConfig = async (config: ChannelConfig, nextMaxConcurrency: number) => {
-    if (config.apiKey.trim()) {
-      const response = await fetch(`${LOCAL_API_BASE}/api/provider`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ baseUrl: config.baseUrl.trim(), apiKey: config.apiKey }),
-      })
-      const body = await response.json() as ApiErrorBody & { baseUrl?: string }
-      if (!response.ok) throw new Error(body.error?.message || 'Provider 配置保存失败')
-      // 保存成功后清空前端内存副本，后续任务由本地服务读取已保存配置。
-      setChannelConfig({ baseUrl: config.baseUrl, apiKey: '' })
-      try {
-        // 只记住地址，API Key 由本地服务保存，避免写入浏览器存储。
-        window.localStorage.setItem('lingtu-channel-config', JSON.stringify({ baseUrl: config.baseUrl }))
-      } catch {
-        // 无痕模式等场景可能禁用存储，仍保留当前会话配置。
-      }
-    }
+  const saveWorkspaceConfig = async (nextMaxConcurrency: number) => {
     const settingsResponse = await fetch(`${LOCAL_API_BASE}/api/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -513,6 +492,16 @@ function App() {
     if (!settingsResponse.ok || typeof settingsBody.maxConcurrency !== 'number') throw new Error(settingsBody.error?.message || '并发设置保存失败')
     setMaxConcurrency(settingsBody.maxConcurrency)
   }
+
+  const refreshProviders = async () => {
+    const response = await fetch(`${LOCAL_API_BASE}/api/providers`)
+    const body = await response.json() as { items?: ModelProvider[]; runningCount?: number }
+    if (!response.ok) throw new Error((body as ApiErrorBody).error?.message || '模型供应商加载失败')
+    setModelProviders(Array.isArray(body.items) ? body.items : [])
+    setProviderRunningCount(typeof body.runningCount === 'number' ? body.runningCount : 0)
+  }
+
+  const activeProvider = modelProviders.find((provider) => provider.enabled)
 
   const updateQueueFromJob = (job: ApiJob) => {
     const status = job.status === 'completed' || job.status === 'done'
@@ -737,10 +726,6 @@ function App() {
               quality,
               repeat,
               sourceImage,
-              provider: {
-                baseUrl: channelConfig.baseUrl.trim(),
-                ...(channelConfig.apiKey.trim() ? { apiKey: channelConfig.apiKey } : {}),
-              },
               idempotencyKey: `lingtu-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
             }),
           })
@@ -785,6 +770,7 @@ function App() {
     { id: 'queue', label: '任务队列', icon: ListChecks, badge: `${queue.filter((item) => item.status === 'running').length}` },
     { id: 'gallery', label: '生成画廊', icon: GalleryHorizontalEnd },
     { id: 'prompts', label: '提示词库', icon: BookOpen },
+    { id: 'models', label: '模型设置', icon: Settings2, badge: activeProvider ? '启用' : '未配' },
   ]
 
   return (
@@ -823,13 +809,14 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} channelConfig={channelConfig} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProviderName={activeProvider?.name} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={refreshQueue} onCancel={cancelJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} />}
+        {page === 'models' && <ModelSettingsPage providers={modelProviders} runningCount={providerRunningCount} onRefresh={refreshProviders} />}
       </main>
 
-      {showSettings && <SettingsModal config={channelConfig} maxConcurrency={maxConcurrency} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsModal maxConcurrency={maxConcurrency} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
     </div>
   )
 }
@@ -873,7 +860,7 @@ type WorkbenchProps = {
   statsLoading: boolean
   statsError: string
   serviceOnline: boolean
-  channelConfig: ChannelConfig
+  activeProviderName?: string
   submitError: string
   onRefresh: () => Promise<void>
   onNavigate: (page: Page) => void
@@ -881,7 +868,7 @@ type WorkbenchProps = {
 }
 
 function Workbench(props: WorkbenchProps) {
-  const { mode, setMode, activeMode, layout, setLayout, size, setSize, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, channelConfig, submitError, onRefresh, onNavigate, onViewResults } = props
+  const { mode, setMode, activeMode, layout, setLayout, size, setSize, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProviderName, submitError, onRefresh, onNavigate, onViewResults } = props
   const [showAdvanced, setShowAdvanced] = useState(true)
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -971,7 +958,7 @@ function Workbench(props: WorkbenchProps) {
 
         <div className="settings-divider"><button className="advanced-trigger" onClick={() => setShowAdvanced((open) => !open)} aria-expanded={showAdvanced}><SlidersHorizontal size={15} />高级参数 <span>默认生产规范</span><ChevronDown size={15} className={showAdvanced ? 'rotate-180' : ''} /></button></div>
         {showAdvanced && <div className="settings-grid"><div className="compact-field"><label htmlFor="layout-select">输出布局</label><div className="select-wrap"><select id="layout-select" value={layout} onChange={(event) => setLayout(event.target.value)}><option>四宫格</option><option>二宫格</option><option>九宫格</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="size-select">长宽比例</label><div className="select-wrap"><select id="size-select" value={size} onChange={(event) => setSize(event.target.value)}>{SIZE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="resolution-select">分辨率</label><div className="select-wrap"><select id="resolution-select" value={resolution} onChange={(event) => setResolution(event.target.value)}><option>1K</option><option>2K</option><option>4K</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="quality-select">质量</label><div className="select-wrap"><select id="quality-select" value={quality} onChange={(event) => setQuality(event.target.value)}><option>高</option><option>中</option><option>自动</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="repeat-input">重复次数</label><div className="number-control"><input id="repeat-input" type="number" min="1" max="20" value={repeat} onChange={(event) => setRepeat(Math.min(20, Math.max(1, Number(event.target.value) || 1)))} /><span>次</span></div></div></div>}
-        <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>默认通道已配置 <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}{submissionProgress && <span className="submit-progress" role="status">已提交 {submissionProgress.current} / {submissionProgress.total} 张，后端并发处理中</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />{mode === 'edit' ? '批量提交中' : '创建任务中'}</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
+        <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>{activeProviderName ? `当前模型：${activeProviderName}` : '尚未配置模型供应商'} <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}{submissionProgress && <span className="submit-progress" role="status">已提交 {submissionProgress.current} / {submissionProgress.total} 张，后端并发处理中</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />{mode === 'edit' ? '批量提交中' : '创建任务中'}</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
       </div>
 
       <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div aria-hidden="true" /></div><div className={`layout-preview ${layout === '二宫格' ? 'layout-two' : layout === '九宫格' ? 'layout-nine' : ''}`} style={{ aspectRatio: formatSizeAspectRatio(size) }}>{Array.from({ length: previewCount }, (_, index) => <div className={`preview-cell cell-${String.fromCharCode(97 + index)}`} key={String.fromCharCode(65 + index)}><span>{String.fromCharCode(65 + index)}</span><small>{index === 0 ? '主视觉区域' : index === 1 ? '卖点信息区域' : '细节变体'}</small></div>)}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{formatSizeRatio(size)}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link" onClick={() => onNavigate('gallery')}>查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryAssets.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={`打开 ${image.title}`} aria-label={`打开 ${image.title}`} onClick={() => openRecentAsset(image)}><img src={image.src} alt={image.title} /><span className={`mini-status ${image.tone}`} /></button>)}{galleryAssets.length === 0 && <span className="empty-inline">暂无生成结果</span>}</div></div></div>
@@ -1108,39 +1095,131 @@ function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPr
   return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>提示词由本地服务初始化并从数据库读取。</p></div></section><div className="prompt-toolbar"><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" /></div></div>{error && <div className="form-error" role="status"><AlertTriangle size={14} />{error}</div>}{loading ? <div className="empty-state">提示词加载中…</div> : filtered.length === 0 ? <div className="empty-state">暂无可用提示词</div> : <div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? prompts.length : prompts.filter((prompt) => prompt.category === item).length}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => <article className={`prompt-card panel ${selectedPrompt === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedPrompt(item.id)}><div className="prompt-card-top"><span className="category-chip">{item.category}</span></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.layout === 'four_up' ? '4K 四宫格' : item.layout === 'fifteen_up_test' ? '4K 十五宫格测试' : '两宫格'} · 后端初始化</span>{selectedPrompt === item.id && <span className="selected-label"><Check size={13} />已选中</span>}</div></article>)}</div></div>}</div>
 }
 
-function SettingsModal({ config, maxConcurrency, onSave, onClose }: { config: ChannelConfig; maxConcurrency: number; onSave: (config: ChannelConfig, maxConcurrency: number) => Promise<void>; onClose: () => void }) {
-  const [draft, setDraft] = useState(config)
-  const [draftMaxConcurrency, setDraftMaxConcurrency] = useState(maxConcurrency)
+function ModelSettingsPage({ providers, runningCount, onRefresh }: { providers: ModelProvider[]; runningCount: number; onRefresh: () => Promise<void> }) {
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [showForm, setShowForm] = useState(false)
+  const [name, setName] = useState('')
+  const [baseUrl, setBaseUrl] = useState('')
+  const [apiKey, setApiKey] = useState('')
   const [showKey, setShowKey] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [error, setError] = useState('')
+  const [feedback, setFeedback] = useState('')
+  const [refreshing, setRefreshing] = useState(false)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => void onRefresh().catch(() => undefined), 2000)
+    return () => window.clearInterval(timer)
+  }, [onRefresh])
+
+  useEffect(() => {
+    if (!feedback) return
+    const timer = window.setTimeout(() => setFeedback(''), 2400)
+    return () => window.clearTimeout(timer)
+  }, [feedback])
+
+  const resetForm = () => {
+    setEditingId(null); setShowForm(false); setName(''); setBaseUrl(''); setApiKey(''); setShowKey(false); setError('')
+  }
+
+  const openCreate = () => {
+    setEditingId(null); setName(''); setBaseUrl(''); setApiKey(''); setShowKey(false); setError(''); setShowForm(true)
+  }
+
+  const openEdit = (provider: ModelProvider) => {
+    setEditingId(provider.id); setName(provider.name); setBaseUrl(provider.baseUrl); setApiKey(''); setShowKey(false); setError(''); setShowForm(true)
+  }
+
+  const parseError = async (response: Response, fallback: string): Promise<string> => {
+    try { return (await response.json() as ApiErrorBody).error?.message || fallback } catch { return fallback }
+  }
+
+  const validateForm = (): boolean => {
+    if (!name.trim()) { setError('请填写供应商名称。'); return false }
+    if (!baseUrl.trim()) { setError('请填写 Base URL。'); return false }
+    try {
+      const url = new URL(baseUrl.trim())
+      if (!['http:', 'https:'].includes(url.protocol)) throw new Error('unsupported protocol')
+    } catch { setError('Base URL 需填写完整的 http:// 或 https:// 地址。'); return false }
+    if (!editingId && !apiKey.trim()) { setError('新增供应商时必须填写 API Key。'); return false }
+    return true
+  }
+
+  const saveProvider = async () => {
+    if (saving || !validateForm()) return
+    setSaving(true); setError('')
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/api/providers${editingId ? `/${encodeURIComponent(editingId)}` : ''}`, {
+        method: editingId ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.trim(), baseUrl: baseUrl.trim(), ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) }),
+      })
+      if (!response.ok) throw new Error(await parseError(response, editingId ? '供应商保存失败' : '供应商创建失败'))
+      await onRefresh(); setFeedback(editingId ? '供应商配置已更新' : '供应商已添加'); resetForm()
+    } catch (saveError) { setError(saveError instanceof Error ? saveError.message : '供应商保存失败') } finally { setSaving(false) }
+  }
+
+  const enableProvider = async (provider: ModelProvider) => {
+    if (provider.enabled || busyId || runningCount > 0) return
+    setBusyId(provider.id); setError('')
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/api/providers/${encodeURIComponent(provider.id)}/enable`, { method: 'POST' })
+      if (!response.ok) throw new Error(await parseError(response, '模型供应商切换失败'))
+      await onRefresh(); setFeedback(`已启用 ${provider.name}`)
+    } catch (switchError) { setError(switchError instanceof Error ? switchError.message : '模型供应商切换失败') } finally { setBusyId(null) }
+  }
+
+  const deleteProvider = async (provider: ModelProvider) => {
+    if (provider.enabled || busyId || runningCount > 0 || providers.length <= 1) return
+    if (!window.confirm(`确认删除模型供应商“${provider.name}”？此操作不会删除历史任务。`)) return
+    setBusyId(provider.id); setError('')
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/api/providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(await parseError(response, '供应商删除失败'))
+      await onRefresh(); setFeedback(`已删除 ${provider.name}`)
+    } catch (deleteError) { setError(deleteError instanceof Error ? deleteError.message : '供应商删除失败') } finally { setBusyId(null) }
+  }
+
+  const handleRefresh = async () => {
+    if (refreshing) return
+    setRefreshing(true)
+    try {
+      // 保留短暂的视觉反馈，让刷新动作可感知且避免重复点击。
+      await Promise.all([onRefresh(), new Promise<void>((resolve) => window.setTimeout(resolve, 220))])
+      // 刷新成功后清除上一次切换失败留下的旧提示，避免任务结束后继续误导用户。
+      setError('')
+    } catch (refreshError) {
+      setError(refreshError instanceof Error ? refreshError.message : '模型供应商刷新失败')
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  return <div className="page-content inner-page model-settings-page">
+    <section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />连接管理</div><h1>模型设置</h1><p>配置多个模型供应商，并为新任务启用唯一的执行通道。</p></div><div className="heading-actions"><button className="button button-ghost" type="button" onClick={() => void handleRefresh()} disabled={refreshing} aria-busy={refreshing}><RefreshCw size={16} className={refreshing ? 'refreshing-icon' : ''} />{refreshing ? '刷新中…' : '刷新'}</button><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加供应商</button></div></section>
+    {runningCount > 0 && <div className="provider-lock-banner locked" role="status"><div><ShieldCheck size={17} /><span>当前有 {runningCount} 个任务执行中，暂不能切换模型供应商</span></div><small>任务结束前不能切换或删除供应商，配置编辑不受影响。</small></div>}
+    {error && <div className="form-error provider-page-error" role="alert"><AlertTriangle size={15} />{error}</div>}
+    {showForm && <section className="provider-form-panel" aria-labelledby="provider-form-title"><div className="provider-form-heading"><div><span className="section-kicker">{editingId ? '编辑配置' : '新增配置'}</span><h2 id="provider-form-title">{editingId ? '更新模型供应商' : '添加模型供应商'}</h2></div><button className="icon-button subtle" type="button" onClick={resetForm} title="关闭表单" aria-label="关闭供应商表单"><X size={18} /></button></div><div className="provider-form-grid"><div className="setting-field"><label htmlFor="provider-name">供应商名称</label><input id="provider-name" value={name} onChange={(event) => { setName(event.target.value); setError('') }} placeholder="例如：主力模型" autoFocus /></div><div className="setting-field provider-url-field"><label htmlFor="provider-base-url">服务地址</label><input id="provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="provider-api-key">API 秘钥</label><div className="secret-input"><input id="provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">秘钥仅保存在本地服务，不会出现在任务、日志或接口响应中。</span></div></div><div className="provider-form-actions"><button className="button button-ghost" type="button" onClick={resetForm}>取消</button><button className="button button-primary" type="button" onClick={() => void saveProvider()} disabled={saving}><Check size={16} />{saving ? '保存中…' : editingId ? '保存修改' : '添加供应商'}</button></div></section>}
+    {providers.length === 0 ? <div className="empty-state panel provider-empty"><Settings2 size={24} /><strong>尚未配置模型供应商</strong><span>添加名称、Base URL 和 API Key 后即可创建生图任务。</span><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加第一个供应商</button></div> : <div className="provider-list">{providers.map((provider) => <article className={`provider-row ${provider.enabled ? 'enabled' : ''}`} key={provider.id}><div className="provider-status-mark"><span /><small>{provider.enabled ? '已启用' : '未启用'}</small></div><div className="provider-identity"><div><h2>{provider.name}</h2>{provider.enabled && <span className="provider-active-badge"><CheckCircle2 size={13} />当前使用</span>}</div><span className="mono" title={provider.baseUrl}>{provider.baseUrl}</span><small>API Key {provider.configured ? '已配置' : '未配置'} · 更新于 {new Date(provider.updatedAt).toLocaleString('zh-CN', { hour12: false })}</small></div><div className="provider-stats" aria-label={`${provider.name}任务统计`}><div><span>成功</span><strong>{provider.successCount}</strong></div><div><span>失败</span><strong>{provider.failureCount}</strong></div></div><div className="provider-actions"><button className="icon-button subtle" type="button" onClick={() => openEdit(provider)} title={`编辑 ${provider.name}`} aria-label={`编辑 ${provider.name}`}><Settings2 size={16} /></button><button className="button button-small button-ghost provider-enable-button" type="button" disabled={provider.enabled || runningCount > 0 || busyId !== null} onClick={() => void enableProvider(provider)} title={runningCount > 0 ? '有任务执行中，暂不能切换' : provider.enabled ? '当前已启用' : `启用 ${provider.name}`}>{provider.enabled ? <><Check size={14} />已启用</> : <><Play size={14} />启用</>}</button><button className="icon-button danger-icon" type="button" disabled={provider.enabled || runningCount > 0 || providers.length <= 1 || busyId !== null} onClick={() => void deleteProvider(provider)} title={provider.enabled ? '当前启用供应商不能删除' : providers.length <= 1 ? '至少保留一个供应商' : `删除 ${provider.name}`} aria-label={`删除 ${provider.name}`}><Trash2 size={16} /></button></div></article>)}</div>}
+    {feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}
+  </div>
+}
+
+function SettingsModal({ maxConcurrency, onSave, onClose }: { maxConcurrency: number; onSave: (maxConcurrency: number) => Promise<void>; onClose: () => void }) {
+  const [draftMaxConcurrency, setDraftMaxConcurrency] = useState(maxConcurrency)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
 
-  const updateDraft = (patch: Partial<ChannelConfig>) => {
-    setSaved(false)
-    setError('')
-    setDraft((current) => ({ ...current, ...patch }))
-  }
-
   const handleSave = async () => {
     if (saving) return
-    if (!draft.baseUrl.trim()) {
-      setError('请填写接口地址。')
-      return
-    }
-    try {
-      const url = new URL(draft.baseUrl)
-      if (!['http:', 'https:'].includes(url.protocol)) throw new Error('unsupported protocol')
-    } catch {
-      setError('接口地址需填写完整的 http:// 或 https:// 地址。')
-      return
-    }
     setSaving(true)
     try {
-      await onSave(draft, draftMaxConcurrency)
+      await onSave(draftMaxConcurrency)
       setSaved(true)
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : 'Provider 配置保存失败')
+      setError(saveError instanceof Error ? saveError.message : '工作区设置保存失败')
     } finally {
       setSaving(false)
     }
@@ -1153,26 +1232,11 @@ function SettingsModal({ config, maxConcurrency, onSave, onClose }: { config: Ch
           <div>
             <span className="section-kicker">本地配置</span>
             <h2 id="settings-title">工作区设置</h2>
-            <p className="modal-description">当前版本仅支持一个默认通道，填写地址和密钥即可开始使用。</p>
+            <p className="modal-description">管理任务调度和本地工作区行为。模型连接请前往“模型设置”。</p>
           </div>
           <button className="icon-button subtle" onClick={onClose} title="关闭"><X size={18} /></button>
         </div>
         <div className="settings-modal-body">
-          <div className="channel-form">
-            <div className="setting-field">
-              <label htmlFor="channel-base-url">接口地址（baseUrl）</label>
-              <input id="channel-base-url" value={draft.baseUrl} onChange={(event) => updateDraft({ baseUrl: event.target.value })} placeholder="https://api.example.com/v1" inputMode="url" aria-invalid={Boolean(error)} />
-            </div>
-            <div className="setting-field">
-              <label htmlFor="channel-api-key">API Key</label>
-      <div className="secret-input">
-                <input id="channel-api-key" className={showKey ? 'api-key-input' : 'api-key-input masked'} type="text" value={draft.apiKey} onChange={(event) => updateDraft({ apiKey: event.target.value })} placeholder="输入当前通道的 API Key" autoComplete="off" />
-                <button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API Key' : '显示 API Key'} aria-label={showKey ? '隐藏 API Key' : '显示 API Key'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button>
-              </div>
-              <span className="field-help">密钥仅保存到本地服务配置表并用于 Provider 调用，不展示在任务、日志或导出文件中。</span>
-            </div>
-            {error && <div className="form-error" role="alert"><AlertTriangle size={14} />{error}</div>}
-          </div>
           <div className="setting-row">
             <div><strong>输出工作区</strong><span>结果、报告和日志均写入本机</span></div>
             <span className="field-help">由本地服务自动管理</span>
@@ -1181,6 +1245,7 @@ function SettingsModal({ config, maxConcurrency, onSave, onClose }: { config: Ch
             <div><strong>最大并发</strong><span>建议根据供应商配额逐步增加</span></div>
             <div className="number-control compact"><input type="number" min="1" max="20" value={draftMaxConcurrency} onChange={(event) => { setSaved(false); setError(''); setDraftMaxConcurrency(Math.min(20, Math.max(1, Number(event.target.value) || 1))) }} aria-label="最大并发数" /><span>线程</span></div>
           </div>
+          {error && <div className="form-error settings-modal-error" role="alert"><AlertTriangle size={14} />{error}</div>}
         </div>
         <div className="modal-footer">
           <span className={`save-feedback ${saved ? 'visible' : ''}`} role="status">{saved ? <><CheckCircle2 size={14} />已保存到本地配置</> : '修改后点击保存'}</span>
