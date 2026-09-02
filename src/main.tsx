@@ -16,9 +16,11 @@ import {
   Eye,
   EyeOff,
   FileImage,
+  FolderOpen,
   GalleryHorizontalEnd,
   GripVertical,
   ImagePlus,
+  Images,
   LayoutGrid,
   ListChecks,
   LoaderCircle,
@@ -75,6 +77,7 @@ type QueueItem = {
   time: string
   resultCount?: number
   error?: string
+  createdAt?: string
 }
 
 type GalleryAsset = {
@@ -117,6 +120,8 @@ type ApiErrorBody = {
 
 const LOCAL_API_BASE = 'http://127.0.0.1:8765'
 const SELECTED_PROMPT_STORAGE_KEY = 'lingtu-selected-prompt'
+const MAX_CONCURRENCY_STORAGE_KEY = 'lingtu-max-concurrency'
+const DEFAULT_MAX_CONCURRENCY = 4
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024
 const SOURCE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
 const SIZE_OPTIONS = [
@@ -146,6 +151,17 @@ function readStoredAdvancedSettings(): AdvancedSettings {
   }
 }
 
+function readStoredMaxConcurrency(): number {
+  try {
+    const raw = window.localStorage.getItem(MAX_CONCURRENCY_STORAGE_KEY)
+    if (!raw) return DEFAULT_MAX_CONCURRENCY
+    const saved = Number(raw)
+    return Number.isInteger(saved) ? Math.min(20, Math.max(1, saved)) : DEFAULT_MAX_CONCURRENCY
+  } catch {
+    return DEFAULT_MAX_CONCURRENCY
+  }
+}
+
 function readStoredPromptId(): string {
   try {
     return window.localStorage.getItem(SELECTED_PROMPT_STORAGE_KEY)?.trim() ?? ''
@@ -170,8 +186,45 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
+function isSupportedSourceImage(file: File): boolean {
+  return SOURCE_IMAGE_TYPES.has(file.type) || /\.(png|jpe?g|webp)$/i.test(file.name)
+}
+
+function sourceFilePath(file: File): string {
+  return (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
+}
+
+function summarizeSourceFiles(files: File[]): string {
+  return files.length === 0 ? '未选择源图' : `已添加：${files.map(sourceFilePath).join('、')}`
+}
+
+function sourceFileKey(file: File): string {
+  return `${sourceFilePath(file)}-${file.size}-${file.lastModified}`
+}
+
+function validateSourceFiles(fileList: FileList | null): { files: File[]; error?: string; skippedCount: number } {
+  const selectedFiles = Array.from(fileList ?? [])
+  const supportedFiles = selectedFiles.filter(isSupportedSourceImage)
+  const files = supportedFiles.filter((file) => file.size <= MAX_SOURCE_IMAGE_BYTES)
+  const skippedCount = selectedFiles.length - files.length
+  if (files.length === 0) {
+    const error = supportedFiles.length > 0 ? '所选图片均超过 8 MB' : '未找到 PNG、JPG 或 WEBP 图片'
+    return { files: [], error, skippedCount }
+  }
+  // 目录选择返回相对路径，按路径排序后提交顺序稳定；多选文件仍保留选择器返回顺序。
+  if (files.some((file) => sourceFilePath(file) !== file.name)) files.sort((a, b) => sourceFilePath(a).localeCompare(sourceFilePath(b), 'zh-CN'))
+  return { files, skippedCount }
+}
+
 function formatToday(): string {
   return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()).replaceAll('/', '.')
+}
+
+function formatQueueCreatedAt(value?: string): string {
+  if (!value) return '创建时间未知'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '创建时间未知'
+  return `创建于 ${new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(date).replaceAll('/', '-')}`
 }
 
 function formatLayoutLabel(layout?: string): string {
@@ -212,7 +265,7 @@ async function encodeFile(file: File): Promise<string> {
 
 const modes: Array<{ id: Mode; label: string; detail: string }> = [
   { id: 'generate', label: '正常生图', detail: '提示词模板 · 快速生产' },
-  { id: 'edit', label: '改图', detail: '单图附件 · 定向修改' },
+  { id: 'edit', label: '改图', detail: '多图/文件夹 · 并发修改' },
   { id: 'text', label: '文生图', detail: '无附件 · 独立尺寸' },
   { id: 'one-to-many', label: '一裂多', detail: '一张源图 · 多方向变体' },
 ]
@@ -242,6 +295,7 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [running, setRunning] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [maxConcurrency, setMaxConcurrency] = useState(() => readStoredMaxConcurrency())
   const [channelConfig, setChannelConfig] = useState<ChannelConfig>(() => {
     try {
       const saved = window.localStorage.getItem('lingtu-channel-config')
@@ -268,8 +322,9 @@ function App() {
   const [resolution, setResolution] = useState(advancedSettings.resolution)
   const [quality, setQuality] = useState(advancedSettings.quality)
   const [repeat, setRepeat] = useState(advancedSettings.repeat)
-  const [inputName, setInputName] = useState('未选择输入文件夹')
-  const [sourceFile, setSourceFile] = useState<File | null>(null)
+  const [inputName, setInputName] = useState('未选择源图')
+  const [sourceFiles, setSourceFiles] = useState<File[]>([])
+  const [submissionProgress, setSubmissionProgress] = useState<{ current: number; total: number } | null>(null)
   const [promptWindows, setPromptWindows] = useState<PromptWindow[]>([])
   const [queue, setQueue] = useState<QueueItem[]>([])
   const [galleryAssets, setGalleryAssets] = useState<GalleryAsset[]>([])
@@ -279,7 +334,28 @@ function App() {
   const [statsError, setStatsError] = useState('')
   const [serviceOnline, setServiceOnline] = useState(false)
   const [submitError, setSubmitError] = useState('')
-  const eventSourceRef = useRef<EventSource | null>(null)
+  const eventSourcesRef = useRef<Map<string, EventSource>>(new Map())
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(MAX_CONCURRENCY_STORAGE_KEY, String(maxConcurrency))
+    } catch {
+      // 存储不可用时保留当前会话的并发设置。
+    }
+  }, [maxConcurrency])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    fetch(`${LOCAL_API_BASE}/api/settings`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number }> : Promise.reject(new Error('settings unavailable')))
+      .then((body) => {
+        if (typeof body.maxConcurrency === 'number' && Number.isInteger(body.maxConcurrency)) {
+          setMaxConcurrency(Math.min(20, Math.max(1, body.maxConcurrency)))
+        }
+      })
+      .catch(() => undefined)
+    return () => controller.abort()
+  }, [])
 
   useEffect(() => {
     // 高级参数属于本机工作偏好，实时保存后刷新页面仍恢复上次选择。
@@ -386,7 +462,8 @@ function App() {
   }, [])
 
   useEffect(() => () => {
-    eventSourceRef.current?.close()
+    eventSourcesRef.current.forEach((source) => source.close())
+    eventSourcesRef.current.clear()
   }, [])
 
   const activeMode = modes.find((item) => item.id === mode) ?? modes[0]
@@ -409,22 +486,32 @@ function App() {
     if (item) setTextPrompt(item.text)
   }
 
-  const saveChannelConfig = async (config: ChannelConfig) => {
-    const response = await fetch(`${LOCAL_API_BASE}/api/provider`, {
+  const saveWorkspaceConfig = async (config: ChannelConfig, nextMaxConcurrency: number) => {
+    if (config.apiKey.trim()) {
+      const response = await fetch(`${LOCAL_API_BASE}/api/provider`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baseUrl: config.baseUrl.trim(), apiKey: config.apiKey }),
+      })
+      const body = await response.json() as ApiErrorBody & { baseUrl?: string }
+      if (!response.ok) throw new Error(body.error?.message || 'Provider 配置保存失败')
+      // 保存成功后清空前端内存副本，后续任务由本地服务读取已保存配置。
+      setChannelConfig({ baseUrl: config.baseUrl, apiKey: '' })
+      try {
+        // 只记住地址，API Key 由本地服务保存，避免写入浏览器存储。
+        window.localStorage.setItem('lingtu-channel-config', JSON.stringify({ baseUrl: config.baseUrl }))
+      } catch {
+        // 无痕模式等场景可能禁用存储，仍保留当前会话配置。
+      }
+    }
+    const settingsResponse = await fetch(`${LOCAL_API_BASE}/api/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ baseUrl: config.baseUrl.trim(), apiKey: config.apiKey }),
+      body: JSON.stringify({ maxConcurrency: nextMaxConcurrency }),
     })
-    const body = await response.json() as ApiErrorBody & { baseUrl?: string }
-    if (!response.ok) throw new Error(body.error?.message || 'Provider 配置保存失败')
-    // 保存成功后清空前端内存副本，后续任务由本地服务读取已保存配置。
-    setChannelConfig({ baseUrl: config.baseUrl, apiKey: '' })
-    try {
-      // 只记住地址，API Key 由本地服务保存，避免写入浏览器存储。
-      window.localStorage.setItem('lingtu-channel-config', JSON.stringify({ baseUrl: config.baseUrl }))
-    } catch {
-      // 无痕模式等场景可能禁用存储，仍保留当前会话配置。
-    }
+    const settingsBody = await settingsResponse.json() as ApiErrorBody & { maxConcurrency?: number }
+    if (!settingsResponse.ok || typeof settingsBody.maxConcurrency !== 'number') throw new Error(settingsBody.error?.message || '并发设置保存失败')
+    setMaxConcurrency(settingsBody.maxConcurrency)
   }
 
   const updateQueueFromJob = (job: ApiJob) => {
@@ -460,6 +547,7 @@ function App() {
       status,
       progress,
       time,
+      createdAt: job.createdAt,
       resultCount: Array.isArray(job.results) ? job.results.length : undefined,
       ...(job.error?.message ? { error: job.error.message } : {}),
     }
@@ -504,6 +592,7 @@ function App() {
           status,
           progress,
           time: job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : job.status === 'cancelled' ? '已取消' : '进行中',
+          createdAt: job.createdAt,
           resultCount: Array.isArray(job.results) ? job.results.length : undefined,
           ...(job.error?.message ? { error: job.error.message } : {}),
         } satisfies QueueItem
@@ -564,20 +653,27 @@ function App() {
     }
   }
 
-  const subscribeJob = (jobId: string) => {
-    eventSourceRef.current?.close()
+  const subscribeJob = (jobId: string): Promise<QueueStatus> => new Promise((resolve) => {
+    let settled = false
+    const settle = (status: QueueStatus) => {
+      if (settled) return
+      settled = true
+      resolve(status)
+    }
+    eventSourcesRef.current.get(jobId)?.close()
     const source = new EventSource(`${LOCAL_API_BASE}/api/jobs/${encodeURIComponent(jobId)}/events`)
-    eventSourceRef.current = source
+    eventSourcesRef.current.set(jobId, source)
     const handleEvent = (event: Event) => {
       try {
         const body = JSON.parse((event as MessageEvent<string>).data) as ApiJob & { completed?: number; total?: number }
         const eventJob = body.job ?? body
         if (!eventJob.id) return
-      const status = updateQueueFromJob({ ...eventJob, progress: body.total ? Math.round((body.completed ?? 0) / body.total * 100) : eventJob.progress })
+        const status = updateQueueFromJob({ ...eventJob, progress: body.total ? Math.round((body.completed ?? 0) / body.total * 100) : eventJob.progress })
         void refreshStats()
         if (status === 'done' || status === 'review' || status === 'failed' || status === 'cancelled') {
           source.close()
-          if (eventSourceRef.current === source) eventSourceRef.current = null
+          if (eventSourcesRef.current.get(jobId) === source) eventSourcesRef.current.delete(jobId)
+          settle(status)
         }
       } catch {
         // 事件数据异常时交给详情接口回读，不让前端任务状态卡死。
@@ -588,16 +684,26 @@ function App() {
     })
     source.onerror = () => {
       source.close()
-      if (eventSourceRef.current === source) eventSourceRef.current = null
-      void readJobDetail(jobId)
+      if (eventSourcesRef.current.get(jobId) === source) eventSourcesRef.current.delete(jobId)
+      // SSE 断开时轮询任务详情，确保并发 worker 只在当前任务结束后领取下一张。
+      const poll = async () => {
+        const detail = await readJobDetail(jobId)
+        const status = detail ? updateQueueFromJob(detail) : undefined
+        if (status === 'done' || status === 'review' || status === 'failed' || status === 'cancelled') {
+          settle(status)
+          return
+        }
+        window.setTimeout(() => void poll(), 800)
+      }
+      void poll()
     }
-  }
+  })
 
   const startJob = async () => {
     if (running) return
     setSubmitError('')
-    if (mode === 'edit' && !sourceFile) {
-      setSubmitError('请先选择一张源图后再开始改图')
+    if (mode === 'edit' && sourceFiles.length === 0) {
+      setSubmitError('请先选择至少一张源图后再开始改图')
       return
     }
     const prompt = mode === 'one-to-many' ? enabledWindows[0]?.prompt.trim() ?? '' : textPrompt.trim() || selectedPromptItem?.text || ''
@@ -606,44 +712,63 @@ function App() {
       return
     }
     setRunning(true)
+    setSubmissionProgress(mode === 'edit' ? { current: 0, total: sourceFiles.length } : null)
     try {
-      const sourceImage = mode === 'edit' && sourceFile
-        ? { data: await encodeFile(sourceFile), mimeType: sourceFile.type, name: sourceFile.name }
-        : undefined
-      const response = await fetch(`${LOCAL_API_BASE}/api/jobs`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mode: mode === 'text' ? 'text_to_image' : mode,
-          prompt,
-          textPrompt: textPrompt.trim(),
-          windows: mode === 'one-to-many' ? enabledWindows.map(({ id, name, prompt: windowPrompt, enabled }) => ({ id, name, prompt: windowPrompt.trim(), enabled })) : undefined,
-          layout,
-          size,
-          resolution,
-          quality,
-          repeat,
-          sourceImage,
-          provider: {
-            baseUrl: channelConfig.baseUrl.trim(),
-            ...(channelConfig.apiKey.trim() ? { apiKey: channelConfig.apiKey } : {}),
-          },
-          idempotencyKey: `lingtu-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        }),
-      })
-      const body = await response.json() as ApiJob | ApiErrorBody
-      if (!response.ok || !('id' in body)) {
-        throw new Error(('error' in body && body.error?.message) || '本地服务拒绝了任务提交')
+      const filesToSubmit: Array<File | undefined> = mode === 'edit' ? sourceFiles : [undefined]
+      let submittedCount = 0
+      let failedCount = 0
+      let firstError = ''
+      const submitOne = async (file: File | undefined, index: number) => {
+        try {
+          const sourceImage = mode === 'edit' && file
+            ? { data: await encodeFile(file), mimeType: file.type, name: file.name }
+            : undefined
+          const response = await fetch(`${LOCAL_API_BASE}/api/jobs`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              mode: mode === 'text' ? 'text_to_image' : mode,
+              prompt,
+              textPrompt: textPrompt.trim(),
+              windows: mode === 'one-to-many' ? enabledWindows.map(({ id, name, prompt: windowPrompt, enabled }) => ({ id, name, prompt: windowPrompt.trim(), enabled })) : undefined,
+              layout,
+              size,
+              resolution,
+              quality,
+              repeat,
+              sourceImage,
+              provider: {
+                baseUrl: channelConfig.baseUrl.trim(),
+                ...(channelConfig.apiKey.trim() ? { apiKey: channelConfig.apiKey } : {}),
+              },
+              idempotencyKey: `lingtu-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
+            }),
+          })
+          const body = await response.json() as ApiJob | ApiErrorBody
+          if (!response.ok || !('id' in body)) {
+            throw new Error(('error' in body && body.error?.message) || '本地服务拒绝了任务提交')
+          }
+          updateQueueFromJob(body)
+          void refreshStats()
+          // 所有图片先独立提交并持久化，后端调度器负责排队和并发执行；页面关闭不影响已提交任务。
+          void subscribeJob(body.id)
+          void readJobDetail(body.id)
+        } catch (error) {
+          failedCount += 1
+          if (!firstError) firstError = error instanceof Error ? error.message : '任务提交失败，请检查本地服务状态'
+        } finally {
+          submittedCount += 1
+          if (mode === 'edit') setSubmissionProgress({ current: submittedCount, total: filesToSubmit.length })
+        }
       }
-      updateQueueFromJob(body)
-      void refreshStats()
-      setRunning(false)
-      subscribeJob(body.id)
-      // POST 成功后立即回读详情，覆盖响应不完整或 SSE 尚未连接的情况。
-      void readJobDetail(body.id)
+      // Promise.all 只负责并行发起提交，不等待 Provider 完成，执行生命周期完全交给后端。
+      await Promise.all(filesToSubmit.map((file, index) => submitOne(file, index)))
+      if (failedCount > 0) setSubmitError(`${firstError}；本批次有 ${failedCount} 张图片失败，请查看任务队列`)
     } catch (error) {
-      setRunning(false)
       setSubmitError(error instanceof Error ? error.message : '任务提交失败，请检查本地服务状态')
+    } finally {
+      setRunning(false)
+      setSubmissionProgress(null)
     }
   }
 
@@ -698,13 +823,13 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFile={sourceFile} setSourceFile={setSourceFile} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} channelConfig={channelConfig} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} channelConfig={channelConfig} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={refreshQueue} onCancel={cancelJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} />}
       </main>
 
-      {showSettings && <SettingsModal config={channelConfig} onSave={saveChannelConfig} onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsModal config={channelConfig} maxConcurrency={maxConcurrency} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
     </div>
   )
 }
@@ -725,8 +850,9 @@ type WorkbenchProps = {
   setRepeat: (value: number) => void
   inputName: string
   setInputName: (value: string) => void
-  sourceFile: File | null
-  setSourceFile: (value: File | null) => void
+  sourceFiles: File[]
+  setSourceFiles: (value: File[]) => void
+  submissionProgress: { current: number; total: number } | null
   selectedPrompt: PromptSelection
   selectedPromptItem?: PromptItem
   prompts: PromptItem[]
@@ -755,7 +881,7 @@ type WorkbenchProps = {
 }
 
 function Workbench(props: WorkbenchProps) {
-  const { mode, setMode, activeMode, layout, setLayout, size, setSize, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFile, setSourceFile, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, channelConfig, submitError, onRefresh, onNavigate, onViewResults } = props
+  const { mode, setMode, activeMode, layout, setLayout, size, setSize, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, channelConfig, submitError, onRefresh, onNavigate, onViewResults } = props
   const [showAdvanced, setShowAdvanced] = useState(true)
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -764,6 +890,24 @@ function Workbench(props: WorkbenchProps) {
   const healthScore = serviceOnline && stats ? 100 : 0
   const today = formatToday()
   const previewCount = layout === '二宫格' ? 2 : layout === '九宫格' ? 9 : 4
+  const sourceTotalBytes = sourceFiles.reduce((total, file) => total + file.size, 0)
+  const handleSourceSelection = (fileList: FileList | null) => {
+    const result = validateSourceFiles(fileList)
+    if (result.error) {
+      setSourceFiles([])
+      setInputName(result.error)
+      return
+    }
+    setSourceFiles(result.files)
+    setInputName(summarizeSourceFiles(result.files))
+    setFeedback(result.skippedCount > 0 ? `已添加 ${result.files.length} 张，跳过 ${result.skippedCount} 个不符合要求的文件` : `已添加 ${result.files.length} 张候选图片`)
+  }
+  const removeSourceFile = (target: File) => {
+    const nextFiles = sourceFiles.filter((file) => file !== target)
+    setSourceFiles(nextFiles)
+    setInputName(summarizeSourceFiles(nextFiles))
+    setFeedback(`已移除 ${sourceFilePath(target)}`)
+  }
   useEffect(() => {
     if (!feedback) return
     const timer = window.setTimeout(() => setFeedback(''), 2400)
@@ -819,7 +963,7 @@ function Workbench(props: WorkbenchProps) {
         </div>
 
         {/* 普通生图只提交提示词和高级参数；源图输入仅用于改图与一裂多。 */}
-        {(mode === 'edit' || mode === 'one-to-many') && <div className="field-block"><div className="field-label"><label htmlFor="source-input">{mode === 'edit' ? '源图附件' : '裂变源图'}</label><span className="field-required">必填</span></div><div className={`dropzone ${inputName !== '未选择输入文件夹' ? 'has-file' : ''}`}><input id="source-input" type="file" hidden accept="image/*" multiple={mode !== 'edit'} onChange={(event) => { const file = event.target.files?.[0]; if (mode === 'edit') { if (!file) { setSourceFile(null); setInputName('未选择源图'); return }; if (!SOURCE_IMAGE_TYPES.has(file.type) || file.size > MAX_SOURCE_IMAGE_BYTES) { setSourceFile(null); setInputName('源图需为 PNG / JPG / WEBP 且不超过 8 MB'); return }; setSourceFile(file); setInputName(file.name); return }; setInputName(event.target.files?.length ? `${event.target.files.length} 个文件已选择` : '未选择输入文件夹') }} /><div className="dropzone-icon"><CloudUpload size={19} /></div><div className="dropzone-copy"><strong>{inputName}</strong><span>{mode === 'edit' ? '支持 PNG / JPG / WEBP，单张不超过 8 MB' : '拖拽图片至此，或点击选择本地图片'}</span></div><label className="button button-small button-dark" htmlFor="source-input"><Upload size={14} />选择</label></div></div>}
+        {(mode === 'edit' || mode === 'one-to-many') && <div className="field-block"><div className="field-label"><div><label htmlFor="source-input">{mode === 'edit' ? '源图附件' : '裂变源图'}</label><span className="field-required">必填</span></div>{mode === 'edit' && sourceFiles.length > 0 && <span className="field-hint">{sourceFiles.length} 张 · {formatBytes(sourceTotalBytes)}</span>}</div><div className={`dropzone ${sourceFiles.length > 0 ? 'has-file' : ''}`}><input id="source-input" type="file" hidden accept="image/png,image/jpeg,image/webp" multiple disabled={running} onChange={(event) => { handleSourceSelection(event.target.files); event.currentTarget.value = '' }} /><input id="source-folder-input" type="file" hidden accept="image/png,image/jpeg,image/webp" multiple disabled={running} ref={(node) => { node?.setAttribute('webkitdirectory', ''); node?.setAttribute('directory', '') }} onChange={(event) => { handleSourceSelection(event.target.files); event.currentTarget.value = '' }} /><div className="dropzone-icon"><CloudUpload size={19} /></div><div className="dropzone-copy"><strong title={inputName}>{inputName}</strong><span>{mode === 'edit' ? '支持 PNG / JPG / WEBP，单张不超过 8 MB；可多选或选择文件夹' : '拖拽图片至此，或点击选择本地图片'}</span></div>{mode === 'edit' && <label className="button button-small button-dark" htmlFor="source-folder-input"><FolderOpen size={14} />文件夹</label>}<label className="button button-small button-dark" htmlFor="source-input"><Images size={14} />图片</label></div>{mode === 'edit' && sourceFiles.length > 0 && <div className="source-file-list" aria-label="候选源图"><div className="source-file-list-heading"><strong>候选图片</strong><span>按以下顺序进入队列</span></div><div className="source-file-items">{sourceFiles.map((file, index) => <div className="source-file-chip" key={sourceFileKey(file)} title={sourceFilePath(file)}><FileImage size={14} /><span className="source-file-name">{index + 1}. {sourceFilePath(file)}</span><button className="source-file-remove" type="button" title={`移除 ${sourceFilePath(file)}`} aria-label={`移除候选图片 ${sourceFilePath(file)}`} disabled={running} onClick={() => removeSourceFile(file)}><X size={14} /></button></div>)}</div></div>}</div>}
 
         {mode === 'text' && <div className="field-block"><div className="field-label"><label htmlFor="text-prompt">创作描述</label><span className="field-required">必填</span></div><textarea id="text-prompt" className="prompt-editor" value={textPrompt} onChange={(event) => setTextPrompt(event.target.value)} /></div>}
 
@@ -827,7 +971,7 @@ function Workbench(props: WorkbenchProps) {
 
         <div className="settings-divider"><button className="advanced-trigger" onClick={() => setShowAdvanced((open) => !open)} aria-expanded={showAdvanced}><SlidersHorizontal size={15} />高级参数 <span>默认生产规范</span><ChevronDown size={15} className={showAdvanced ? 'rotate-180' : ''} /></button></div>
         {showAdvanced && <div className="settings-grid"><div className="compact-field"><label htmlFor="layout-select">输出布局</label><div className="select-wrap"><select id="layout-select" value={layout} onChange={(event) => setLayout(event.target.value)}><option>四宫格</option><option>二宫格</option><option>九宫格</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="size-select">长宽比例</label><div className="select-wrap"><select id="size-select" value={size} onChange={(event) => setSize(event.target.value)}>{SIZE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="resolution-select">分辨率</label><div className="select-wrap"><select id="resolution-select" value={resolution} onChange={(event) => setResolution(event.target.value)}><option>1K</option><option>2K</option><option>4K</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="quality-select">质量</label><div className="select-wrap"><select id="quality-select" value={quality} onChange={(event) => setQuality(event.target.value)}><option>高</option><option>中</option><option>自动</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="repeat-input">重复次数</label><div className="number-control"><input id="repeat-input" type="number" min="1" max="20" value={repeat} onChange={(event) => setRepeat(Math.min(20, Math.max(1, Number(event.target.value) || 1)))} /><span>次</span></div></div></div>}
-        <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>默认通道已配置 <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />创建任务中</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
+        <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>默认通道已配置 <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}{submissionProgress && <span className="submit-progress" role="status">已提交 {submissionProgress.current} / {submissionProgress.total} 张，后端并发处理中</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />{mode === 'edit' ? '批量提交中' : '创建任务中'}</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
       </div>
 
       <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div aria-hidden="true" /></div><div className={`layout-preview ${layout === '二宫格' ? 'layout-two' : layout === '九宫格' ? 'layout-nine' : ''}`} style={{ aspectRatio: formatSizeAspectRatio(size) }}>{Array.from({ length: previewCount }, (_, index) => <div className={`preview-cell cell-${String.fromCharCode(97 + index)}`} key={String.fromCharCode(65 + index)}><span>{String.fromCharCode(65 + index)}</span><small>{index === 0 ? '主视觉区域' : index === 1 ? '卖点信息区域' : '细节变体'}</small></div>)}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{formatSizeRatio(size)}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link" onClick={() => onNavigate('gallery')}>查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryAssets.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={`打开 ${image.title}`} aria-label={`打开 ${image.title}`} onClick={() => openRecentAsset(image)}><img src={image.src} alt={image.title} /><span className={`mini-status ${image.tone}`} /></button>)}{galleryAssets.length === 0 && <span className="empty-inline">暂无生成结果</span>}</div></div></div>
@@ -884,7 +1028,7 @@ function QueuePage({ queue, setQueue, onRefresh, onCancel, onCreate, onViewResul
   const refreshButton = <button className="button button-ghost" onClick={() => void handleRefresh()} disabled={refreshing} aria-label="刷新任务队列" aria-busy={refreshing}><RefreshCw size={16} className={refreshing ? 'spin' : ''} />{refreshing ? '刷新中' : '刷新'}</button>
   const createButton = <button className="button button-primary" onClick={onCreate}><Plus size={16} />创建任务</button>
   if (visible.length === 0) return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions">{refreshButton}{createButton}</div></section><QueueFilterBar queue={queue} filter={filter} setFilter={setFilter} search={search} setSearch={setSearch} /><div className="empty-state panel">暂无任务记录</div></div>
-  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions">{refreshButton}{createButton}</div></section><div className="queue-toolbar panel"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{queue.length}</span></button><button className={filter === 'running' ? 'active' : ''} onClick={() => setFilter('running')}>运行中 <span>{queue.filter((item) => item.status === 'running').length}</span></button><button className={filter === 'review' ? 'active' : ''} onClick={() => setFilter('review')}>待复核 <span>{queue.filter((item) => item.status === 'review').length}</span></button><button className={filter === 'done' ? 'active' : ''} onClick={() => setFilter('done')}>已完成 <span>{queue.filter((item) => item.status === 'done').length}</span></button><button className={filter === 'failed' ? 'active' : ''} onClick={() => setFilter('failed')}>失败 <span>{queue.filter((item) => item.status === 'failed').length}</span></button><button className={filter === 'cancelled' ? 'active' : ''} onClick={() => setFilter('cancelled')}>已取消 <span>{queue.filter((item) => item.status === 'cancelled').length}</span></button></div><div className="queue-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务名称或编号" /></div></div><div className="queue-list panel">{visible.map((item) => <div className={`queue-row ${item.status === 'done' && item.resultCount ? 'has-result' : ''}`} key={item.id}><div className={`queue-status-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="queue-main"><div className="queue-title-line"><strong>{item.title}</strong><span className="mono">{item.id}</span></div><span>{item.meta}</span><div className="progress-track" role="progressbar" aria-label={`${item.title}进度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.progress}><i className={item.status} style={{ width: `${item.progress}%` }} /></div></div><div className="queue-summary"><div className="queue-progress"><strong>{item.progress}%</strong></div><StatusLabel status={item.status} />{item.status === 'done' && item.resultCount ? <button className="queue-result-button" type="button" aria-label={`查看任务 ${item.id} 的 ${item.resultCount} 张结果`} onClick={() => onViewResults(item.id)}><Eye size={15} />查看结果<span>{item.resultCount} 张</span></button> : null}{(item.status === 'queued' || item.status === 'running') && <button className="queue-cancel-button" title="取消任务" aria-label={`取消任务 ${item.title}`} onClick={() => void onCancel(item.id)}><X size={15} /><span>取消</span></button>}</div></div>)}</div><div className="queue-footnote"><CircleHelp size={15} />生图接口超时会进入“待确认”，不会自动重复计费请求。</div></div>
+  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions">{refreshButton}{createButton}</div></section><div className="queue-toolbar panel"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{queue.length}</span></button><button className={filter === 'running' ? 'active' : ''} onClick={() => setFilter('running')}>运行中 <span>{queue.filter((item) => item.status === 'running').length}</span></button><button className={filter === 'review' ? 'active' : ''} onClick={() => setFilter('review')}>待复核 <span>{queue.filter((item) => item.status === 'review').length}</span></button><button className={filter === 'done' ? 'active' : ''} onClick={() => setFilter('done')}>已完成 <span>{queue.filter((item) => item.status === 'done').length}</span></button><button className={filter === 'failed' ? 'active' : ''} onClick={() => setFilter('failed')}>失败 <span>{queue.filter((item) => item.status === 'failed').length}</span></button><button className={filter === 'cancelled' ? 'active' : ''} onClick={() => setFilter('cancelled')}>已取消 <span>{queue.filter((item) => item.status === 'cancelled').length}</span></button></div><div className="queue-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务名称或编号" /></div></div><div className="queue-list panel">{visible.map((item) => <div className={`queue-row ${item.status === 'done' && item.resultCount ? 'has-result' : ''}`} key={item.id}><div className={`queue-status-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="queue-main"><div className="queue-title-line"><strong>{item.title}</strong><span className="mono">{item.id}</span></div><div className="queue-meta-line"><span>{item.meta}</span><time dateTime={item.createdAt}>{formatQueueCreatedAt(item.createdAt)}</time></div><div className="progress-track" role="progressbar" aria-label={`${item.title}进度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.progress}><i className={item.status} style={{ width: `${item.progress}%` }} /></div></div><div className="queue-summary"><div className="queue-progress"><strong>{item.progress}%</strong></div><StatusLabel status={item.status} />{item.status === 'done' && item.resultCount ? <button className="queue-result-button" type="button" aria-label={`查看任务 ${item.id} 的 ${item.resultCount} 张结果`} onClick={() => onViewResults(item.id)}><Eye size={15} />查看结果<span>{item.resultCount} 张</span></button> : null}{(item.status === 'queued' || item.status === 'running') && <button className="queue-cancel-button" title="取消任务" aria-label={`取消任务 ${item.title}`} onClick={() => void onCancel(item.id)}><X size={15} /><span>取消</span></button>}</div></div>)}</div><div className="queue-footnote"><CircleHelp size={15} />生图接口超时会进入“待确认”，不会自动重复计费请求。</div></div>
 }
 
 function GalleryPage({ assets, focusJobId, onClearFocus }: { assets: GalleryAsset[]; focusJobId: string | null; onClearFocus: () => void }) {
@@ -964,8 +1108,9 @@ function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPr
   return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>提示词由本地服务初始化并从数据库读取。</p></div></section><div className="prompt-toolbar"><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" /></div></div>{error && <div className="form-error" role="status"><AlertTriangle size={14} />{error}</div>}{loading ? <div className="empty-state">提示词加载中…</div> : filtered.length === 0 ? <div className="empty-state">暂无可用提示词</div> : <div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? prompts.length : prompts.filter((prompt) => prompt.category === item).length}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => <article className={`prompt-card panel ${selectedPrompt === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedPrompt(item.id)}><div className="prompt-card-top"><span className="category-chip">{item.category}</span></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.layout === 'four_up' ? '4K 四宫格' : item.layout === 'fifteen_up_test' ? '4K 十五宫格测试' : '两宫格'} · 后端初始化</span>{selectedPrompt === item.id && <span className="selected-label"><Check size={13} />已选中</span>}</div></article>)}</div></div>}</div>
 }
 
-function SettingsModal({ config, onSave, onClose }: { config: ChannelConfig; onSave: (config: ChannelConfig) => Promise<void>; onClose: () => void }) {
+function SettingsModal({ config, maxConcurrency, onSave, onClose }: { config: ChannelConfig; maxConcurrency: number; onSave: (config: ChannelConfig, maxConcurrency: number) => Promise<void>; onClose: () => void }) {
   const [draft, setDraft] = useState(config)
+  const [draftMaxConcurrency, setDraftMaxConcurrency] = useState(maxConcurrency)
   const [showKey, setShowKey] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
@@ -979,8 +1124,8 @@ function SettingsModal({ config, onSave, onClose }: { config: ChannelConfig; onS
 
   const handleSave = async () => {
     if (saving) return
-    if (!draft.baseUrl.trim() || !draft.apiKey.trim()) {
-      setError('请填写接口地址和 API Key。')
+    if (!draft.baseUrl.trim()) {
+      setError('请填写接口地址。')
       return
     }
     try {
@@ -992,7 +1137,7 @@ function SettingsModal({ config, onSave, onClose }: { config: ChannelConfig; onS
     }
     setSaving(true)
     try {
-      await onSave(draft)
+      await onSave(draft, draftMaxConcurrency)
       setSaved(true)
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Provider 配置保存失败')
@@ -1034,7 +1179,7 @@ function SettingsModal({ config, onSave, onClose }: { config: ChannelConfig; onS
           </div>
           <div className="setting-row">
             <div><strong>最大并发</strong><span>建议根据供应商配额逐步增加</span></div>
-            <div className="number-control compact"><input type="number" defaultValue="4" /><span>线程</span></div>
+            <div className="number-control compact"><input type="number" min="1" max="20" value={draftMaxConcurrency} onChange={(event) => { setSaved(false); setError(''); setDraftMaxConcurrency(Math.min(20, Math.max(1, Number(event.target.value) || 1))) }} aria-label="最大并发数" /><span>线程</span></div>
           </div>
         </div>
         <div className="modal-footer">

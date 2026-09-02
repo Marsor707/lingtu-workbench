@@ -27,7 +27,7 @@ export type Job = {
   createdAt: string; updatedAt: string; cancelledAt?: string
 }
 type ProviderConfig = { baseUrl: string; apiKey: string }
-type JobInput = { mode?: unknown; idempotencyKey?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; resolution?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown }
+type JobInput = { mode?: unknown; idempotencyKey?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; resolution?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown; maxConcurrency?: unknown }
 type StoredRequest = { prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; provider: ProviderConfig; sourceImage?: SourceImage }
 type Runtime = { controller: AbortController; listeners: Set<HttpResponse> }
 type GenerateImage = typeof generateImage
@@ -40,6 +40,8 @@ const MAX_BODY_BYTES = 12 * 1024 * 1024
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024
 const MAX_SOURCE_IMAGE_BASE64_LENGTH = Math.ceil(MAX_SOURCE_IMAGE_BYTES / 3) * 4
 const RESULTS_DIRECTORY = 'jobs'
+const DEFAULT_MAX_CONCURRENCY = 4
+const MAX_CONCURRENCY = 20
 const VALID_MODES = new Set<JobMode>(['generate', 'edit', 'text_to_image', 'one_to_many'])
 const MODE_ALIASES: Record<string, JobMode> = { text: 'text_to_image', 'one-to-many': 'one_to_many' }
 
@@ -194,6 +196,7 @@ export class JobStore {
     // 仅迁移仍含旧输出契约的内置记录，避免覆盖人工新增或自定义提示词。
     for (const prompt of builtinPrompts) migratePrompt.run(prompt.category, prompt.title, prompt.text, prompt.layout, prompt.sourceName, prompt.id)
     this.db.exec('CREATE TABLE IF NOT EXISTS provider_config (id INTEGER PRIMARY KEY CHECK (id = 1), base_url TEXT NOT NULL, api_key TEXT NOT NULL, updated_at TEXT NOT NULL)')
+    this.db.exec('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)')
   }
   close(): void { this.db.close() }
   private fromRow(row: Record<string, unknown>): Job {
@@ -221,6 +224,14 @@ export class JobStore {
   getProviderConfig(): ProviderConfig | undefined {
     const row = this.db.prepare('SELECT base_url, api_key FROM provider_config WHERE id = 1').get() as { base_url?: string; api_key?: string } | undefined
     return row?.base_url && row.api_key ? { baseUrl: String(row.base_url), apiKey: String(row.api_key) } : undefined
+  }
+  getMaxConcurrency(): number | undefined {
+    const row = this.db.prepare('SELECT value FROM app_settings WHERE key = ?').get('max_concurrency') as { value?: string } | undefined
+    const value = Number(row?.value)
+    return Number.isInteger(value) && value >= 1 && value <= MAX_CONCURRENCY ? value : undefined
+  }
+  saveMaxConcurrency(value: number): void {
+    this.db.prepare('INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at').run('max_concurrency', String(value), now())
   }
   saveProviderConfig(config: ProviderConfig): void {
     this.db.prepare('INSERT INTO provider_config (id, base_url, api_key, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET base_url = excluded.base_url, api_key = excluded.api_key, updated_at = excluded.updated_at').run(config.baseUrl, config.apiKey, now())
@@ -275,6 +286,12 @@ export class JobStore {
 }
 export class RequestValidationError extends Error { constructor(public readonly code: string, message: string) { super(message) } }
 function portFromEnvironment(): number { const value = process.env.LINGTU_PORT; if (value === undefined || value === '') return DEFAULT_PORT; const port = Number(value); if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('LINGTU_PORT must be an integer between 0 and 65535'); return port }
+function maxConcurrencyValue(value: unknown, fallback = DEFAULT_MAX_CONCURRENCY): number {
+  if (value === undefined || value === '') return fallback
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_CONCURRENCY) throw new RequestValidationError('invalid_max_concurrency', `maxConcurrency 必须是 1 到 ${MAX_CONCURRENCY} 的整数`)
+  return parsed
+}
 function setCors(res: HttpResponse): void { res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS') }
 function dataEvent(event: string, data: unknown): string { return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n` }
 const STATIC_CONTENT_TYPES: Record<string, string> = {
@@ -303,12 +320,27 @@ function serveStatic(res: HttpResponse, staticDir: string, pathname: string): bo
 
 export function createApp(store = new JobStore(), options: AppOptions = {}): NativeServer {
   const runtimes = new Map<string, Runtime>(); const workspaceDir = resolve(options.workspaceDir ?? process.env.LINGTU_WORKSPACE ?? 'workspace'); const staticDirValue = options.staticDir ?? process.env.LINGTU_STATIC_DIR; const staticDir = staticDirValue?.trim() ? resolve(staticDirValue) : undefined; const imageGenerator = options.generateImage ?? generateImage; const imageEditor = options.editImage ?? editImage
-  const emit = (id: string, event: string, data: unknown): void => { const runtime = runtimes.get(id); if (!runtime) return; const message = dataEvent(event, data); for (const listener of runtime.listeners) { try { listener.write(message) } catch { runtime.listeners.delete(listener) } }; if (event === 'completed' || event === 'failed') { for (const listener of runtime.listeners) listener.end(); runtime.listeners.clear() } }
+  const environmentMaxConcurrency = process.env.LINGTU_MAX_CONCURRENCY
+  let maxConcurrency = environmentMaxConcurrency === undefined || environmentMaxConcurrency === ''
+    ? store.getMaxConcurrency() ?? DEFAULT_MAX_CONCURRENCY
+    : maxConcurrencyValue(environmentMaxConcurrency)
+  const pendingJobs: string[] = []
+  const pendingJobIds = new Set<string>()
+  const runningJobIds = new Set<string>()
+  const pendingListeners = new Map<string, Set<HttpResponse>>()
+  const emit = (id: string, event: string, data: unknown): void => {
+    const runtime = runtimes.get(id)
+    const listeners = runtime?.listeners ?? pendingListeners.get(id)
+    if (!listeners) return
+    const message = dataEvent(event, data)
+    for (const listener of listeners) { try { listener.write(message) } catch { listeners.delete(listener) } }
+    if (event === 'completed' || event === 'failed') { for (const listener of listeners) listener.end(); listeners.clear(); pendingListeners.delete(id) }
+  }
   const execute = async (id: string): Promise<void> => {
     const request = store.request(id); const initial = store.get(id); if (!request || !initial || initial.status !== 'queued') return
     const jobStartedAt = Date.now()
     appendExecutionLog(workspaceDir, 'job_started', { jobId: id, mode: initial.mode, repeat: request.repeat, size: request.size, resolution: request.resolution, quality: request.quality, promptCount: initial.mode === 'one_to_many' ? initial.windows?.length ?? 0 : request.prompt ? 1 : 0 })
-    const runtime: Runtime = { controller: new AbortController(), listeners: new Set() }; runtimes.set(id, runtime); const running = store.update(id, 'running', { provider: { status: 'running', invoked: false } }); if (!running) return; emit(id, 'snapshot', running)
+    const runtime: Runtime = { controller: new AbortController(), listeners: pendingListeners.get(id) ?? new Set() }; pendingListeners.delete(id); runtimes.set(id, runtime); const running = store.update(id, 'running', { provider: { status: 'running', invoked: false } }); if (!running) return; emit(id, 'snapshot', running)
     const prompts = initial.mode === 'one_to_many' ? (initial.windows ?? []).map((window) => window.prompt) : request.prompt ? [request.prompt] : []
     // 无提示词的旧版请求作为草稿保留，避免凭空调用 Provider。
     if (prompts.length === 0) { runtimes.delete(id); return }
@@ -319,7 +351,8 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       mkdirSync(join(workspaceDir, RESULTS_DIRECTORY), { recursive: true })
       for (const prompt of prompts) for (let repeatIndex = 0; repeatIndex < request.repeat; repeatIndex += 1) {
         if (runtime.controller.signal.aborted) throw new DOMException('任务已取消', 'AbortError')
-        const provider = store.provider(id) ?? request.provider
+        // 页面关闭或服务重启后，任务仍可从本地 Provider 配置恢复执行凭据。
+        const provider = store.provider(id) ?? store.getProviderConfig() ?? request.provider
         const requestStartedAt = Date.now()
         providerStage = 'request'
         appendExecutionLog(workspaceDir, 'provider_request_started', { jobId: id, mode: initial.mode, itemIndex: results.length, providerHost: providerHost(provider.baseUrl), size: request.size, resolution: request.resolution, quality: request.quality })
@@ -349,11 +382,50 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       const failed = store.update(id, 'failed', { provider: { status: 'failed', invoked: true }, error: safeError }); if (failed) emit(id, 'failed', failed)
     } finally { if (runtimes.get(id) === runtime) runtimes.delete(id); store.forgetProvider(id) }
   }
-  const queue = (id: string): void => { setImmediate(() => { void execute(id) }) }
+  const pump = (): void => {
+    while (runningJobIds.size < maxConcurrency && pendingJobs.length > 0) {
+      const id = pendingJobs.shift()!
+      pendingJobIds.delete(id)
+      if (runningJobIds.has(id)) continue
+      runningJobIds.add(id)
+      // 任务状态已经持久化为 queued，只有调度器取得名额后才进入 Provider 执行阶段。
+      void execute(id).finally(() => {
+        runningJobIds.delete(id)
+        pump()
+      })
+    }
+  }
+  const queue = (id: string): void => {
+    if (!pendingJobIds.has(id) && !runningJobIds.has(id)) {
+      pendingJobs.push(id)
+      pendingJobIds.add(id)
+    }
+    pump()
+  }
+  // 后端重启后继续执行尚未领取的任务，避免前端页面状态成为任务可靠性的前提。
+  for (const job of store.list()) {
+    if (job.status === 'queued' && (job.prompt || (job.windows && job.windows.length > 0))) queue(job.id)
+  }
   return createServer(async (req: HttpRequest, res: HttpResponse) => {
     setCors(res); if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }; const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
     if (req.method === 'GET' && path === '/health') { json(res, 200, { status: 'ok', service: 'lingtu-workbench' }); return }
     if (req.method === 'GET' && path === '/api/stats') { json(res, 200, store.stats(workspaceDir)); return }
+    if (req.method === 'GET' && path === '/api/settings') { json(res, 200, { maxConcurrency }); return }
+    if (req.method === 'PUT' && path === '/api/settings') {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      try {
+        const value = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>).maxConcurrency : undefined
+        const next = maxConcurrencyValue(value, maxConcurrency)
+        if (environmentMaxConcurrency === undefined || environmentMaxConcurrency === '') {
+          store.saveMaxConcurrency(next)
+          maxConcurrency = next
+          pump()
+        }
+        json(res, 200, { maxConcurrency })
+      } catch (error) { if (error instanceof RequestValidationError) { errorResponse(res, 400, error.code, error.message); return }; errorResponse(res, 500, 'internal_error', '工作区设置保存失败') }
+      return
+    }
     if (req.method === 'GET' && path === '/api/prompts') { const items = store.prompts(); json(res, 200, { items, total: items.length }); return }
     if (req.method === 'GET' && path === '/api/provider') {
       json(res, 200, effectiveProviderMetadata(store))
@@ -382,7 +454,11 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     if (req.method === 'POST' && path === '/api/jobs') {
       let body: unknown; try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }; if (!body || typeof body !== 'object' || Array.isArray(body)) { errorResponse(res, 400, 'invalid_body', '请求体必须是 JSON 对象'); return }
       const input = body as JobInput; const bodyKey = input.idempotencyKey; const headerKey = headerValue(req.headers['idempotency-key']); if (bodyKey !== undefined && typeof bodyKey !== 'string') { errorResponse(res, 400, 'invalid_idempotency_key', 'idempotencyKey 必须是字符串'); return }; if (bodyKey && headerKey && bodyKey !== headerKey) { errorResponse(res, 400, 'idempotency_key_mismatch', '请求体与请求头的幂等键不一致'); return }; const idempotencyKey = bodyKey || headerKey; if (idempotencyKey !== undefined && (idempotencyKey.trim() === '' || idempotencyKey.length > 200)) { errorResponse(res, 400, 'invalid_idempotency_key', 'idempotencyKey 长度必须为 1 到 200 个字符'); return }
-      try { const result = store.create(input, idempotencyKey, options.defaultProvider); json(res, result.created ? 201 : 200, result.job); if (result.created && (result.job.prompt || result.job.windows)) queue(result.job.id) } catch (error) { if (error instanceof RequestValidationError) { errorResponse(res, 400, error.code, error.message); return }; errorResponse(res, 500, 'internal_error', '创建任务失败') }; return
+      try {
+        const result = store.create(input, idempotencyKey, options.defaultProvider)
+        json(res, result.created ? 201 : 200, result.job)
+        if (result.created && (result.job.prompt || result.job.windows)) queue(result.job.id)
+      } catch (error) { if (error instanceof RequestValidationError) { errorResponse(res, 400, error.code, error.message); return }; errorResponse(res, 500, 'internal_error', '创建任务失败') }; return
     }
     if (req.method === 'GET' && path === '/api/jobs') { const items = store.list(); json(res, 200, { items, total: items.length }); return }
     const resultMatch = path.match(/^\/api\/jobs\/([^/]+)\/results\/(\d+)$/)
@@ -398,9 +474,9 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       return
     }
     const jobMatch = path.match(/^\/api\/jobs\/([^/]+)(?:\/([^/]+))?$/); if (jobMatch) { const id = decodeURIComponent(jobMatch[1]); const action = jobMatch[2]
-      if (req.method === 'GET' && action === 'events') { const job = store.get(id); if (!job) { errorResponse(res, 404, 'job_not_found', '任务不存在'); return }; res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' }); const runtime = runtimes.get(id); if (runtime) runtime.listeners.add(res); res.write(dataEvent('snapshot', job)); if (['completed', 'failed', 'cancelled'].includes(job.status)) { res.write(dataEvent(job.status === 'completed' ? 'completed' : 'failed', job)); res.end(); return }; if (!runtime) { res.end(); return }; res.on?.('close', () => runtime.listeners.delete(res)); return }
+      if (req.method === 'GET' && action === 'events') { const job = store.get(id); if (!job) { errorResponse(res, 404, 'job_not_found', '任务不存在'); return }; res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' }); const runtime = runtimes.get(id); const waitingForScheduler = !runtime && pendingJobIds.has(id); const listeners = runtime?.listeners ?? pendingListeners.get(id) ?? new Set<HttpResponse>(); if (!runtime && waitingForScheduler) pendingListeners.set(id, listeners); listeners.add(res); res.write(dataEvent('snapshot', job)); if (['completed', 'failed', 'cancelled'].includes(job.status)) { res.write(dataEvent(job.status === 'completed' ? 'completed' : 'failed', job)); res.end(); listeners.delete(res); return }; if (!runtime && !waitingForScheduler) { res.end(); listeners.delete(res); return }; res.on?.('close', () => listeners.delete(res)); return }
       if (req.method === 'GET' && !action) { const job = store.get(id); if (!job) errorResponse(res, 404, 'job_not_found', '任务不存在'); else json(res, 200, job); return }
-      if (req.method === 'POST' && action === 'cancel') { const runtime = runtimes.get(id); const job = store.cancel(id); if (!job) { errorResponse(res, 404, 'job_not_found', '任务不存在'); return }; if (runtime) { runtime.controller.abort(); emit(id, 'failed', job) }; json(res, 200, job); return }
+      if (req.method === 'POST' && action === 'cancel') { const runtime = runtimes.get(id); const job = store.cancel(id); if (!job) { errorResponse(res, 404, 'job_not_found', '任务不存在'); return }; if (runtime) runtime.controller.abort(); emit(id, 'failed', job); json(res, 200, job); return }
     }
     // API 路由处理完后再托管静态文件，避免把未知 API 请求误返回前端首页。
     if (req.method === 'GET' && staticDir && path !== '/api' && !path.startsWith('/api/')) { serveStatic(res, staticDir, path); return }

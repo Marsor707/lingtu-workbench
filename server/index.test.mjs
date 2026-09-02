@@ -374,6 +374,53 @@ test('edit 模式必须提供源图片，并通过 mock Provider 完成改图任
   }
 })
 
+test('任务队列按 maxConcurrency 限制 Provider 并发', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-concurrency-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  let active = 0
+  let maxActive = 0
+  const server = await startServer(0, '127.0.0.1', store, {
+    workspaceDir: directory,
+    generateImage: async () => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await new Promise((resolve) => setTimeout(resolve, 35))
+      active -= 1
+      return { kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' }
+    },
+  })
+  const base = `http://127.0.0.1:${server.address().port}`
+  try {
+    const settingsResponse = await fetch(`${base}/api/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ maxConcurrency: 2 }),
+    })
+    assert.equal(settingsResponse.status, 200)
+    assert.deepEqual(await settingsResponse.json(), { maxConcurrency: 2 })
+    assert.deepEqual(await (await fetch(`${base}/api/settings`)).json(), { maxConcurrency: 2 })
+
+    const created = await Promise.all(Array.from({ length: 3 }, async (_, index) => {
+      const response = await fetch(`${base}/api/jobs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: 'generate', prompt: `并发测试 ${index}` }),
+      })
+      assert.equal(response.status, 201)
+      return response.json()
+    }))
+    await Promise.all(created.map(async (job) => {
+      const events = await fetch(`${base}/api/jobs/${job.id}/events`)
+      assert.match(await events.text(), /event: completed/)
+    }))
+    assert.equal(maxActive, 2)
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
 test('Mock Provider 完成异步生图、SSE 推送并将 base64 结果落盘', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'lingtu-workspace-'))
   const dbPath = join(directory, 'jobs.db')
