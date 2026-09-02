@@ -533,8 +533,19 @@ test('任务队列按 maxConcurrency 限制 Provider 并发', async () => {
       body: JSON.stringify({ maxConcurrency: 2 }),
     })
     assert.equal(settingsResponse.status, 200)
-    assert.deepEqual(await settingsResponse.json(), { maxConcurrency: 2 })
-    assert.deepEqual(await (await fetch(`${base}/api/settings`)).json(), { maxConcurrency: 2 })
+    assert.deepEqual(await settingsResponse.json(), { maxConcurrency: 2, pixelUpscale4K: false })
+    assert.deepEqual(await (await fetch(`${base}/api/settings`)).json(), { maxConcurrency: 2, pixelUpscale4K: false })
+
+    const upscaleResponse = await fetch(`${base}/api/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pixelUpscale4K: true }),
+    })
+    assert.deepEqual(await upscaleResponse.json(), { maxConcurrency: 2, pixelUpscale4K: true })
+    assert.equal(store.getPixelUpscale4K(), true)
+    const snapshotted = store.create({ mode: 'generate', prompt: '快照测试' }).job
+    assert.equal(snapshotted.pixelUpscale4K, true)
+    assert.equal(store.request(snapshotted.id)?.pixelUpscale4K, true)
 
     const created = await Promise.all(Array.from({ length: 3 }, async (_, index) => {
       const response = await fetch(`${base}/api/jobs`, {

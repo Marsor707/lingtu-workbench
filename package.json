@@ -13,12 +13,14 @@
     "backend:build": "tsc -p tsconfig.server.json",
     "backend:sidecar": "node scripts/build-sidecar.mjs",
     "backend:dev": "npm run backend:build && node --use-env-proxy --watch dist-server/index.js",
-    "backend:test": "npm run backend:build && node --test server/index.test.mjs server/provider.test.mjs"
+    "backend:test": "npm run backend:build && node --test server/index.test.mjs server/provider.test.mjs server/image.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
     "@vitejs/plugin-react": "latest",
+    "jpeg-js": "^0.4.4",
     "lucide-react": "latest",
+    "pngjs": "^7.0.0",
     "react": "latest",
     "react-dom": "latest",
     "typescript": "latest",
@@ -26,6 +28,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/pngjs": "^6.0.5",
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "esbuild": "^0.28.2",

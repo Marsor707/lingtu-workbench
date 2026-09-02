@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { isSea } from 'node:sea'
 import { editImage, generateImage, materializeImageResult, ProviderError } from './provider.js'
 import type { GenerationResult } from './provider.js'
+import { pixelUpscaleTo4K } from './image.js'
 import { builtinPrompts } from './prompts.js'
 
 declare const process: { env: Record<string, string | undefined>; argv: string[]; exitCode?: number }
@@ -21,7 +22,7 @@ export type Prompt = { id: string; category: string; title: string; text: string
 export type AppStats = { completed: number; running: number; review: number; failed: number; total: number; storageBytes: number }
 export type SourceImage = { data: string; mimeType: string; name: string }
 export type Job = {
-  id: string; mode: JobMode; status: JobStatus; idempotencyKey?: string; prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number
+  id: string; mode: JobMode; status: JobStatus; idempotencyKey?: string; prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; pixelUpscale4K?: boolean
   windows?: PromptWindow[]; results?: JobResult[]; error?: { code: string; message: string }; providerId?: string
   provider: { status: 'not_implemented' | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'; invoked: boolean }
   createdAt: string; updatedAt: string; cancelledAt?: string
@@ -29,8 +30,8 @@ export type Job = {
 type ProviderConfig = { baseUrl: string; apiKey: string }
 export type ModelProvider = { id: string; name: string; baseUrl: string; configured: boolean; enabled: boolean; successCount: number; failureCount: number; createdAt: string; updatedAt: string }
 type StoredProvider = ModelProvider & { apiKey: string }
-type JobInput = { mode?: unknown; idempotencyKey?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; resolution?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown; maxConcurrency?: unknown }
-type StoredRequest = { prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; provider: ProviderConfig; providerId?: string; sourceImage?: SourceImage }
+type JobInput = { mode?: unknown; idempotencyKey?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; resolution?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown; maxConcurrency?: unknown; pixelUpscale4K?: unknown }
+type StoredRequest = { prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; pixelUpscale4K: boolean; provider: ProviderConfig; providerId?: string; sourceImage?: SourceImage }
 type Runtime = { controller: AbortController; listeners: Set<HttpResponse> }
 type GenerateImage = typeof generateImage
 type EditImage = typeof editImage
@@ -125,6 +126,7 @@ function validWindows(value: unknown): PromptWindow[] | undefined {
 }
 function optionalString(value: unknown, field: string): string | undefined { if (value === undefined || value === null) return undefined; if (typeof value !== 'string' || value.trim() === '') throw new RequestValidationError(`invalid_${field}`, `${field} 必须是非空字符串`); return value.trim() }
 function repeatValue(value: unknown): number { if (value === undefined) return 1; if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 100) throw new RequestValidationError('invalid_repeat', 'repeat 必须是 1 到 100 的整数'); return value as number }
+function booleanValue(value: unknown, fallback: boolean): boolean { if (value === undefined) return fallback; if (typeof value !== 'boolean') throw new RequestValidationError('invalid_pixel_upscale_4k', 'pixelUpscale4K 必须是布尔值'); return value }
 function sourceImageValue(value: unknown): SourceImage | undefined {
   if (value === undefined || value === null) return undefined
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RequestValidationError('invalid_source_image', 'sourceImage 必须是图片对象')
@@ -205,7 +207,7 @@ export class JobStore {
   close(): void { this.db.close() }
   private fromRow(row: Record<string, unknown>): Job {
     const request = row.request_json ? JSON.parse(String(row.request_json)) as StoredRequest : undefined
-    return { id: String(row.id), mode: row.mode as JobMode, status: row.status as JobStatus, ...(row.idempotency_key ? { idempotencyKey: String(row.idempotency_key) } : {}), ...(request?.prompt ? { prompt: request.prompt } : {}), ...(request?.layout ? { layout: request.layout } : {}), ...(request?.size ? { size: request.size } : {}), ...(request?.resolution ? { resolution: request.resolution } : {}), ...(request?.quality ? { quality: request.quality } : {}), repeat: request?.repeat ?? 1, ...(request?.providerId || row.provider_id ? { providerId: request?.providerId ?? String(row.provider_id) } : {}), ...(row.windows_json ? { windows: JSON.parse(String(row.windows_json)) as PromptWindow[] } : {}), ...(row.results_json ? { results: JSON.parse(String(row.results_json)) as JobResult[] } : {}), ...(row.error_json ? { error: JSON.parse(String(row.error_json)) as Job['error'] } : {}), provider: JSON.parse(String(row.provider_json)) as Job['provider'], createdAt: String(row.created_at), updatedAt: String(row.updated_at), ...(row.cancelled_at ? { cancelledAt: String(row.cancelled_at) } : {}) }
+    return { id: String(row.id), mode: row.mode as JobMode, status: row.status as JobStatus, ...(request?.prompt ? { prompt: request.prompt } : {}), ...(request?.layout ? { layout: request.layout } : {}), ...(request?.size ? { size: request.size } : {}), ...(request?.resolution ? { resolution: request.resolution } : {}), ...(request?.quality ? { quality: request.quality } : {}), ...(request?.pixelUpscale4K ? { pixelUpscale4K: true } : {}), ...(row.idempotency_key ? { idempotencyKey: String(row.idempotency_key) } : {}), repeat: request?.repeat ?? 1, ...(request?.providerId || row.provider_id ? { providerId: request?.providerId ?? String(row.provider_id) } : {}), ...(row.windows_json ? { windows: JSON.parse(String(row.windows_json)) as PromptWindow[] } : {}), ...(row.results_json ? { results: JSON.parse(String(row.results_json)) as JobResult[] } : {}), ...(row.error_json ? { error: JSON.parse(String(row.error_json)) as Job['error'] } : {}), provider: JSON.parse(String(row.provider_json)) as Job['provider'], createdAt: String(row.created_at), updatedAt: String(row.updated_at), ...(row.cancelled_at ? { cancelledAt: String(row.cancelled_at) } : {}) }
   }
   private migrateLegacyProvider(): void {
     const count = Number((this.db.prepare('SELECT COUNT(*) AS count FROM model_providers').get() as { count?: number }).count ?? 0)
@@ -224,8 +226,8 @@ export class JobStore {
     const sourceImage = sourceImageValue(input.sourceImage)
     if (mode === 'edit' && !sourceImage) throw new RequestValidationError('invalid_source_image', 'edit 模式必须提供 sourceImage')
     if (mode === 'edit' && !prompt) throw new RequestValidationError('invalid_prompt', 'edit 模式必须提供 prompt')
-    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), resolution: optionalString(input.resolution, 'resolution'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), provider: providerConfig(input.provider, { ...this.activeProviderConfig(), ...this.getProviderConfig(), ...defaults }), ...(providerId ? { providerId } : {}), ...(sourceImage ? { sourceImage } : {}) }
-    const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.resolution ? { resolution: request.resolution } : {}), ...(request.quality ? { quality: request.quality } : {}), repeat: request.repeat, ...(request.providerId ? { providerId: request.providerId } : {}), ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
+    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), resolution: optionalString(input.resolution, 'resolution'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), pixelUpscale4K: booleanValue(input.pixelUpscale4K, this.getPixelUpscale4K()), provider: providerConfig(input.provider, { ...this.activeProviderConfig(), ...this.getProviderConfig(), ...defaults }), ...(providerId ? { providerId } : {}), ...(sourceImage ? { sourceImage } : {}) }
+    const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.resolution ? { resolution: request.resolution } : {}), ...(request.quality ? { quality: request.quality } : {}), ...(request.pixelUpscale4K ? { pixelUpscale4K: true } : {}), repeat: request.repeat, ...(request.providerId ? { providerId: request.providerId } : {}), ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
     const persistedRequest = { ...request, provider: { baseUrl: request.provider.baseUrl, apiKey: '' } }
     this.db.prepare('INSERT INTO jobs (id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, request_json, provider_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(job.id, idempotencyKey ?? null, job.mode, job.status, job.windows ? JSON.stringify(job.windows) : null, JSON.stringify(job.provider), job.createdAt, job.updatedAt, JSON.stringify(persistedRequest), request.providerId ?? null)
     this.runtimeProviders.set(job.id, request.provider)
@@ -294,6 +296,13 @@ export class JobStore {
   }
   saveMaxConcurrency(value: number): void {
     this.db.prepare('INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at').run('max_concurrency', String(value), now())
+  }
+  getPixelUpscale4K(): boolean {
+    const row = this.db.prepare('SELECT value FROM app_settings WHERE key = ?').get('pixel_upscale_4k') as { value?: string } | undefined
+    return row?.value === 'true'
+  }
+  savePixelUpscale4K(value: boolean): void {
+    this.db.prepare('INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at').run('pixel_upscale_4k', String(value), now())
   }
   saveProviderConfig(config: ProviderConfig): void {
     this.db.prepare('INSERT INTO provider_config (id, base_url, api_key, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET base_url = excluded.base_url, api_key = excluded.api_key, updated_at = excluded.updated_at').run(config.baseUrl, config.apiKey, now())
@@ -390,6 +399,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   let maxConcurrency = environmentMaxConcurrency === undefined || environmentMaxConcurrency === ''
     ? store.getMaxConcurrency() ?? DEFAULT_MAX_CONCURRENCY
     : maxConcurrencyValue(environmentMaxConcurrency)
+  let pixelUpscale4K = store.getPixelUpscale4K()
   const pendingJobs: string[] = []
   const pendingJobIds = new Set<string>()
   const runningJobIds = new Set<string>()
@@ -405,7 +415,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   const execute = async (id: string): Promise<void> => {
     const request = store.request(id); const initial = store.get(id); if (!request || !initial || initial.status !== 'queued') return
     const jobStartedAt = Date.now()
-    appendExecutionLog(workspaceDir, 'job_started', { jobId: id, mode: initial.mode, repeat: request.repeat, size: request.size, resolution: request.resolution, quality: request.quality, promptCount: initial.mode === 'one_to_many' ? initial.windows?.length ?? 0 : request.prompt ? 1 : 0 })
+    appendExecutionLog(workspaceDir, 'job_started', { jobId: id, mode: initial.mode, repeat: request.repeat, size: request.size, resolution: request.resolution, quality: request.quality, pixelUpscale4K: request.pixelUpscale4K, promptCount: initial.mode === 'one_to_many' ? initial.windows?.length ?? 0 : request.prompt ? 1 : 0 })
     const runtime: Runtime = { controller: new AbortController(), listeners: pendingListeners.get(id) ?? new Set() }; pendingListeners.delete(id); runtimes.set(id, runtime); const running = store.update(id, 'running', { provider: { status: 'running', invoked: false } }); if (!running) return; emit(id, 'snapshot', running)
     const prompts = initial.mode === 'one_to_many' ? (initial.windows ?? []).map((window) => window.prompt) : request.prompt ? [request.prompt] : []
     // 无提示词的旧版请求作为草稿保留，避免凭空调用 Provider。
@@ -437,8 +447,13 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         })
         // Provider 可能返回 base64，也可能返回短时效图片 URL；URL 必须在任务执行期间下载后再落盘。
         providerStage = 'materialize'
-        const imageBytes = await materializeImageResult(result, runtime.controller.signal)
-        appendExecutionLog(workspaceDir, 'provider_result_materialized', { jobId: id, itemIndex: results.length, resultKind: result.kind, bytes: imageBytes.byteLength, durationMs: Date.now() - requestStartedAt })
+        const materializedBytes = await materializeImageResult(result, runtime.controller.signal)
+        appendExecutionLog(workspaceDir, 'provider_result_materialized', { jobId: id, itemIndex: results.length, resultKind: result.kind, bytes: materializedBytes.byteLength, durationMs: Date.now() - requestStartedAt })
+        // 放大开关随任务快照保存，执行时只做最近邻像素重采样，不再调用 Provider。
+        const upscale = request.pixelUpscale4K ? pixelUpscaleTo4K(materializedBytes) : undefined
+        const imageBytes = upscale?.bytes ?? materializedBytes
+        if (upscale && !upscale.upscaled) appendExecutionLog(workspaceDir, 'pixel_upscale_skipped', { jobId: id, itemIndex: results.length, reason: upscale.reason, format: upscale.format, sourceWidth: upscale.sourceWidth, sourceHeight: upscale.sourceHeight })
+        if (upscale?.upscaled) appendExecutionLog(workspaceDir, 'pixel_upscale_completed', { jobId: id, itemIndex: results.length, format: upscale.format, sourceWidth: upscale.sourceWidth, sourceHeight: upscale.sourceHeight, targetWidth: upscale.targetWidth, targetHeight: upscale.targetHeight, bytes: imageBytes.byteLength })
         const index = results.length; const relativePath = join(RESULTS_DIRECTORY, `${id}-${String(index + 1).padStart(3, '0')}.png`).replaceAll('\\', '/'); writeFileSync(join(workspaceDir, relativePath), imageBytes); results.push({ path: relativePath, index })
         providerStage = undefined
         const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) return
@@ -484,19 +499,23 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     setCors(res); if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }; const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
     if (req.method === 'GET' && path === '/health') { json(res, 200, { status: 'ok', service: 'lingtu-workbench' }); return }
     if (req.method === 'GET' && path === '/api/stats') { json(res, 200, store.stats(workspaceDir)); return }
-    if (req.method === 'GET' && path === '/api/settings') { json(res, 200, { maxConcurrency }); return }
+    if (req.method === 'GET' && path === '/api/settings') { json(res, 200, { maxConcurrency, pixelUpscale4K }); return }
     if (req.method === 'PUT' && path === '/api/settings') {
       let body: unknown
       try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
       try {
-        const value = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>).maxConcurrency : undefined
+        const item = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
+        const value = item.maxConcurrency
         const next = maxConcurrencyValue(value, maxConcurrency)
+        const nextPixelUpscale4K = booleanValue(item.pixelUpscale4K, pixelUpscale4K)
         if (environmentMaxConcurrency === undefined || environmentMaxConcurrency === '') {
           store.saveMaxConcurrency(next)
           maxConcurrency = next
           pump()
         }
-        json(res, 200, { maxConcurrency })
+        store.savePixelUpscale4K(nextPixelUpscale4K)
+        pixelUpscale4K = nextPixelUpscale4K
+        json(res, 200, { maxConcurrency, pixelUpscale4K })
       } catch (error) { if (error instanceof RequestValidationError) { errorResponse(res, 400, error.code, error.message); return }; errorResponse(res, 500, 'internal_error', '工作区设置保存失败') }
       return
     }

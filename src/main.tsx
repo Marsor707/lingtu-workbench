@@ -24,6 +24,7 @@ import {
   LayoutGrid,
   ListChecks,
   LoaderCircle,
+  Maximize2,
   MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
@@ -303,6 +304,7 @@ function App() {
   const [running, setRunning] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [maxConcurrency, setMaxConcurrency] = useState(() => readStoredMaxConcurrency())
+  const [pixelUpscale4K, setPixelUpscale4K] = useState(false)
   const [modelProviders, setModelProviders] = useState<ModelProvider[]>([])
   const [providerRunningCount, setProviderRunningCount] = useState(0)
   const [prompts, setPrompts] = useState<PromptItem[]>([])
@@ -341,11 +343,12 @@ function App() {
   useEffect(() => {
     const controller = new AbortController()
     fetch(`${LOCAL_API_BASE}/api/settings`, { signal: controller.signal })
-      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number }> : Promise.reject(new Error('settings unavailable')))
+      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number; pixelUpscale4K?: boolean }> : Promise.reject(new Error('settings unavailable')))
       .then((body) => {
         if (typeof body.maxConcurrency === 'number' && Number.isInteger(body.maxConcurrency)) {
           setMaxConcurrency(Math.min(20, Math.max(1, body.maxConcurrency)))
         }
+        if (typeof body.pixelUpscale4K === 'boolean') setPixelUpscale4K(body.pixelUpscale4K)
       })
       .catch(() => undefined)
     return () => controller.abort()
@@ -482,15 +485,16 @@ function App() {
     if (item) setTextPrompt(item.text)
   }
 
-  const saveWorkspaceConfig = async (nextMaxConcurrency: number) => {
+  const saveWorkspaceConfig = async (nextMaxConcurrency: number, nextPixelUpscale4K: boolean) => {
     const settingsResponse = await fetch(`${LOCAL_API_BASE}/api/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ maxConcurrency: nextMaxConcurrency }),
+      body: JSON.stringify({ maxConcurrency: nextMaxConcurrency, pixelUpscale4K: nextPixelUpscale4K }),
     })
-    const settingsBody = await settingsResponse.json() as ApiErrorBody & { maxConcurrency?: number }
+    const settingsBody = await settingsResponse.json() as ApiErrorBody & { maxConcurrency?: number; pixelUpscale4K?: boolean }
     if (!settingsResponse.ok || typeof settingsBody.maxConcurrency !== 'number') throw new Error(settingsBody.error?.message || '并发设置保存失败')
     setMaxConcurrency(settingsBody.maxConcurrency)
+    if (typeof settingsBody.pixelUpscale4K === 'boolean') setPixelUpscale4K(settingsBody.pixelUpscale4K)
   }
 
   const refreshProviders = async () => {
@@ -725,6 +729,7 @@ function App() {
               resolution,
               quality,
               repeat,
+              pixelUpscale4K,
               sourceImage,
               idempotencyKey: `lingtu-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
             }),
@@ -816,7 +821,7 @@ function App() {
         {page === 'models' && <ModelSettingsPage providers={modelProviders} runningCount={providerRunningCount} onRefresh={refreshProviders} />}
       </main>
 
-      {showSettings && <SettingsModal maxConcurrency={maxConcurrency} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsModal maxConcurrency={maxConcurrency} pixelUpscale4K={pixelUpscale4K} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
     </div>
   )
 }
@@ -1206,8 +1211,9 @@ function ModelSettingsPage({ providers, runningCount, onRefresh }: { providers: 
   </div>
 }
 
-function SettingsModal({ maxConcurrency, onSave, onClose }: { maxConcurrency: number; onSave: (maxConcurrency: number) => Promise<void>; onClose: () => void }) {
+function SettingsModal({ maxConcurrency, pixelUpscale4K, onSave, onClose }: { maxConcurrency: number; pixelUpscale4K: boolean; onSave: (maxConcurrency: number, pixelUpscale4K: boolean) => Promise<void>; onClose: () => void }) {
   const [draftMaxConcurrency, setDraftMaxConcurrency] = useState(maxConcurrency)
+  const [draftPixelUpscale4K, setDraftPixelUpscale4K] = useState(pixelUpscale4K)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
@@ -1216,7 +1222,7 @@ function SettingsModal({ maxConcurrency, onSave, onClose }: { maxConcurrency: nu
     if (saving) return
     setSaving(true)
     try {
-      await onSave(draftMaxConcurrency)
+      await onSave(draftMaxConcurrency, draftPixelUpscale4K)
       setSaved(true)
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : '工作区设置保存失败')
@@ -1244,6 +1250,10 @@ function SettingsModal({ maxConcurrency, onSave, onClose }: { maxConcurrency: nu
           <div className="setting-row">
             <div><strong>最大并发</strong><span>建议根据供应商配额逐步增加</span></div>
             <div className="number-control compact"><input type="number" min="1" max="20" value={draftMaxConcurrency} onChange={(event) => { setSaved(false); setError(''); setDraftMaxConcurrency(Math.min(20, Math.max(1, Number(event.target.value) || 1))) }} aria-label="最大并发数" /><span>线程</span></div>
+          </div>
+          <div className="setting-row setting-row-toggle">
+            <div><strong><Maximize2 size={15} />像素放大到 4K</strong><span>任务完成前在本机按比例放大最长边至 3840px，不调用模型。</span></div>
+            <label className="setting-switch"><input type="checkbox" aria-label="像素放大到 4K" checked={draftPixelUpscale4K} onChange={(event) => { setSaved(false); setError(''); setDraftPixelUpscale4K(event.target.checked) }} /><span aria-hidden="true" /></label>
           </div>
           {error && <div className="form-error settings-modal-error" role="alert"><AlertTriangle size={14} />{error}</div>}
         </div>
