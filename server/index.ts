@@ -449,7 +449,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         providerStage = 'materialize'
         const materializedBytes = await materializeImageResult(result, runtime.controller.signal)
         appendExecutionLog(workspaceDir, 'provider_result_materialized', { jobId: id, itemIndex: results.length, resultKind: result.kind, bytes: materializedBytes.byteLength, durationMs: Date.now() - requestStartedAt })
-        // 放大开关随任务快照保存，执行时只做最近邻像素重采样，不再调用 Provider。
+        // 放大开关随任务快照保存，执行时只做 Lanczos3 像素重采样，不再调用 Provider。
         const upscale = request.pixelUpscale4K ? pixelUpscaleTo4K(materializedBytes) : undefined
         const imageBytes = upscale?.bytes ?? materializedBytes
         if (upscale && !upscale.upscaled) appendExecutionLog(workspaceDir, 'pixel_upscale_skipped', { jobId: id, itemIndex: results.length, reason: upscale.reason, format: upscale.format, sourceWidth: upscale.sourceWidth, sourceHeight: upscale.sourceHeight })

@@ -22,18 +22,74 @@ function isJpeg(bytes: Uint8Array): boolean {
   return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
 }
 
+type ResizeContribution = { indices: number[]; weights: number[] }
+
+function sinc(value: number): number {
+  if (value === 0) return 1
+  const piValue = Math.PI * value
+  return Math.sin(piValue) / piValue
+}
+
+function lanczos3(value: number): number {
+  const distance = Math.abs(value)
+  return distance >= 3 ? 0 : sinc(value) * sinc(value / 3)
+}
+
+function resizeContributions(sourceSize: number, targetSize: number): ResizeContribution[] {
+  const scale = targetSize / sourceSize
+  const contributions: ResizeContribution[] = []
+  for (let targetIndex = 0; targetIndex < targetSize; targetIndex += 1) {
+    const sourceCenter = (targetIndex + 0.5) / scale - 0.5
+    const first = Math.ceil(sourceCenter - 3)
+    const last = Math.floor(sourceCenter + 3)
+    const weightsByIndex = new Map<number, number>()
+    for (let sourceIndex = first; sourceIndex <= last; sourceIndex += 1) {
+      const clampedIndex = Math.max(0, Math.min(sourceSize - 1, sourceIndex))
+      weightsByIndex.set(clampedIndex, (weightsByIndex.get(clampedIndex) ?? 0) + lanczos3(sourceCenter - sourceIndex))
+    }
+    const totalWeight = [...weightsByIndex.values()].reduce((sum, weight) => sum + weight, 0)
+    contributions.push({
+      indices: [...weightsByIndex.keys()],
+      weights: [...weightsByIndex.values()].map((weight) => weight / totalWeight),
+    })
+  }
+  return contributions
+}
+
 function resizeRgba(source: Uint8Array, sourceWidth: number, sourceHeight: number, targetWidth: number, targetHeight: number): Buffer {
+  const horizontal = resizeContributions(sourceWidth, targetWidth)
+  const vertical = resizeContributions(sourceHeight, targetHeight)
+  const intermediate = new Float32Array(targetWidth * sourceHeight * 4)
+
+  // Lanczos3 是可分离滤波器，先横向再纵向，避免为每个输出像素重复计算二维权重。
+  for (let y = 0; y < sourceHeight; y += 1) {
+    for (let x = 0; x < targetWidth; x += 1) {
+      const contribution = horizontal[x]
+      const targetOffset = (y * targetWidth + x) * 4
+      for (let channel = 0; channel < 4; channel += 1) {
+        let value = 0
+        for (let sample = 0; sample < contribution.indices.length; sample += 1) {
+          const sourceOffset = (y * sourceWidth + contribution.indices[sample]) * 4 + channel
+          value += source[sourceOffset] * contribution.weights[sample]
+        }
+        intermediate[targetOffset + channel] = Math.max(0, Math.min(255, value))
+      }
+    }
+  }
+
   const target = Buffer.allocUnsafe(targetWidth * targetHeight * 4)
   for (let y = 0; y < targetHeight; y += 1) {
-    const sourceY = Math.min(sourceHeight - 1, Math.floor(y * sourceHeight / targetHeight))
     for (let x = 0; x < targetWidth; x += 1) {
-      const sourceX = Math.min(sourceWidth - 1, Math.floor(x * sourceWidth / targetWidth))
-      const sourceOffset = (sourceY * sourceWidth + sourceX) * 4
+      const contribution = vertical[y]
       const targetOffset = (y * targetWidth + x) * 4
-      target[targetOffset] = source[sourceOffset]
-      target[targetOffset + 1] = source[sourceOffset + 1]
-      target[targetOffset + 2] = source[sourceOffset + 2]
-      target[targetOffset + 3] = source[sourceOffset + 3]
+      for (let channel = 0; channel < 4; channel += 1) {
+        let value = 0
+        for (let sample = 0; sample < contribution.indices.length; sample += 1) {
+          const sourceOffset = (contribution.indices[sample] * targetWidth + x) * 4 + channel
+          value += intermediate[sourceOffset] * contribution.weights[sample]
+        }
+        target[targetOffset + channel] = Math.max(0, Math.min(255, Math.round(value)))
+      }
     }
   }
   return target

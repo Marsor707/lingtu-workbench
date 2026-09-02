@@ -22,6 +22,10 @@ test('像素放大按最长边 3840 保持比例并输出 PNG', () => {
   const decoded = PNG.sync.read(Buffer.from(result.bytes))
   assert.deepEqual([decoded.width, decoded.height], [3840, 1920])
   assert.deepEqual([...decoded.data.subarray(0, 4)], [255, 255, 0, 255])
+
+  // Lanczos3 在原图边界生成过渡像素，不应退化为最近邻的硬切换。
+  const boundaryGreen = decoded.data[(1920 * 4) + 1]
+  assert.ok(boundaryGreen > 0 && boundaryGreen < 255)
 })
 
 test('JPEG 结果也能放大并统一编码为 PNG', () => {
