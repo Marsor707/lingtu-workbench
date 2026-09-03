@@ -82,6 +82,9 @@ test('高级参数追加段覆盖模板输出布局并保留目标长宽比', ()
   assert.match(two, /两个彼此独立的成品区域，固定为上下两行排列/)
   assert.doesNotMatch(two, /目标画布长宽比：/)
   assert.match(two, /目标分辨率等级：4K/)
+
+  const single = buildEffectivePrompt('测试', 'single', '1024x1024', '1K')
+  assert.match(single, /输出布局：单图；一个完整的独立成品区域，不拆分为宫格/)
 })
 
 test('旧版单 Provider 配置首次启动自动迁移为默认启用供应商', () => {
@@ -419,6 +422,92 @@ test('任务可查询、发送 SSE 初始快照并取消', async () => {
   assert.equal(cancelled.body.status, 'cancelled')
   const detail = await request(`/api/jobs/${id}`)
   assert.equal(detail.body.status, 'cancelled')
+})
+
+test('失败或取消任务可沿用原 ID 重试并重新完成', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-retry-workspace-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const previousEnvironment = Object.fromEntries(environmentKeys.map((name) => [name, process.env[name]]))
+  let failAttempts = 0
+  let cancelAttempts = 0
+  const seenProviders = []
+  const mockGenerate = async ({ prompt, signal, baseUrl, apiKey }) => {
+    seenProviders.push({ baseUrl, apiKey })
+    if (prompt.startsWith('首次失败') && failAttempts === 0) {
+      failAttempts += 1
+      throw new Error('mock provider failure')
+    }
+    if (prompt.startsWith('取消后重试') && cancelAttempts === 0) {
+      cancelAttempts += 1
+      return new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new DOMException('任务已取消', 'AbortError')), { once: true })
+      })
+    }
+    return { kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' }
+  }
+  const server = await startServer(0, '127.0.0.1', store, { workspaceDir: directory, generateImage: mockGenerate, editImage: mockGenerate })
+  const base = `http://127.0.0.1:${server.address().port}`
+  try {
+    const providerResponse = await fetch(`${base}/api/providers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'provider-a', baseUrl: 'https://provider-a.example/v1', apiKey: 'provider-a-secret' }) })
+    const providerA = await providerResponse.json()
+    const backupProviderResponse = await fetch(`${base}/api/providers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'provider-b', baseUrl: 'https://provider-b.example/v1', apiKey: 'provider-b-secret' }) })
+    const providerB = await backupProviderResponse.json()
+    await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pixelUpscale4K: false }) })
+    const create = async (prompt) => {
+      const response = await fetch(`${base}/api/jobs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'edit', prompt, layout: 'four_up', size: '1024x1024', resolution: '1K', quality: 'high', sourceImage: { data: 'ZmFrZS1pbWFnZQ==', mimeType: 'image/png', name: 'source.png' } }) })
+      assert.equal(response.status, 201)
+      return response.json()
+    }
+
+    const failedJob = await create('首次失败')
+    assert.match(await (await fetch(`${base}/api/jobs/${failedJob.id}/events`)).text(), /event: failed/)
+    assert.equal((await (await fetch(`${base}/api/jobs/${failedJob.id}`)).json()).status, 'failed')
+    const originalRequest = store.request(failedJob.id)
+    await new Promise((resolve) => setTimeout(resolve, 2))
+    assert.equal((await fetch(`${base}/api/providers/${providerB.id}/enable`, { method: 'POST' })).status, 200)
+    await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pixelUpscale4K: true }) })
+
+    const retryResponse = await fetch(`${base}/api/jobs/${failedJob.id}/retry`, { method: 'POST' })
+    const retryJob = await retryResponse.json()
+    assert.equal(retryResponse.status, 200)
+    assert.equal(retryJob.id, failedJob.id)
+    assert.equal(retryJob.status, 'queued')
+    assert.equal(retryJob.error, undefined)
+    assert.notEqual(retryJob.createdAt, failedJob.createdAt)
+    const retriedRequest = store.request(failedJob.id)
+    assert.equal(retriedRequest?.providerId, providerB.id)
+    assert.equal(retriedRequest?.provider.baseUrl, 'https://provider-b.example/v1')
+    assert.equal(retriedRequest?.pixelUpscale4K, true)
+    assert.deepEqual(seenProviders.slice(0, 2), [{ baseUrl: 'https://provider-a.example/v1', apiKey: 'provider-a-secret' }, { baseUrl: 'https://provider-b.example/v1', apiKey: 'provider-b-secret' }])
+    assert.deepEqual({ prompt: retriedRequest?.prompt, layout: retriedRequest?.layout, size: retriedRequest?.size, resolution: retriedRequest?.resolution, quality: retriedRequest?.quality, sourceImage: retriedRequest?.sourceImage }, { prompt: originalRequest?.prompt, layout: originalRequest?.layout, size: originalRequest?.size, resolution: originalRequest?.resolution, quality: originalRequest?.quality, sourceImage: originalRequest?.sourceImage })
+    assert.match(await (await fetch(`${base}/api/jobs/${failedJob.id}/events`)).text(), /event: completed/)
+    assert.equal((await (await fetch(`${base}/api/jobs/${failedJob.id}`)).json()).status, 'completed')
+
+    const cancelledJob = await create('取消后重试')
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if ((await (await fetch(`${base}/api/jobs/${cancelledJob.id}`)).json()).status === 'running') break
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
+    assert.equal((await (await fetch(`${base}/api/jobs/${cancelledJob.id}`)).json()).status, 'running')
+    const cancelResponse = await fetch(`${base}/api/jobs/${cancelledJob.id}/cancel`, { method: 'POST' })
+    assert.equal((await cancelResponse.json()).status, 'cancelled')
+    process.env.LINGTU_PROVIDER_BASE_URL = 'https://env-retry.example/v1'
+    process.env.LINGTU_API_KEY = 'env-retry-secret'
+    const cancelledRetryResponse = await fetch(`${base}/api/jobs/${cancelledJob.id}/retry`, { method: 'POST' })
+    const cancelledRetry = await cancelledRetryResponse.json()
+    assert.equal(cancelledRetryResponse.status, 200)
+    assert.equal(cancelledRetry.id, cancelledJob.id)
+    assert.deepEqual(seenProviders.at(-1), { baseUrl: 'https://env-retry.example/v1', apiKey: 'env-retry-secret' })
+    assert.match(await (await fetch(`${base}/api/jobs/${cancelledJob.id}/events`)).text(), /event: completed/)
+  } finally {
+    for (const name of environmentKeys) {
+      if (previousEnvironment[name] === undefined) delete process.env[name]
+      else process.env[name] = previousEnvironment[name]
+    }
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
 })
 
 test('任务元数据可从 SQLite 跨实例回读', () => {

@@ -50,6 +50,9 @@ const MODE_ALIASES: Record<string, JobMode> = { text: 'text_to_image', 'one-to-m
 
 type OutputLayoutSpec = { name: string; arrangement: string }
 const OUTPUT_LAYOUTS: Record<string, OutputLayoutSpec> = {
+  // 单图保持完整画布；同时接受界面文案和内部英文值，兼容不同来源的任务请求。
+  '单图': { name: '单图', arrangement: '一个完整的独立成品区域，不拆分为宫格' },
+  single: { name: '单图', arrangement: '一个完整的独立成品区域，不拆分为宫格' },
   '四宫格': { name: '四宫格', arrangement: '四个彼此独立的成品区域，固定为 2 列 × 2 行排列' },
   '4K 四宫格': { name: '四宫格', arrangement: '四个彼此独立的成品区域，固定为 2 列 × 2 行排列' },
   four_up: { name: '四宫格', arrangement: '四个彼此独立的成品区域，固定为 2 列 × 2 行排列' },
@@ -358,6 +361,26 @@ export class JobStore {
   forgetProvider(id: string): void { this.runtimeProviders.delete(id) }
   update(id: string, status: JobStatus, patch: { provider?: Job['provider']; results?: JobResult[]; error?: Job['error'] } = {}): Job | undefined { const timestamp = now(); this.db.prepare('UPDATE jobs SET status = ?, provider_json = COALESCE(?, provider_json), results_json = COALESCE(?, results_json), error_json = COALESCE(?, error_json), updated_at = ? WHERE id = ?').run(status, patch.provider ? JSON.stringify(patch.provider) : null, patch.results ? JSON.stringify(patch.results) : null, patch.error ? JSON.stringify(patch.error) : null, timestamp, id); return this.get(id) }
   cancel(id: string): Job | undefined { const job = this.get(id); if (!job || ['completed', 'failed', 'cancelled'].includes(job.status)) return job; const timestamp = now(); this.db.prepare('UPDATE jobs SET status = ?, cancelled_at = ?, updated_at = ?, provider_json = ? WHERE id = ?').run('cancelled', timestamp, timestamp, JSON.stringify({ status: 'cancelled', invoked: job.provider.invoked }), id); return this.get(id) }
+  retry(id: string, latest?: { provider?: ProviderConfig; providerId?: string; pixelUpscale4K?: boolean }): Job | undefined {
+    const job = this.get(id)
+    if (!job || !['failed', 'cancelled'].includes(job.status)) return undefined
+    const request = this.request(id)
+    if (!request) return undefined
+    const { providerId: _previousProviderId, ...requestWithoutProviderId } = request
+    const nextRequest: StoredRequest = {
+      ...requestWithoutProviderId,
+      ...(latest?.provider ? { provider: latest.provider } : {}),
+      ...(latest?.providerId ? { providerId: latest.providerId } : {}),
+      ...(latest?.pixelUpscale4K === undefined ? {} : { pixelUpscale4K: latest.pixelUpscale4K }),
+    }
+    const persistedRequest = { ...nextRequest, provider: { baseUrl: nextRequest.provider.baseUrl, apiKey: '' } }
+    const candidateTimestamp = now()
+    // 极快重试可能落在同一毫秒，至少向后推进 1ms 以保证列表排序可观察到变化。
+    const timestamp = candidateTimestamp > job.createdAt ? candidateTimestamp : new Date(Date.parse(job.createdAt) + 1).toISOString()
+    // 重试沿用原任务身份，清空本轮结果和错误后重新进入统一调度队列。
+    this.db.prepare('UPDATE jobs SET status = ?, created_at = ?, cancelled_at = NULL, provider_json = ?, results_json = NULL, error_json = NULL, provider_id = ?, request_json = ?, updated_at = ? WHERE id = ? AND status IN (?, ?)').run('queued', timestamp, JSON.stringify({ status: 'pending', invoked: false }), nextRequest.providerId ?? null, JSON.stringify(persistedRequest), timestamp, id, 'failed', 'cancelled')
+    return this.get(id)
+  }
 }
 export class RequestValidationError extends Error { constructor(public readonly code: string, message: string) { super(message) } }
 function portFromEnvironment(): number { const value = process.env.LINGTU_PORT; if (value === undefined || value === '') return DEFAULT_PORT; const port = Number(value); if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('LINGTU_PORT must be an integer between 0 and 65535'); return port }
@@ -404,16 +427,18 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   const pendingJobIds = new Set<string>()
   const runningJobIds = new Set<string>()
   const pendingListeners = new Map<string, Set<HttpResponse>>()
+  const executionTokens = new Map<string, symbol>()
   const emit = (id: string, event: string, data: unknown): void => {
     const runtime = runtimes.get(id)
     const listeners = runtime?.listeners ?? pendingListeners.get(id)
     if (!listeners) return
     const message = dataEvent(event, data)
     for (const listener of listeners) { try { listener.write(message) } catch { listeners.delete(listener) } }
-    if (event === 'completed' || event === 'failed') { for (const listener of listeners) listener.end(); listeners.clear(); pendingListeners.delete(id) }
+    if (event === 'completed' || event === 'failed' || event === 'cancelled') { for (const listener of listeners) listener.end(); listeners.clear(); pendingListeners.delete(id) }
   }
-  const execute = async (id: string): Promise<void> => {
+  const execute = async (id: string, token: symbol): Promise<void> => {
     const request = store.request(id); const initial = store.get(id); if (!request || !initial || initial.status !== 'queued') return
+    const isCurrentExecution = (): boolean => executionTokens.get(id) === token
     const jobStartedAt = Date.now()
     appendExecutionLog(workspaceDir, 'job_started', { jobId: id, mode: initial.mode, repeat: request.repeat, size: request.size, resolution: request.resolution, quality: request.quality, pixelUpscale4K: request.pixelUpscale4K, promptCount: initial.mode === 'one_to_many' ? initial.windows?.length ?? 0 : request.prompt ? 1 : 0 })
     const runtime: Runtime = { controller: new AbortController(), listeners: pendingListeners.get(id) ?? new Set() }; pendingListeners.delete(id); runtimes.set(id, runtime); const running = store.update(id, 'running', { provider: { status: 'running', invoked: false } }); if (!running) return; emit(id, 'snapshot', running)
@@ -429,7 +454,10 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         if (runtime.controller.signal.aborted) throw new DOMException('任务已取消', 'AbortError')
         // 页面关闭或服务重启后，任务仍可从本地 Provider 配置恢复执行凭据。
         const storedProvider = request.providerId ? store.getProvider(request.providerId) : undefined
-        const provider = store.provider(id) ?? (storedProvider ? { baseUrl: request.provider.baseUrl || storedProvider.baseUrl, apiKey: storedProvider.apiKey } : undefined) ?? store.activeProviderConfig() ?? store.getProviderConfig() ?? request.provider
+        const selectedProvider = store.provider(id) ?? (storedProvider ? { baseUrl: request.provider.baseUrl || storedProvider.baseUrl, apiKey: storedProvider.apiKey } : undefined) ?? store.activeProviderConfig() ?? store.getProviderConfig() ?? request.provider
+        // 环境变量是最终覆盖层，确保重试和普通任务都不会因供应商缓存而回退到旧密钥。
+        const envProvider = environmentProvider()
+        const provider = { baseUrl: envProvider.baseUrl ?? selectedProvider.baseUrl, apiKey: envProvider.apiKey ?? selectedProvider.apiKey }
         const requestStartedAt = Date.now()
         providerStage = 'request'
         appendExecutionLog(workspaceDir, 'provider_request_started', { jobId: id, mode: initial.mode, itemIndex: results.length, providerHost: providerHost(provider.baseUrl), size: request.size, resolution: request.resolution, quality: request.quality })
@@ -448,20 +476,23 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         // Provider 可能返回 base64，也可能返回短时效图片 URL；URL 必须在任务执行期间下载后再落盘。
         providerStage = 'materialize'
         const materializedBytes = await materializeImageResult(result, runtime.controller.signal)
+        if (!isCurrentExecution() || runtime.controller.signal.aborted) return
         appendExecutionLog(workspaceDir, 'provider_result_materialized', { jobId: id, itemIndex: results.length, resultKind: result.kind, bytes: materializedBytes.byteLength, durationMs: Date.now() - requestStartedAt })
         // 放大开关随任务快照保存，执行时只做 Lanczos3 像素重采样，不再调用 Provider。
         const upscale = request.pixelUpscale4K ? pixelUpscaleTo4K(materializedBytes) : undefined
         const imageBytes = upscale?.bytes ?? materializedBytes
         if (upscale && !upscale.upscaled) appendExecutionLog(workspaceDir, 'pixel_upscale_skipped', { jobId: id, itemIndex: results.length, reason: upscale.reason, format: upscale.format, sourceWidth: upscale.sourceWidth, sourceHeight: upscale.sourceHeight })
         if (upscale?.upscaled) appendExecutionLog(workspaceDir, 'pixel_upscale_completed', { jobId: id, itemIndex: results.length, format: upscale.format, sourceWidth: upscale.sourceWidth, sourceHeight: upscale.sourceHeight, targetWidth: upscale.targetWidth, targetHeight: upscale.targetHeight, bytes: imageBytes.byteLength })
+        if (!isCurrentExecution() || runtime.controller.signal.aborted) return
         const index = results.length; const relativePath = join(RESULTS_DIRECTORY, `${id}-${String(index + 1).padStart(3, '0')}.png`).replaceAll('\\', '/'); writeFileSync(join(workspaceDir, relativePath), imageBytes); results.push({ path: relativePath, index })
         providerStage = undefined
-        const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) return
+        const current = store.get(id); if (!isCurrentExecution() || current?.status === 'cancelled' || runtime.controller.signal.aborted) return
         emit(id, 'progress', { completed: index + 1, total, result: results[index], job: current })
       }
-      const current = store.get(id); if (current?.status === 'cancelled') return; const completed = store.update(id, 'completed', { provider: { status: 'completed', invoked: true }, results }); if (completed) { store.recordProviderOutcome(request.providerId, 'completed'); appendExecutionLog(workspaceDir, 'job_completed', { jobId: id, resultCount: results.length, durationMs: Date.now() - jobStartedAt }); emit(id, 'completed', completed) }
+      const current = store.get(id); if (!isCurrentExecution() || current?.status === 'cancelled') return; const completed = store.update(id, 'completed', { provider: { status: 'completed', invoked: true }, results }); if (completed) { store.recordProviderOutcome(request.providerId, 'completed'); appendExecutionLog(workspaceDir, 'job_completed', { jobId: id, resultCount: results.length, durationMs: Date.now() - jobStartedAt }); emit(id, 'completed', completed) }
     } catch (error) {
-      const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) { if (current) emit(id, 'failed', current); return }
+      if (!isCurrentExecution()) return
+      const current = store.get(id); if (current?.status === 'cancelled' || runtime.controller.signal.aborted) { if (current) emit(id, 'cancelled', current); return }
       // 仅向前端返回可操作的诊断方向，不透传 Provider 原始响应或请求内容。
       const safeError = error instanceof ProviderError
         ? { code: error.code, message: error.message }
@@ -469,7 +500,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       if (providerStage) appendExecutionLog(workspaceDir, 'provider_stage_failed', { jobId: id, stage: providerStage, ...logErrorFields(error) })
       appendExecutionLog(workspaceDir, 'job_failed', { jobId: id, mode: initial.mode, durationMs: Date.now() - jobStartedAt, ...logErrorFields(error) })
       const failed = store.update(id, 'failed', { provider: { status: 'failed', invoked: true }, error: safeError }); if (failed) { store.recordProviderOutcome(request.providerId, 'failed'); emit(id, 'failed', failed) }
-    } finally { if (runtimes.get(id) === runtime) runtimes.delete(id); store.forgetProvider(id) }
+    } finally { if (isCurrentExecution()) { if (runtimes.get(id) === runtime) runtimes.delete(id); store.forgetProvider(id) } }
   }
   const pump = (): void => {
     while (runningJobIds.size < maxConcurrency && pendingJobs.length > 0) {
@@ -477,9 +508,15 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       pendingJobIds.delete(id)
       if (runningJobIds.has(id)) continue
       runningJobIds.add(id)
+      const token = Symbol(id)
+      executionTokens.set(id, token)
       // 任务状态已经持久化为 queued，只有调度器取得名额后才进入 Provider 执行阶段。
-      void execute(id).finally(() => {
-        runningJobIds.delete(id)
+      void execute(id, token).finally(() => {
+        // 旧执行被取消并重试后，不能清理新一轮执行的占用标记。
+        if (executionTokens.get(id) === token) {
+          executionTokens.delete(id)
+          runningJobIds.delete(id)
+        }
         pump()
       })
     }
@@ -490,6 +527,17 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       pendingJobIds.add(id)
     }
     pump()
+  }
+  const dropPending = (id: string): void => {
+    pendingJobIds.delete(id)
+    for (let index = pendingJobs.length - 1; index >= 0; index -= 1) if (pendingJobs[index] === id) pendingJobs.splice(index, 1)
+  }
+  const latestRetryConfig = (): { provider: ProviderConfig; providerId?: string } => {
+    const activeProvider = store.activeProvider()
+    const defaults = activeProvider
+      ? { baseUrl: activeProvider.baseUrl, apiKey: activeProvider.apiKey }
+      : store.getProviderConfig() ?? options.defaultProvider ?? {}
+    return { provider: providerConfig(undefined, defaults), ...(activeProvider ? { providerId: activeProvider.id } : {}) }
   }
   // 后端重启后继续执行尚未领取的任务，避免前端页面状态成为任务可靠性的前提。
   for (const job of store.list()) {
@@ -620,9 +668,28 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       return
     }
     const jobMatch = path.match(/^\/api\/jobs\/([^/]+)(?:\/([^/]+))?$/); if (jobMatch) { const id = decodeURIComponent(jobMatch[1]); const action = jobMatch[2]
-      if (req.method === 'GET' && action === 'events') { const job = store.get(id); if (!job) { errorResponse(res, 404, 'job_not_found', '任务不存在'); return }; res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' }); const runtime = runtimes.get(id); const waitingForScheduler = !runtime && pendingJobIds.has(id); const listeners = runtime?.listeners ?? pendingListeners.get(id) ?? new Set<HttpResponse>(); if (!runtime && waitingForScheduler) pendingListeners.set(id, listeners); listeners.add(res); res.write(dataEvent('snapshot', job)); if (['completed', 'failed', 'cancelled'].includes(job.status)) { res.write(dataEvent(job.status === 'completed' ? 'completed' : 'failed', job)); res.end(); listeners.delete(res); return }; if (!runtime && !waitingForScheduler) { res.end(); listeners.delete(res); return }; res.on?.('close', () => listeners.delete(res)); return }
+      if (req.method === 'GET' && action === 'events') { const job = store.get(id); if (!job) { errorResponse(res, 404, 'job_not_found', '任务不存在'); return }; res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' }); const runtime = runtimes.get(id); const waitingForScheduler = !runtime && pendingJobIds.has(id); const listeners = runtime?.listeners ?? pendingListeners.get(id) ?? new Set<HttpResponse>(); if (!runtime && waitingForScheduler) pendingListeners.set(id, listeners); listeners.add(res); res.write(dataEvent('snapshot', job)); if (['completed', 'failed', 'cancelled'].includes(job.status)) { res.write(dataEvent(job.status === 'completed' ? 'completed' : job.status, job)); res.end(); listeners.delete(res); return }; if (!runtime && !waitingForScheduler) { res.end(); listeners.delete(res); return }; res.on?.('close', () => listeners.delete(res)); return }
       if (req.method === 'GET' && !action) { const job = store.get(id); if (!job) errorResponse(res, 404, 'job_not_found', '任务不存在'); else json(res, 200, job); return }
-      if (req.method === 'POST' && action === 'cancel') { const runtime = runtimes.get(id); const job = store.cancel(id); if (!job) { errorResponse(res, 404, 'job_not_found', '任务不存在'); return }; if (runtime) runtime.controller.abort(); emit(id, 'failed', job); json(res, 200, job); return }
+      if (req.method === 'POST' && action === 'cancel') { const runtime = runtimes.get(id); const job = store.cancel(id); if (!job) { errorResponse(res, 404, 'job_not_found', '任务不存在'); return }; dropPending(id); if (runtime) runtime.controller.abort(); emit(id, 'cancelled', job); json(res, 200, job); return }
+      if (req.method === 'POST' && action === 'retry') {
+        const current = store.get(id)
+        if (!current) { errorResponse(res, 404, 'job_not_found', '任务不存在'); return }
+        if (!['failed', 'cancelled'].includes(current.status)) { errorResponse(res, 409, 'retry_not_allowed', '仅失败或已取消的任务可以重试'); return }
+        // 取消旧执行并使其失效，避免旧请求在新一轮任务中回写状态或结果。
+        runtimes.get(id)?.controller.abort()
+        runtimes.delete(id)
+        store.forgetProvider(id)
+        executionTokens.delete(id)
+        runningJobIds.delete(id)
+        dropPending(id)
+        const latest = latestRetryConfig()
+        const job = store.retry(id, { ...latest, pixelUpscale4K })
+        if (!job) { errorResponse(res, 409, 'retry_conflict', '任务状态已发生变化，请刷新后重试'); return }
+        appendExecutionLog(workspaceDir, 'job_retried', { jobId: id, previousStatus: current.status })
+        json(res, 200, job)
+        if (job.prompt || job.windows) queue(job.id)
+        return
+      }
     }
     // API 路由处理完后再托管静态文件，避免把未知 API 请求误返回前端首页。
     if (req.method === 'GET' && staticDir && path !== '/api' && !path.startsWith('/api/')) { serveStatic(res, staticDir, path); return }
