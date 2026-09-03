@@ -75,6 +75,19 @@ type ModelProvider = {
   updatedAt: string
 }
 
+type LlmProvider = {
+  id: string
+  name: string
+  baseUrl: string
+  model: string
+  configured: boolean
+  enabled: boolean
+  successCount: number
+  failureCount: number
+  createdAt: string
+  updatedAt: string
+}
+
 type QueueStatus = 'queued' | 'running' | 'done' | 'review' | 'failed' | 'cancelled'
 
 type QueueItem = {
@@ -108,7 +121,7 @@ type ApiJob = {
   size?: string
   resolution?: string
   job?: ApiJob
-  results?: Array<{ index: number }>
+  results?: Array<{ index: number; name?: string }>
   error?: { message?: string }
 }
 
@@ -293,7 +306,7 @@ function assetsFromJob(job: ApiJob): GalleryAsset[] {
   const modeLabel = modes.find((item) => item.id === (job.mode === 'text_to_image' ? 'text' : job.mode))?.label ?? '生图'
   return job.results.map((result) => ({
     src: `${LOCAL_API_BASE}/api/jobs/${encodeURIComponent(job.id)}/results/${result.index}`,
-    title: `${modeLabel} · ${job.id.slice(-8)} · ${String(result.index + 1).padStart(2, '0')}`,
+    title: result.name || `${modeLabel} · ${job.id.slice(-8)} · ${String(result.index + 1).padStart(2, '0')}`,
     tag: 'PASS',
     tone: 'pass',
     jobId: job.id,
@@ -308,8 +321,11 @@ function App() {
   const [showSettings, setShowSettings] = useState(false)
   const [maxConcurrency, setMaxConcurrency] = useState(() => readStoredMaxConcurrency())
   const [pixelUpscale4K, setPixelUpscale4K] = useState(false)
+  const [imageNamingEnabled, setImageNamingEnabled] = useState(false)
   const [modelProviders, setModelProviders] = useState<ModelProvider[]>([])
   const [providerRunningCount, setProviderRunningCount] = useState(0)
+  const [llmProviders, setLlmProviders] = useState<LlmProvider[]>([])
+  const [llmRunningCount, setLlmRunningCount] = useState(0)
   const [prompts, setPrompts] = useState<PromptItem[]>([])
   const [promptsLoading, setPromptsLoading] = useState(true)
   const [promptsError, setPromptsError] = useState('')
@@ -346,12 +362,25 @@ function App() {
   useEffect(() => {
     const controller = new AbortController()
     fetch(`${LOCAL_API_BASE}/api/settings`, { signal: controller.signal })
-      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number; pixelUpscale4K?: boolean }> : Promise.reject(new Error('settings unavailable')))
+      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number; pixelUpscale4K?: boolean; imageNamingEnabled?: boolean }> : Promise.reject(new Error('settings unavailable')))
       .then((body) => {
         if (typeof body.maxConcurrency === 'number' && Number.isInteger(body.maxConcurrency)) {
           setMaxConcurrency(Math.min(20, Math.max(1, body.maxConcurrency)))
         }
         if (typeof body.pixelUpscale4K === 'boolean') setPixelUpscale4K(body.pixelUpscale4K)
+        if (typeof body.imageNamingEnabled === 'boolean') setImageNamingEnabled(body.imageNamingEnabled)
+      })
+      .catch(() => undefined)
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    fetch(`${LOCAL_API_BASE}/api/llm-providers`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() as Promise<{ items?: LlmProvider[]; runningCount?: number }> : Promise.reject(new Error('llm provider config unavailable')))
+      .then((body) => {
+        setLlmProviders(Array.isArray(body.items) ? body.items : [])
+        setLlmRunningCount(typeof body.runningCount === 'number' ? body.runningCount : 0)
       })
       .catch(() => undefined)
     return () => controller.abort()
@@ -488,16 +517,17 @@ function App() {
     if (item) setTextPrompt(item.text)
   }
 
-  const saveWorkspaceConfig = async (nextMaxConcurrency: number, nextPixelUpscale4K: boolean) => {
+  const saveWorkspaceConfig = async (nextMaxConcurrency: number, nextPixelUpscale4K: boolean, nextImageNamingEnabled: boolean) => {
     const settingsResponse = await fetch(`${LOCAL_API_BASE}/api/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ maxConcurrency: nextMaxConcurrency, pixelUpscale4K: nextPixelUpscale4K }),
+      body: JSON.stringify({ maxConcurrency: nextMaxConcurrency, pixelUpscale4K: nextPixelUpscale4K, imageNamingEnabled: nextImageNamingEnabled }),
     })
-    const settingsBody = await settingsResponse.json() as ApiErrorBody & { maxConcurrency?: number; pixelUpscale4K?: boolean }
+    const settingsBody = await settingsResponse.json() as ApiErrorBody & { maxConcurrency?: number; pixelUpscale4K?: boolean; imageNamingEnabled?: boolean }
     if (!settingsResponse.ok || typeof settingsBody.maxConcurrency !== 'number') throw new Error(settingsBody.error?.message || '并发设置保存失败')
     setMaxConcurrency(settingsBody.maxConcurrency)
     if (typeof settingsBody.pixelUpscale4K === 'boolean') setPixelUpscale4K(settingsBody.pixelUpscale4K)
+    if (typeof settingsBody.imageNamingEnabled === 'boolean') setImageNamingEnabled(settingsBody.imageNamingEnabled)
   }
 
   const refreshProviders = async () => {
@@ -506,6 +536,14 @@ function App() {
     if (!response.ok) throw new Error((body as ApiErrorBody).error?.message || '模型供应商加载失败')
     setModelProviders(Array.isArray(body.items) ? body.items : [])
     setProviderRunningCount(typeof body.runningCount === 'number' ? body.runningCount : 0)
+  }
+
+  const refreshLlmProviders = async () => {
+    const response = await fetch(`${LOCAL_API_BASE}/api/llm-providers`)
+    const body = await response.json() as { items?: LlmProvider[]; runningCount?: number }
+    if (!response.ok) throw new Error((body as ApiErrorBody).error?.message || 'LLM 供应商加载失败')
+    setLlmProviders(Array.isArray(body.items) ? body.items : [])
+    setLlmRunningCount(typeof body.runningCount === 'number' ? body.runningCount : 0)
   }
 
   const activeProvider = modelProviders.find((provider) => provider.enabled)
@@ -832,10 +870,10 @@ function App() {
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={refreshQueue} onCancel={cancelJob} onRetry={retryJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} />}
-        {page === 'models' && <ModelSettingsPage providers={modelProviders} runningCount={providerRunningCount} onRefresh={refreshProviders} />}
+        {page === 'models' && <ModelSettingsPage providers={modelProviders} runningCount={providerRunningCount} llmProviders={llmProviders} llmRunningCount={llmRunningCount} onRefresh={refreshProviders} onRefreshLlm={refreshLlmProviders} />}
       </main>
 
-      {showSettings && <SettingsModal maxConcurrency={maxConcurrency} pixelUpscale4K={pixelUpscale4K} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsModal maxConcurrency={maxConcurrency} pixelUpscale4K={pixelUpscale4K} imageNamingEnabled={imageNamingEnabled} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
     </div>
   )
 }
@@ -1132,7 +1170,7 @@ function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPr
   return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>提示词由本地服务初始化并从数据库读取。</p></div></section><div className="prompt-toolbar"><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" /></div></div>{error && <div className="form-error" role="status"><AlertTriangle size={14} />{error}</div>}{loading ? <div className="empty-state">提示词加载中…</div> : filtered.length === 0 ? <div className="empty-state">暂无可用提示词</div> : <div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? prompts.length : prompts.filter((prompt) => prompt.category === item).length}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => <article className={`prompt-card panel ${selectedPrompt === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedPrompt(item.id)}><div className="prompt-card-top"><span className="category-chip">{item.category}</span></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.layout === 'four_up' ? '4K 四宫格' : item.layout === 'fifteen_up_test' ? '4K 十五宫格测试' : '两宫格'} · 后端初始化</span>{selectedPrompt === item.id && <span className="selected-label"><Check size={13} />已选中</span>}</div></article>)}</div></div>}</div>
 }
 
-function ModelSettingsPage({ providers, runningCount, onRefresh }: { providers: ModelProvider[]; runningCount: number; onRefresh: () => Promise<void> }) {
+function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCount, onRefresh, onRefreshLlm }: { providers: ModelProvider[]; runningCount: number; llmProviders: LlmProvider[]; llmRunningCount: number; onRefresh: () => Promise<void>; onRefreshLlm: () => Promise<void> }) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [name, setName] = useState('')
@@ -1234,18 +1272,81 @@ function ModelSettingsPage({ providers, runningCount, onRefresh }: { providers: 
   }
 
   return <div className="page-content inner-page model-settings-page">
-    <section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />连接管理</div><h1>模型设置</h1><p>配置多个模型供应商，并为新任务启用唯一的执行通道。</p></div><div className="heading-actions"><button className="button button-ghost" type="button" onClick={() => void handleRefresh()} disabled={refreshing} aria-busy={refreshing}><RefreshCw size={16} className={refreshing ? 'refreshing-icon' : ''} />{refreshing ? '刷新中…' : '刷新'}</button><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加供应商</button></div></section>
+    <section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />连接管理</div><h1>模型设置</h1><p>分别配置生图模型和图片命名模型，为新任务选择执行通道。</p></div><div className="heading-actions"><button className="button button-ghost" type="button" onClick={() => void handleRefresh()} disabled={refreshing} aria-busy={refreshing}><RefreshCw size={16} className={refreshing ? 'refreshing-icon' : ''} />{refreshing ? '刷新中…' : '刷新'}</button><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加供应商</button></div></section>
     {runningCount > 0 && <div className="provider-lock-banner locked" role="status"><div><ShieldCheck size={17} /><span>当前有 {runningCount} 个任务执行中，暂不能切换模型供应商</span></div><small>任务结束前不能切换或删除供应商，配置编辑不受影响。</small></div>}
     {error && <div className="form-error provider-page-error" role="alert"><AlertTriangle size={15} />{error}</div>}
     {showForm && <section className="provider-form-panel" aria-labelledby="provider-form-title"><div className="provider-form-heading"><div><span className="section-kicker">{editingId ? '编辑配置' : '新增配置'}</span><h2 id="provider-form-title">{editingId ? '更新模型供应商' : '添加模型供应商'}</h2></div><button className="icon-button subtle" type="button" onClick={resetForm} title="关闭表单" aria-label="关闭供应商表单"><X size={18} /></button></div><div className="provider-form-grid"><div className="setting-field"><label htmlFor="provider-name">供应商名称</label><input id="provider-name" value={name} onChange={(event) => { setName(event.target.value); setError('') }} placeholder="例如：主力模型" autoFocus /></div><div className="setting-field provider-url-field"><label htmlFor="provider-base-url">服务地址</label><input id="provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="provider-api-key">API 秘钥</label><div className="secret-input"><input id="provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">秘钥仅保存在本地服务，不会出现在任务、日志或接口响应中。</span></div></div><div className="provider-form-actions"><button className="button button-ghost" type="button" onClick={resetForm}>取消</button><button className="button button-primary" type="button" onClick={() => void saveProvider()} disabled={saving}><Check size={16} />{saving ? '保存中…' : editingId ? '保存修改' : '添加供应商'}</button></div></section>}
     {providers.length === 0 ? <div className="empty-state panel provider-empty"><Settings2 size={24} /><strong>尚未配置模型供应商</strong><span>添加名称、Base URL 和 API Key 后即可创建生图任务。</span><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加第一个供应商</button></div> : <div className="provider-list">{providers.map((provider) => <article className={`provider-row ${provider.enabled ? 'enabled' : ''}`} key={provider.id}><div className="provider-status-mark"><span /><small>{provider.enabled ? '已启用' : '未启用'}</small></div><div className="provider-identity"><div><h2>{provider.name}</h2>{provider.enabled && <span className="provider-active-badge"><CheckCircle2 size={13} />当前使用</span>}</div><span className="mono" title={provider.baseUrl}>{provider.baseUrl}</span><small>API Key {provider.configured ? '已配置' : '未配置'} · 更新于 {new Date(provider.updatedAt).toLocaleString('zh-CN', { hour12: false })}</small></div><div className="provider-stats" aria-label={`${provider.name}任务统计`}><div><span>成功</span><strong>{provider.successCount}</strong></div><div><span>失败</span><strong>{provider.failureCount}</strong></div></div><div className="provider-actions"><button className="icon-button subtle" type="button" onClick={() => openEdit(provider)} title={`编辑 ${provider.name}`} aria-label={`编辑 ${provider.name}`}><Settings2 size={16} /></button><button className="button button-small button-ghost provider-enable-button" type="button" disabled={provider.enabled || runningCount > 0 || busyId !== null} onClick={() => void enableProvider(provider)} title={runningCount > 0 ? '有任务执行中，暂不能切换' : provider.enabled ? '当前已启用' : `启用 ${provider.name}`}>{provider.enabled ? <><Check size={14} />已启用</> : <><Play size={14} />启用</>}</button><button className="icon-button danger-icon" type="button" disabled={provider.enabled || runningCount > 0 || providers.length <= 1 || busyId !== null} onClick={() => void deleteProvider(provider)} title={provider.enabled ? '当前启用供应商不能删除' : providers.length <= 1 ? '至少保留一个供应商' : `删除 ${provider.name}`} aria-label={`删除 ${provider.name}`}><Trash2 size={16} /></button></div></article>)}</div>}
     {feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}
+    <LlmSettingsSection providers={llmProviders} runningCount={llmRunningCount} onRefresh={onRefreshLlm} />
   </div>
 }
 
-function SettingsModal({ maxConcurrency, pixelUpscale4K, onSave, onClose }: { maxConcurrency: number; pixelUpscale4K: boolean; onSave: (maxConcurrency: number, pixelUpscale4K: boolean) => Promise<void>; onClose: () => void }) {
+function LlmSettingsSection({ providers, runningCount, onRefresh }: { providers: LlmProvider[]; runningCount: number; onRefresh: () => Promise<void> }) {
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [showForm, setShowForm] = useState(false)
+  const [name, setName] = useState('')
+  const [baseUrl, setBaseUrl] = useState('')
+  const [model, setModel] = useState('')
+  const [apiKey, setApiKey] = useState('')
+  const [showKey, setShowKey] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [error, setError] = useState('')
+  const [feedback, setFeedback] = useState('')
+  const [refreshing, setRefreshing] = useState(false)
+
+  const resetForm = () => { setEditingId(null); setShowForm(false); setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setShowKey(false); setError('') }
+  const openCreate = () => { setEditingId(null); setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setShowKey(false); setError(''); setShowForm(true) }
+  const openEdit = (provider: LlmProvider) => { setEditingId(provider.id); setName(provider.name); setBaseUrl(provider.baseUrl); setModel(provider.model); setApiKey(''); setShowKey(false); setError(''); setShowForm(true) }
+  const parseError = async (response: Response, fallback: string) => { try { return (await response.json() as ApiErrorBody).error?.message || fallback } catch { return fallback } }
+  const validate = () => {
+    if (!name.trim() || !baseUrl.trim() || !model.trim() || (!editingId && !apiKey.trim())) { setError('名称、服务地址、模型名称和 API 秘钥均不能为空。'); return false }
+    try { const url = new URL(baseUrl.trim()); if (!['http:', 'https:'].includes(url.protocol)) throw new Error() } catch { setError('服务地址需填写完整的 http:// 或 https:// 地址。'); return false }
+    return true
+  }
+  const save = async () => {
+    if (busy || !validate()) return
+    setBusy(true); setError('')
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/api/llm-providers${editingId ? `/${encodeURIComponent(editingId)}` : ''}`, { method: editingId ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim(), baseUrl: baseUrl.trim(), model: model.trim(), ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) }) })
+      if (!response.ok) throw new Error(await parseError(response, 'LLM 供应商保存失败'))
+      await onRefresh(); setFeedback(editingId ? 'LLM 供应商配置已更新' : 'LLM 供应商已添加'); resetForm()
+    } catch (saveError) { setError(saveError instanceof Error ? saveError.message : 'LLM 供应商保存失败') } finally { setBusy(false) }
+  }
+  const enable = async (provider: LlmProvider) => {
+    if (provider.enabled || busyId || runningCount > 0) return
+    setBusyId(provider.id); setError('')
+    try { const response = await fetch(`${LOCAL_API_BASE}/api/llm-providers/${encodeURIComponent(provider.id)}/enable`, { method: 'POST' }); if (!response.ok) throw new Error(await parseError(response, 'LLM 供应商切换失败')); await onRefresh(); setFeedback(`已启用 ${provider.name}`) } catch (switchError) { setError(switchError instanceof Error ? switchError.message : 'LLM 供应商切换失败') } finally { setBusyId(null) }
+  }
+  const remove = async (provider: LlmProvider) => {
+    if (provider.enabled || busyId || runningCount > 0 || providers.length <= 1 || !window.confirm(`确认删除 LLM 供应商“${provider.name}”？此操作不会删除历史任务。`)) return
+    setBusyId(provider.id); setError('')
+    try { const response = await fetch(`${LOCAL_API_BASE}/api/llm-providers/${encodeURIComponent(provider.id)}`, { method: 'DELETE' }); if (!response.ok) throw new Error(await parseError(response, 'LLM 供应商删除失败')); await onRefresh(); setFeedback(`已删除 ${provider.name}`) } catch (deleteError) { setError(deleteError instanceof Error ? deleteError.message : 'LLM 供应商删除失败') } finally { setBusyId(null) }
+  }
+  useEffect(() => { if (!feedback) return; const timer = window.setTimeout(() => setFeedback(''), 2400); return () => window.clearTimeout(timer) }, [feedback])
+  useEffect(() => { const timer = window.setInterval(() => void onRefresh().catch(() => undefined), 2000); return () => window.clearInterval(timer) }, [onRefresh])
+  const handleRefresh = async () => {
+    if (refreshing) return
+    setRefreshing(true)
+    try { await Promise.all([onRefresh(), new Promise<void>((resolve) => window.setTimeout(resolve, 220))]); setError('') } catch (refreshError) { setError(refreshError instanceof Error ? refreshError.message : 'LLM 供应商刷新失败') } finally { setRefreshing(false) }
+  }
+
+  return <section className="llm-settings-section" aria-labelledby="llm-settings-title">
+    <div className="section-divider" />
+    <div className="page-heading heading-row llm-heading"><div><div className="eyebrow"><span className="eyebrow-line" />图片命名</div><h2 id="llm-settings-title">LLM 模型</h2><p>为生图结果生成文件名，需要配置支持视觉输入的 OpenAI 兼容模型。</p></div><div className="heading-actions"><button className="button button-ghost" type="button" onClick={() => void handleRefresh()} disabled={refreshing} aria-busy={refreshing}><RefreshCw size={16} className={refreshing ? 'refreshing-icon' : ''} />{refreshing ? '刷新中…' : '刷新'}</button><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加 LLM 供应商</button></div></div>
+    {runningCount > 0 && <div className="provider-lock-banner locked" role="status"><div><ShieldCheck size={17} /><span>当前有 {runningCount} 个任务执行中，暂不能切换 LLM 供应商</span></div><small>配置编辑不受影响，切换仅影响新任务。</small></div>}
+    {error && <div className="form-error provider-page-error" role="alert"><AlertTriangle size={15} />{error}</div>}
+    {showForm && <section className="provider-form-panel" aria-labelledby="llm-form-title"><div className="provider-form-heading"><div><span className="section-kicker">{editingId ? '编辑配置' : '新增配置'}</span><h3 id="llm-form-title">{editingId ? '更新 LLM 供应商' : '添加 LLM 供应商'}</h3></div><button className="icon-button subtle" type="button" onClick={resetForm} title="关闭表单" aria-label="关闭 LLM 供应商表单"><X size={18} /></button></div><div className="provider-form-grid llm-provider-form-grid"><div className="setting-field"><label htmlFor="llm-provider-name">供应商名称</label><input id="llm-provider-name" value={name} onChange={(event) => { setName(event.target.value); setError('') }} placeholder="例如：视觉命名模型" autoFocus /></div><div className="setting-field"><label htmlFor="llm-provider-base-url">服务地址</label><input id="llm-provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="llm-provider-model">模型名称</label><input id="llm-provider-model" value={model} onChange={(event) => { setModel(event.target.value); setError('') }} placeholder="例如：gpt-4o" /></div><div className="setting-field"><label htmlFor="llm-provider-api-key">API 秘钥</label><div className="secret-input"><input id="llm-provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">仅保存到本地服务，不会出现在任务、日志或接口响应中。</span></div></div><div className="provider-form-actions"><button className="button button-ghost" type="button" onClick={resetForm}>取消</button><button className="button button-primary" type="button" onClick={() => void save()} disabled={busy}><Check size={16} />{busy ? '保存中…' : editingId ? '保存修改' : '添加供应商'}</button></div></section>}
+    {providers.length === 0 ? <div className="empty-state panel provider-empty"><Sparkles size={24} /><strong>尚未配置 LLM 图片命名模型</strong><span>添加供应商并启用工作区设置中的“LLM 图片命名”。</span><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加第一个 LLM 供应商</button></div> : <div className="provider-list llm-provider-list">{providers.map((provider) => <article className={`provider-row ${provider.enabled ? 'enabled' : ''}`} key={provider.id}><div className="provider-status-mark"><span /><small>{provider.enabled ? '已启用' : '未启用'}</small></div><div className="provider-identity"><div><h3>{provider.name}</h3>{provider.enabled && <span className="provider-active-badge"><CheckCircle2 size={13} />当前使用</span>}</div><span className="mono" title={provider.baseUrl}>{provider.baseUrl}</span><small>模型 {provider.model} · API 秘钥 {provider.configured ? '已配置' : '未配置'}</small></div><div className="provider-stats" aria-label={`${provider.name}命名统计`}><div><span>成功</span><strong>{provider.successCount}</strong></div><div><span>失败</span><strong>{provider.failureCount}</strong></div></div><div className="provider-actions"><button className="icon-button subtle" type="button" onClick={() => openEdit(provider)} title={`编辑 ${provider.name}`} aria-label={`编辑 ${provider.name}`}><Settings2 size={16} /></button><button className="button button-small button-ghost provider-enable-button" type="button" disabled={provider.enabled || runningCount > 0 || busyId !== null} onClick={() => void enable(provider)} title={runningCount > 0 ? '有任务执行中，暂不能切换' : provider.enabled ? '当前已启用' : `启用 ${provider.name}`}>{provider.enabled ? <><Check size={14} />已启用</> : <><Play size={14} />启用</>}</button><button className="icon-button danger-icon" type="button" disabled={provider.enabled || runningCount > 0 || providers.length <= 1 || busyId !== null} onClick={() => void remove(provider)} title={provider.enabled ? '当前启用供应商不能删除' : '删除供应商'} aria-label={`删除 ${provider.name}`}><Trash2 size={16} /></button></div></article>)}</div>}
+    {feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}
+  </section>
+}
+
+function SettingsModal({ maxConcurrency, pixelUpscale4K, imageNamingEnabled, onSave, onClose }: { maxConcurrency: number; pixelUpscale4K: boolean; imageNamingEnabled: boolean; onSave: (maxConcurrency: number, pixelUpscale4K: boolean, imageNamingEnabled: boolean) => Promise<void>; onClose: () => void }) {
   const [draftMaxConcurrency, setDraftMaxConcurrency] = useState(maxConcurrency)
   const [draftPixelUpscale4K, setDraftPixelUpscale4K] = useState(pixelUpscale4K)
+  const [draftImageNamingEnabled, setDraftImageNamingEnabled] = useState(imageNamingEnabled)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
@@ -1254,7 +1355,7 @@ function SettingsModal({ maxConcurrency, pixelUpscale4K, onSave, onClose }: { ma
     if (saving) return
     setSaving(true)
     try {
-      await onSave(draftMaxConcurrency, draftPixelUpscale4K)
+      await onSave(draftMaxConcurrency, draftPixelUpscale4K, draftImageNamingEnabled)
       setSaved(true)
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : '工作区设置保存失败')
@@ -1286,6 +1387,10 @@ function SettingsModal({ maxConcurrency, pixelUpscale4K, onSave, onClose }: { ma
           <div className="setting-row setting-row-toggle">
             <div><strong><Maximize2 size={15} />像素放大到 4K</strong><span>任务完成前在本机按比例放大最长边至 3840px，不调用模型。</span></div>
             <label className="setting-switch"><input type="checkbox" aria-label="像素放大到 4K" checked={draftPixelUpscale4K} onChange={(event) => { setSaved(false); setError(''); setDraftPixelUpscale4K(event.target.checked) }} /><span aria-hidden="true" /></label>
+          </div>
+          <div className="setting-row setting-row-toggle">
+            <div><strong><Sparkles size={15} />启用 LLM 图片命名</strong><span>生图完成后用已启用的视觉模型生成文件名；未配置或失败时保留原有命名。</span></div>
+            <label className="setting-switch"><input type="checkbox" aria-label="启用 LLM 图片命名" checked={draftImageNamingEnabled} onChange={(event) => { setSaved(false); setError(''); setDraftImageNamingEnabled(event.target.checked) }} /><span aria-hidden="true" /></label>
           </div>
           {error && <div className="form-error settings-modal-error" role="alert"><AlertTriangle size={14} />{error}</div>}
         </div>

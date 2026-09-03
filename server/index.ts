@@ -1,12 +1,13 @@
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { isSea } from 'node:sea'
 import { editImage, generateImage, materializeImageResult, ProviderError } from './provider.js'
 import type { GenerationResult } from './provider.js'
 import { pixelUpscaleTo4K } from './image.js'
+import { ImageNamingError, nameImage, sanitizeImageName } from './image-naming.js'
 import { builtinPrompts } from './prompts.js'
 
 declare const process: { env: Record<string, string | undefined>; argv: string[]; exitCode?: number }
@@ -17,21 +18,23 @@ type NativeServer = { listen(port: number, host: string, callback: () => void): 
 export type JobMode = 'generate' | 'edit' | 'text_to_image' | 'one_to_many'
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
 export type PromptWindow = { id?: string | number; name?: string; prompt: string; enabled?: boolean }
-export type JobResult = { path: string; index: number }
+export type JobResult = { path: string; index: number; name?: string }
 export type Prompt = { id: string; category: string; title: string; text: string; layout: string; builtin: boolean; sourceName: string }
 export type AppStats = { completed: number; running: number; review: number; failed: number; total: number; storageBytes: number }
 export type SourceImage = { data: string; mimeType: string; name: string }
 export type Job = {
   id: string; mode: JobMode; status: JobStatus; idempotencyKey?: string; prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; pixelUpscale4K?: boolean
-  windows?: PromptWindow[]; results?: JobResult[]; error?: { code: string; message: string }; providerId?: string
+  windows?: PromptWindow[]; results?: JobResult[]; error?: { code: string; message: string }; providerId?: string; imageNamingEnabled?: boolean
   provider: { status: 'not_implemented' | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'; invoked: boolean }
   createdAt: string; updatedAt: string; cancelledAt?: string
 }
 type ProviderConfig = { baseUrl: string; apiKey: string }
 export type ModelProvider = { id: string; name: string; baseUrl: string; configured: boolean; enabled: boolean; successCount: number; failureCount: number; createdAt: string; updatedAt: string }
 type StoredProvider = ModelProvider & { apiKey: string }
-type JobInput = { mode?: unknown; idempotencyKey?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; resolution?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown; maxConcurrency?: unknown; pixelUpscale4K?: unknown }
-type StoredRequest = { prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; pixelUpscale4K: boolean; provider: ProviderConfig; providerId?: string; sourceImage?: SourceImage }
+export type LlmProvider = { id: string; name: string; baseUrl: string; model: string; configured: boolean; enabled: boolean; successCount: number; failureCount: number; createdAt: string; updatedAt: string }
+type StoredLlmProvider = LlmProvider & { apiKey: string }
+type JobInput = { mode?: unknown; idempotencyKey?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; resolution?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown; maxConcurrency?: unknown; pixelUpscale4K?: unknown; imageNamingEnabled?: unknown }
+type StoredRequest = { prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; pixelUpscale4K: boolean; imageNamingEnabled: boolean; provider: ProviderConfig; providerId?: string; sourceImage?: SourceImage; llmProvider?: { baseUrl: string; apiKey: string; model: string }; llmProviderId?: string }
 type Runtime = { controller: AbortController; listeners: Set<HttpResponse> }
 type GenerateImage = typeof generateImage
 type EditImage = typeof editImage
@@ -101,6 +104,7 @@ function safeLogText(value: string): string { return value.replace(/Bearer\s+\S+
 function providerHost(baseUrl: string): string | undefined { try { return new URL(baseUrl).hostname } catch { return undefined } }
 function logErrorFields(error: unknown): Record<string, unknown> {
   if (error instanceof ProviderError) return { errorCode: error.code, ...(error.status === undefined ? {} : { httpStatus: error.status }), errorMessage: error.message, ...(error.detail ? { errorDetail: error.detail } : {}) }
+  if (error instanceof ImageNamingError) return { errorCode: error.code, ...(error.status === undefined ? {} : { httpStatus: error.status }), errorMessage: error.message }
   if (error instanceof Error) return { errorName: error.name, errorMessage: safeLogText(error.message) }
   return { errorName: typeof error }
 }
@@ -111,6 +115,15 @@ function appendExecutionLog(workspaceDir: string, event: string, fields: Record<
     appendFileSync(join(logDirectory, 'execution.log'), `${JSON.stringify({ timestamp: executionLogTimestamp(), event, ...fields })}\n`, 'utf8')
   } catch {
     // 日志属于旁路诊断能力，目录不可写时不能改变任务本身的成功或失败结果。
+  }
+}
+function uniqueImagePath(workspaceDir: string, stem: string): string {
+  let suffix = 1
+  while (true) {
+    const candidateStem = suffix === 1 ? stem : `${stem} (${suffix})`
+    const relativePath = join(RESULTS_DIRECTORY, `${candidateStem}.png`).replaceAll('\\', '/')
+    if (!existsSync(join(workspaceDir, relativePath))) return relativePath
+    suffix += 1
   }
 }
 
@@ -129,7 +142,7 @@ function validWindows(value: unknown): PromptWindow[] | undefined {
 }
 function optionalString(value: unknown, field: string): string | undefined { if (value === undefined || value === null) return undefined; if (typeof value !== 'string' || value.trim() === '') throw new RequestValidationError(`invalid_${field}`, `${field} 必须是非空字符串`); return value.trim() }
 function repeatValue(value: unknown): number { if (value === undefined) return 1; if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 100) throw new RequestValidationError('invalid_repeat', 'repeat 必须是 1 到 100 的整数'); return value as number }
-function booleanValue(value: unknown, fallback: boolean): boolean { if (value === undefined) return fallback; if (typeof value !== 'boolean') throw new RequestValidationError('invalid_pixel_upscale_4k', 'pixelUpscale4K 必须是布尔值'); return value }
+function booleanValue(value: unknown, fallback: boolean, field: string, label: string): boolean { if (value === undefined) return fallback; if (typeof value !== 'boolean') throw new RequestValidationError(`invalid_${field}`, `${label} 必须是布尔值`); return value }
 function sourceImageValue(value: unknown): SourceImage | undefined {
   if (value === undefined || value === null) return undefined
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RequestValidationError('invalid_source_image', 'sourceImage 必须是图片对象')
@@ -204,13 +217,14 @@ export class JobStore {
     for (const prompt of builtinPrompts) migratePrompt.run(prompt.category, prompt.title, prompt.text, prompt.layout, prompt.sourceName, prompt.id)
     this.db.exec('CREATE TABLE IF NOT EXISTS provider_config (id INTEGER PRIMARY KEY CHECK (id = 1), base_url TEXT NOT NULL, api_key TEXT NOT NULL, updated_at TEXT NOT NULL)')
     this.db.exec('CREATE TABLE IF NOT EXISTS model_providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
+    this.db.exec('CREATE TABLE IF NOT EXISTS llm_providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, model TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
     this.db.exec('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)')
     this.migrateLegacyProvider()
   }
   close(): void { this.db.close() }
   private fromRow(row: Record<string, unknown>): Job {
     const request = row.request_json ? JSON.parse(String(row.request_json)) as StoredRequest : undefined
-    return { id: String(row.id), mode: row.mode as JobMode, status: row.status as JobStatus, ...(request?.prompt ? { prompt: request.prompt } : {}), ...(request?.layout ? { layout: request.layout } : {}), ...(request?.size ? { size: request.size } : {}), ...(request?.resolution ? { resolution: request.resolution } : {}), ...(request?.quality ? { quality: request.quality } : {}), ...(request?.pixelUpscale4K ? { pixelUpscale4K: true } : {}), ...(row.idempotency_key ? { idempotencyKey: String(row.idempotency_key) } : {}), repeat: request?.repeat ?? 1, ...(request?.providerId || row.provider_id ? { providerId: request?.providerId ?? String(row.provider_id) } : {}), ...(row.windows_json ? { windows: JSON.parse(String(row.windows_json)) as PromptWindow[] } : {}), ...(row.results_json ? { results: JSON.parse(String(row.results_json)) as JobResult[] } : {}), ...(row.error_json ? { error: JSON.parse(String(row.error_json)) as Job['error'] } : {}), provider: JSON.parse(String(row.provider_json)) as Job['provider'], createdAt: String(row.created_at), updatedAt: String(row.updated_at), ...(row.cancelled_at ? { cancelledAt: String(row.cancelled_at) } : {}) }
+    return { id: String(row.id), mode: row.mode as JobMode, status: row.status as JobStatus, ...(request?.prompt ? { prompt: request.prompt } : {}), ...(request?.layout ? { layout: request.layout } : {}), ...(request?.size ? { size: request.size } : {}), ...(request?.resolution ? { resolution: request.resolution } : {}), ...(request?.quality ? { quality: request.quality } : {}), ...(request?.pixelUpscale4K ? { pixelUpscale4K: true } : {}), ...(request?.imageNamingEnabled ? { imageNamingEnabled: true } : {}), ...(row.idempotency_key ? { idempotencyKey: String(row.idempotency_key) } : {}), repeat: request?.repeat ?? 1, ...(request?.providerId || row.provider_id ? { providerId: request?.providerId ?? String(row.provider_id) } : {}), ...(row.windows_json ? { windows: JSON.parse(String(row.windows_json)) as PromptWindow[] } : {}), ...(row.results_json ? { results: JSON.parse(String(row.results_json)) as JobResult[] } : {}), ...(row.error_json ? { error: JSON.parse(String(row.error_json)) as Job['error'] } : {}), provider: JSON.parse(String(row.provider_json)) as Job['provider'], createdAt: String(row.created_at), updatedAt: String(row.updated_at), ...(row.cancelled_at ? { cancelledAt: String(row.cancelled_at) } : {}) }
   }
   private migrateLegacyProvider(): void {
     const count = Number((this.db.prepare('SELECT COUNT(*) AS count FROM model_providers').get() as { count?: number }).count ?? 0)
@@ -229,9 +243,11 @@ export class JobStore {
     const sourceImage = sourceImageValue(input.sourceImage)
     if (mode === 'edit' && !sourceImage) throw new RequestValidationError('invalid_source_image', 'edit 模式必须提供 sourceImage')
     if (mode === 'edit' && !prompt) throw new RequestValidationError('invalid_prompt', 'edit 模式必须提供 prompt')
-    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), resolution: optionalString(input.resolution, 'resolution'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), pixelUpscale4K: booleanValue(input.pixelUpscale4K, this.getPixelUpscale4K()), provider: providerConfig(input.provider, { ...this.activeProviderConfig(), ...this.getProviderConfig(), ...defaults }), ...(providerId ? { providerId } : {}), ...(sourceImage ? { sourceImage } : {}) }
-    const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.resolution ? { resolution: request.resolution } : {}), ...(request.quality ? { quality: request.quality } : {}), ...(request.pixelUpscale4K ? { pixelUpscale4K: true } : {}), repeat: request.repeat, ...(request.providerId ? { providerId: request.providerId } : {}), ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
-    const persistedRequest = { ...request, provider: { baseUrl: request.provider.baseUrl, apiKey: '' } }
+    const imageNamingEnabled = booleanValue(input.imageNamingEnabled, this.getImageNamingEnabled(), 'image_naming_enabled', 'imageNamingEnabled')
+    const activeLlm = imageNamingEnabled ? this.activeLlmProvider() : undefined
+    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), resolution: optionalString(input.resolution, 'resolution'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), pixelUpscale4K: booleanValue(input.pixelUpscale4K, this.getPixelUpscale4K(), 'pixel_upscale_4k', 'pixelUpscale4K'), imageNamingEnabled, provider: providerConfig(input.provider, { ...this.activeProviderConfig(), ...this.getProviderConfig(), ...defaults }), ...(providerId ? { providerId } : {}), ...(activeLlm ? { llmProviderId: activeLlm.id, llmProvider: { baseUrl: activeLlm.baseUrl, apiKey: activeLlm.apiKey, model: activeLlm.model } } : {}), ...(sourceImage ? { sourceImage } : {}) }
+    const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.resolution ? { resolution: request.resolution } : {}), ...(request.quality ? { quality: request.quality } : {}), ...(request.pixelUpscale4K ? { pixelUpscale4K: true } : {}), ...(request.imageNamingEnabled ? { imageNamingEnabled: true } : {}), repeat: request.repeat, ...(request.providerId ? { providerId: request.providerId } : {}), ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
+    const persistedRequest = { ...request, provider: { baseUrl: request.provider.baseUrl, apiKey: '' }, ...(request.llmProvider ? { llmProvider: { baseUrl: request.llmProvider.baseUrl, model: request.llmProvider.model, apiKey: '' } } : {}) }
     this.db.prepare('INSERT INTO jobs (id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, request_json, provider_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(job.id, idempotencyKey ?? null, job.mode, job.status, job.windows ? JSON.stringify(job.windows) : null, JSON.stringify(job.provider), job.createdAt, job.updatedAt, JSON.stringify(persistedRequest), request.providerId ?? null)
     this.runtimeProviders.set(job.id, request.provider)
     return { job, created: true }
@@ -291,6 +307,48 @@ export class JobStore {
     const column = status === 'completed' ? 'success_count' : 'failure_count'
     this.db.prepare(`UPDATE model_providers SET ${column} = ${column} + 1, updated_at = ? WHERE id = ?`).run(now(), providerId)
   }
+  private llmProviderFromRow(row: Record<string, unknown>): StoredLlmProvider {
+    return { id: String(row.id), name: String(row.name), baseUrl: String(row.base_url), model: String(row.model), apiKey: String(row.api_key), configured: Boolean(String(row.api_key)) && Boolean(String(row.model)), enabled: Number(row.enabled) === 1, successCount: Number(row.success_count ?? 0), failureCount: Number(row.failure_count ?? 0), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }
+  }
+  listLlmProviders(): LlmProvider[] {
+    return (this.db.prepare('SELECT id, name, base_url, api_key, model, enabled, success_count, failure_count, created_at, updated_at FROM llm_providers ORDER BY rowid ASC').all() as Record<string, unknown>[]).map((row) => {
+      const provider = this.llmProviderFromRow(row)
+      const { apiKey: _apiKey, ...publicProvider } = provider
+      return publicProvider
+    })
+  }
+  getLlmProvider(id: string): StoredLlmProvider | undefined {
+    const row = this.db.prepare('SELECT id, name, base_url, api_key, model, enabled, success_count, failure_count, created_at, updated_at FROM llm_providers WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    return row ? this.llmProviderFromRow(row) : undefined
+  }
+  activeLlmProvider(): StoredLlmProvider | undefined {
+    const row = this.db.prepare('SELECT id, name, base_url, api_key, model, enabled, success_count, failure_count, created_at, updated_at FROM llm_providers WHERE enabled = 1 LIMIT 1').get() as Record<string, unknown> | undefined
+    return row ? this.llmProviderFromRow(row) : undefined
+  }
+  createLlmProvider(name: string, baseUrl: string, apiKey: string, model: string): LlmProvider {
+    const id = `llm_${randomUUID()}`; const timestamp = now(); const shouldEnable = !this.activeLlmProvider()
+    this.db.prepare('INSERT INTO llm_providers (id, name, base_url, api_key, model, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(id, name, baseUrl, apiKey, model, shouldEnable ? 1 : 0, timestamp, timestamp)
+    return this.listLlmProviders().find((provider) => provider.id === id)!
+  }
+  updateLlmProvider(id: string, name: string, baseUrl: string, model: string, apiKey?: string): LlmProvider | undefined {
+    const existing = this.getLlmProvider(id); if (!existing) return undefined
+    const nextKey = apiKey?.trim() ? apiKey.trim() : existing.apiKey
+    this.db.prepare('UPDATE llm_providers SET name = ?, base_url = ?, model = ?, api_key = ?, updated_at = ? WHERE id = ?').run(name, baseUrl, model, nextKey, now(), id)
+    return this.listLlmProviders().find((provider) => provider.id === id)
+  }
+  enableLlmProvider(id: string): LlmProvider | undefined {
+    if (!this.getLlmProvider(id)) return undefined
+    const timestamp = now(); this.db.prepare('UPDATE llm_providers SET enabled = 0, updated_at = ?').run(timestamp); this.db.prepare('UPDATE llm_providers SET enabled = 1, updated_at = ? WHERE id = ?').run(timestamp, id)
+    return this.listLlmProviders().find((provider) => provider.id === id)
+  }
+  deleteLlmProvider(id: string): boolean { const existing = this.getLlmProvider(id); if (!existing) return false; this.db.prepare('DELETE FROM llm_providers WHERE id = ?').run(id); return true }
+  recordLlmOutcome(providerId: string | undefined, status: 'completed' | 'failed'): void {
+    if (!providerId) return
+    const column = status === 'completed' ? 'success_count' : 'failure_count'
+    this.db.prepare(`UPDATE llm_providers SET ${column} = ${column} + 1, updated_at = ? WHERE id = ?`).run(now(), providerId)
+  }
+  getImageNamingEnabled(): boolean { const row = this.db.prepare('SELECT value FROM app_settings WHERE key = ?').get('image_naming_enabled') as { value?: string } | undefined; return row?.value === 'true' }
+  saveImageNamingEnabled(value: boolean): void { this.db.prepare('INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at').run('image_naming_enabled', String(value), now()) }
   runningCount(): number { return Number((this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE status = 'running'").get() as { count?: number }).count ?? 0) }
   getMaxConcurrency(): number | undefined {
     const row = this.db.prepare('SELECT value FROM app_settings WHERE key = ?').get('max_concurrency') as { value?: string } | undefined
@@ -361,7 +419,7 @@ export class JobStore {
   forgetProvider(id: string): void { this.runtimeProviders.delete(id) }
   update(id: string, status: JobStatus, patch: { provider?: Job['provider']; results?: JobResult[]; error?: Job['error'] } = {}): Job | undefined { const timestamp = now(); this.db.prepare('UPDATE jobs SET status = ?, provider_json = COALESCE(?, provider_json), results_json = COALESCE(?, results_json), error_json = COALESCE(?, error_json), updated_at = ? WHERE id = ?').run(status, patch.provider ? JSON.stringify(patch.provider) : null, patch.results ? JSON.stringify(patch.results) : null, patch.error ? JSON.stringify(patch.error) : null, timestamp, id); return this.get(id) }
   cancel(id: string): Job | undefined { const job = this.get(id); if (!job || ['completed', 'failed', 'cancelled'].includes(job.status)) return job; const timestamp = now(); this.db.prepare('UPDATE jobs SET status = ?, cancelled_at = ?, updated_at = ?, provider_json = ? WHERE id = ?').run('cancelled', timestamp, timestamp, JSON.stringify({ status: 'cancelled', invoked: job.provider.invoked }), id); return this.get(id) }
-  retry(id: string, latest?: { provider?: ProviderConfig; providerId?: string; pixelUpscale4K?: boolean }): Job | undefined {
+  retry(id: string, latest?: { provider?: ProviderConfig; providerId?: string; pixelUpscale4K?: boolean; imageNamingEnabled?: boolean; llmProvider?: { baseUrl: string; apiKey: string; model: string }; llmProviderId?: string }): Job | undefined {
     const job = this.get(id)
     if (!job || !['failed', 'cancelled'].includes(job.status)) return undefined
     const request = this.request(id)
@@ -372,8 +430,11 @@ export class JobStore {
       ...(latest?.provider ? { provider: latest.provider } : {}),
       ...(latest?.providerId ? { providerId: latest.providerId } : {}),
       ...(latest?.pixelUpscale4K === undefined ? {} : { pixelUpscale4K: latest.pixelUpscale4K }),
+      ...(latest?.imageNamingEnabled === undefined ? {} : { imageNamingEnabled: latest.imageNamingEnabled }),
+      ...(latest?.llmProvider ? { llmProvider: latest.llmProvider } : latest?.imageNamingEnabled !== undefined ? { llmProvider: undefined, llmProviderId: undefined } : {}),
+      ...(latest?.llmProviderId ? { llmProviderId: latest.llmProviderId } : {}),
     }
-    const persistedRequest = { ...nextRequest, provider: { baseUrl: nextRequest.provider.baseUrl, apiKey: '' } }
+    const persistedRequest = { ...nextRequest, provider: { baseUrl: nextRequest.provider.baseUrl, apiKey: '' }, ...(nextRequest.llmProvider ? { llmProvider: { baseUrl: nextRequest.llmProvider.baseUrl, model: nextRequest.llmProvider.model, apiKey: '' } } : {}) }
     const candidateTimestamp = now()
     // 极快重试可能落在同一毫秒，至少向后推进 1ms 以保证列表排序可观察到变化。
     const timestamp = candidateTimestamp > job.createdAt ? candidateTimestamp : new Date(Date.parse(job.createdAt) + 1).toISOString()
@@ -423,6 +484,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     ? store.getMaxConcurrency() ?? DEFAULT_MAX_CONCURRENCY
     : maxConcurrencyValue(environmentMaxConcurrency)
   let pixelUpscale4K = store.getPixelUpscale4K()
+  let imageNamingEnabled = store.getImageNamingEnabled()
   const pendingJobs: string[] = []
   const pendingJobIds = new Set<string>()
   const runningJobIds = new Set<string>()
@@ -448,7 +510,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     const total = prompts.length * request.repeat; const results: JobResult[] = []
     let providerStage: 'request' | 'materialize' | undefined
     try {
-      // 所有结果平铺到统一目录，文件名带任务 ID 以避免不同任务互相覆盖。
+      // 所有结果平铺到统一目录；未启用命名时使用任务 ID 作为稳定回退名称。
       mkdirSync(join(workspaceDir, RESULTS_DIRECTORY), { recursive: true })
       for (const prompt of prompts) for (let repeatIndex = 0; repeatIndex < request.repeat; repeatIndex += 1) {
         if (runtime.controller.signal.aborted) throw new DOMException('任务已取消', 'AbortError')
@@ -484,7 +546,35 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         if (upscale && !upscale.upscaled) appendExecutionLog(workspaceDir, 'pixel_upscale_skipped', { jobId: id, itemIndex: results.length, reason: upscale.reason, format: upscale.format, sourceWidth: upscale.sourceWidth, sourceHeight: upscale.sourceHeight })
         if (upscale?.upscaled) appendExecutionLog(workspaceDir, 'pixel_upscale_completed', { jobId: id, itemIndex: results.length, format: upscale.format, sourceWidth: upscale.sourceWidth, sourceHeight: upscale.sourceHeight, targetWidth: upscale.targetWidth, targetHeight: upscale.targetHeight, bytes: imageBytes.byteLength })
         if (!isCurrentExecution() || runtime.controller.signal.aborted) return
-        const index = results.length; const relativePath = join(RESULTS_DIRECTORY, `${id}-${String(index + 1).padStart(3, '0')}.png`).replaceAll('\\', '/'); writeFileSync(join(workspaceDir, relativePath), imageBytes); results.push({ path: relativePath, index })
+        const index = results.length
+        const fallbackStem = `${id}-${String(index + 1).padStart(3, '0')}`
+        let imageName: string | undefined
+        let outputStem = fallbackStem
+        if (request.imageNamingEnabled) {
+          const storedLlmProvider = request.llmProviderId ? store.getLlmProvider(request.llmProviderId) : undefined
+          const namingConfig = request.llmProvider && request.llmProviderId
+            ? { ...request.llmProvider, apiKey: storedLlmProvider?.apiKey ?? request.llmProvider.apiKey }
+            : undefined
+          if (!namingConfig || !request.llmProviderId) {
+            appendExecutionLog(workspaceDir, 'image_name_failed', { jobId: id, itemIndex: index, errorCode: 'llm_not_configured', errorMessage: 'LLM 图片命名未配置' })
+          } else {
+            try {
+              imageName = await nameImage(namingConfig, imageBytes, runtime.controller.signal)
+              const safeName = sanitizeImageName(imageName)
+              if (!safeName) throw new ImageNamingError('llm_invalid_name', 'LLM 返回的图片名称不适合作为文件名')
+              outputStem = safeName
+              store.recordLlmOutcome(request.llmProviderId, 'completed')
+              appendExecutionLog(workspaceDir, 'image_name_completed', { jobId: id, itemIndex: index, name: safeName })
+            } catch (error) {
+              if (runtime.controller.signal.aborted) throw error
+              store.recordLlmOutcome(request.llmProviderId, 'failed')
+              appendExecutionLog(workspaceDir, 'image_name_failed', { jobId: id, itemIndex: index, ...logErrorFields(error) })
+            }
+          }
+        }
+        const relativePath = uniqueImagePath(workspaceDir, outputStem)
+        writeFileSync(join(workspaceDir, relativePath), imageBytes)
+        results.push({ path: relativePath, index, ...(imageName ? { name: imageName } : {}) })
         providerStage = undefined
         const current = store.get(id); if (!isCurrentExecution() || current?.status === 'cancelled' || runtime.controller.signal.aborted) return
         emit(id, 'progress', { completed: index + 1, total, result: results[index], job: current })
@@ -532,12 +622,13 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     pendingJobIds.delete(id)
     for (let index = pendingJobs.length - 1; index >= 0; index -= 1) if (pendingJobs[index] === id) pendingJobs.splice(index, 1)
   }
-  const latestRetryConfig = (): { provider: ProviderConfig; providerId?: string } => {
+  const latestRetryConfig = (): { provider: ProviderConfig; providerId?: string; imageNamingEnabled: boolean; llmProvider?: { baseUrl: string; apiKey: string; model: string }; llmProviderId?: string } => {
     const activeProvider = store.activeProvider()
     const defaults = activeProvider
       ? { baseUrl: activeProvider.baseUrl, apiKey: activeProvider.apiKey }
       : store.getProviderConfig() ?? options.defaultProvider ?? {}
-    return { provider: providerConfig(undefined, defaults), ...(activeProvider ? { providerId: activeProvider.id } : {}) }
+    const activeLlm = imageNamingEnabled ? store.activeLlmProvider() : undefined
+    return { provider: providerConfig(undefined, defaults), ...(activeProvider ? { providerId: activeProvider.id } : {}), imageNamingEnabled, ...(activeLlm ? { llmProviderId: activeLlm.id, llmProvider: { baseUrl: activeLlm.baseUrl, apiKey: activeLlm.apiKey, model: activeLlm.model } } : {}) }
   }
   // 后端重启后继续执行尚未领取的任务，避免前端页面状态成为任务可靠性的前提。
   for (const job of store.list()) {
@@ -547,7 +638,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     setCors(res); if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }; const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
     if (req.method === 'GET' && path === '/health') { json(res, 200, { status: 'ok', service: 'lingtu-workbench' }); return }
     if (req.method === 'GET' && path === '/api/stats') { json(res, 200, store.stats(workspaceDir)); return }
-    if (req.method === 'GET' && path === '/api/settings') { json(res, 200, { maxConcurrency, pixelUpscale4K }); return }
+    if (req.method === 'GET' && path === '/api/settings') { json(res, 200, { maxConcurrency, pixelUpscale4K, imageNamingEnabled }); return }
     if (req.method === 'PUT' && path === '/api/settings') {
       let body: unknown
       try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
@@ -555,7 +646,8 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         const item = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
         const value = item.maxConcurrency
         const next = maxConcurrencyValue(value, maxConcurrency)
-        const nextPixelUpscale4K = booleanValue(item.pixelUpscale4K, pixelUpscale4K)
+        const nextPixelUpscale4K = booleanValue(item.pixelUpscale4K, pixelUpscale4K, 'pixel_upscale_4k', 'pixelUpscale4K')
+        const nextImageNamingEnabled = booleanValue(item.imageNamingEnabled, imageNamingEnabled, 'image_naming_enabled', 'imageNamingEnabled')
         if (environmentMaxConcurrency === undefined || environmentMaxConcurrency === '') {
           store.saveMaxConcurrency(next)
           maxConcurrency = next
@@ -563,7 +655,9 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         }
         store.savePixelUpscale4K(nextPixelUpscale4K)
         pixelUpscale4K = nextPixelUpscale4K
-        json(res, 200, { maxConcurrency, pixelUpscale4K })
+        store.saveImageNamingEnabled(nextImageNamingEnabled)
+        imageNamingEnabled = nextImageNamingEnabled
+        json(res, 200, { maxConcurrency, pixelUpscale4K, imageNamingEnabled })
       } catch (error) { if (error instanceof RequestValidationError) { errorResponse(res, 400, error.code, error.message); return }; errorResponse(res, 500, 'internal_error', '工作区设置保存失败') }
       return
     }
@@ -584,6 +678,58 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         if (!name || !baseUrl || !apiKey) throw new RequestValidationError('invalid_provider', '供应商名称、Base URL 和 API Key 均不能为空')
         json(res, 201, store.createProvider(name, { baseUrl, apiKey }))
       } catch (error) { if (error instanceof RequestValidationError) errorResponse(res, 400, error.code, error.message); else errorResponse(res, 500, 'internal_error', '供应商创建失败') }
+      return
+    }
+    if (req.method === 'GET' && path === '/api/llm-providers') {
+      const active = store.activeLlmProvider()
+      json(res, 200, { items: store.listLlmProviders(), activeId: active?.id ?? null, runningCount: store.runningCount() })
+      return
+    }
+    if (req.method === 'POST' && path === '/api/llm-providers') {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      try {
+        const item = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
+        const name = optionalString(item.name, 'llm_provider_name')
+        const baseUrl = optionalString(item.baseUrl, 'llm_provider_base_url')
+        const apiKey = optionalString(item.apiKey, 'llm_provider_api_key')
+        const model = optionalString(item.model, 'llm_provider_model')
+        if (!name || !baseUrl || !apiKey || !model) throw new RequestValidationError('invalid_llm_provider', 'LLM 名称、服务地址、API 秘钥和模型名称均不能为空')
+        json(res, 201, store.createLlmProvider(name, baseUrl, apiKey, model))
+      } catch (error) { if (error instanceof RequestValidationError) errorResponse(res, 400, error.code, error.message); else errorResponse(res, 500, 'internal_error', 'LLM 供应商创建失败') }
+      return
+    }
+    const llmProviderMatch = path.match(/^\/api\/llm-providers\/([^/]+)(?:\/(enable))?$/)
+    if (llmProviderMatch && req.method === 'PUT' && !llmProviderMatch[2]) {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      try {
+        const item = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
+        const name = optionalString(item.name, 'llm_provider_name')
+        const baseUrl = optionalString(item.baseUrl, 'llm_provider_base_url')
+        const model = optionalString(item.model, 'llm_provider_model')
+        if (!name || !baseUrl || !model) throw new RequestValidationError('invalid_llm_provider', 'LLM 名称、服务地址和模型名称不能为空')
+        const updated = store.updateLlmProvider(decodeURIComponent(llmProviderMatch[1]), name, baseUrl, model, typeof item.apiKey === 'string' ? item.apiKey : undefined)
+        if (!updated) { errorResponse(res, 404, 'llm_provider_not_found', 'LLM 供应商不存在'); return }
+        json(res, 200, updated)
+      } catch (error) { if (error instanceof RequestValidationError) errorResponse(res, 400, error.code, error.message); else errorResponse(res, 500, 'internal_error', 'LLM 供应商保存失败') }
+      return
+    }
+    if (llmProviderMatch && req.method === 'POST' && llmProviderMatch[2]) {
+      const id = decodeURIComponent(llmProviderMatch[1]); const existing = store.getLlmProvider(id)
+      if (!existing) { errorResponse(res, 404, 'llm_provider_not_found', 'LLM 供应商不存在'); return }
+      if (!existing.enabled && store.runningCount() > 0) { errorResponse(res, 409, 'llm_provider_switch_locked', `当前有 ${store.runningCount()} 个任务执行中，暂不能切换 LLM 供应商`); return }
+      json(res, 200, store.enableLlmProvider(id));
+      return
+    }
+    if (llmProviderMatch && req.method === 'DELETE' && !llmProviderMatch[2]) {
+      const id = decodeURIComponent(llmProviderMatch[1]); const existing = store.getLlmProvider(id)
+      if (!existing) { errorResponse(res, 404, 'llm_provider_not_found', 'LLM 供应商不存在'); return }
+      const providers = store.listLlmProviders()
+      if (store.runningCount() > 0) { errorResponse(res, 409, 'llm_provider_delete_locked', '有任务执行中，暂不能删除 LLM 供应商'); return }
+      if (providers.length <= 1) { errorResponse(res, 409, 'llm_provider_last_one', '至少保留一个 LLM 供应商'); return }
+      if (existing.enabled) { errorResponse(res, 409, 'llm_provider_enabled', '请先启用其他 LLM 供应商，再删除当前供应商'); return }
+      store.deleteLlmProvider(id); res.writeHead(204); res.end()
       return
     }
     const providerMatch = path.match(/^\/api\/providers\/([^/]+)(?:\/(enable))?$/)

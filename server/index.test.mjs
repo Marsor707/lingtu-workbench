@@ -622,15 +622,15 @@ test('任务队列按 maxConcurrency 限制 Provider 并发', async () => {
       body: JSON.stringify({ maxConcurrency: 2 }),
     })
     assert.equal(settingsResponse.status, 200)
-    assert.deepEqual(await settingsResponse.json(), { maxConcurrency: 2, pixelUpscale4K: false })
-    assert.deepEqual(await (await fetch(`${base}/api/settings`)).json(), { maxConcurrency: 2, pixelUpscale4K: false })
+    assert.deepEqual(await settingsResponse.json(), { maxConcurrency: 2, pixelUpscale4K: false, imageNamingEnabled: false })
+    assert.deepEqual(await (await fetch(`${base}/api/settings`)).json(), { maxConcurrency: 2, pixelUpscale4K: false, imageNamingEnabled: false })
 
     const upscaleResponse = await fetch(`${base}/api/settings`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ pixelUpscale4K: true }),
     })
-    assert.deepEqual(await upscaleResponse.json(), { maxConcurrency: 2, pixelUpscale4K: true })
+    assert.deepEqual(await upscaleResponse.json(), { maxConcurrency: 2, pixelUpscale4K: true, imageNamingEnabled: false })
     assert.equal(store.getPixelUpscale4K(), true)
     const snapshotted = store.create({ mode: 'generate', prompt: '快照测试' }).job
     assert.equal(snapshotted.pixelUpscale4K, true)
@@ -787,6 +787,53 @@ test('Mock Provider 返回图片 URL 时由后端下载并落盘', async () => {
   } finally {
     await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
     await new Promise((resolve, reject) => resultServer.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('启用 LLM 图片命名后使用视觉模型名称落盘，失败回退原有命名并记录统计', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-llm-naming-workspace-'))
+  let llmCalls = 0
+  const llmServer = createHttpServer(async (req, res) => {
+    if (req.url !== '/v1/chat/completions') { res.statusCode = 404; res.end(); return }
+    let body = ''
+    for await (const chunk of req) body += chunk
+    const payload = JSON.parse(body)
+    assert.equal(payload.model, 'vision-model')
+    assert.equal(payload.messages?.[1]?.content?.[0]?.type, 'image_url')
+    llmCalls += 1
+    res.setHeader('content-type', 'application/json')
+    if (llmCalls === 1) res.end(JSON.stringify({ choices: [{ message: { content: '{"name":"花卉浴室套装"}' } }] }))
+    else res.end(JSON.stringify({ choices: [{ message: { content: '无法命名' } }] }))
+  })
+  await new Promise((resolve) => llmServer.listen(0, '127.0.0.1', resolve))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const app = await startServer(0, '127.0.0.1', store, { workspaceDir: directory, generateImage: async () => ({ kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' }) })
+  const base = `http://127.0.0.1:${app.address().port}`
+  try {
+    const provider = await (await fetch(`${base}/api/llm-providers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: '本地视觉模型', baseUrl: `http://127.0.0.1:${llmServer.address().port}/v1`, apiKey: 'llm-secret', model: 'vision-model' }) })).json()
+    assert.equal(provider.enabled, true)
+    const settings = await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ imageNamingEnabled: true }) })
+    assert.equal((await settings.json()).imageNamingEnabled, true)
+    const createJob = async (prompt) => (await fetch(`${base}/api/jobs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'generate', prompt }) })).json()
+    const first = await createJob('命名成功')
+    await (await fetch(`${base}/api/jobs/${first.id}/events`)).text()
+    const firstDetail = await (await fetch(`${base}/api/jobs/${first.id}`)).json()
+    assert.equal(firstDetail.results[0].name, '花卉浴室套装')
+    assert.equal(firstDetail.results[0].path, 'jobs/花卉浴室套装.png')
+    assert.equal(readFileSync(join(directory, firstDetail.results[0].path), 'utf8'), 'fake-image')
+    const second = await createJob('命名失败')
+    await (await fetch(`${base}/api/jobs/${second.id}/events`)).text()
+    const secondDetail = await (await fetch(`${base}/api/jobs/${second.id}`)).json()
+    assert.equal(secondDetail.results[0].name, undefined)
+    assert.match(secondDetail.results[0].path, new RegExp(`jobs/${second.id}-001\\.png`))
+    const llmProviders = await (await fetch(`${base}/api/llm-providers`)).json()
+    assert.deepEqual({ success: llmProviders.items[0].successCount, failure: llmProviders.items[0].failureCount }, { success: 1, failure: 1 })
+    assert.equal(JSON.stringify(firstDetail).includes('llm-secret'), false)
+  } finally {
+    await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
+    await new Promise((resolve, reject) => llmServer.close((error) => error ? reject(error) : resolve()))
     store.close()
     rmSync(directory, { recursive: true, force: true })
   }
