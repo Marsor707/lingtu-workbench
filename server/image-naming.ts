@@ -83,7 +83,6 @@ export async function nameImage(config: ImageNamingConfig, bytes: Uint8Array, si
             { type: 'text', text: IMAGE_NAMING_PROMPT },
           ] },
         ],
-        temperature: 0.2,
       }),
       signal: requestSignal,
     })
