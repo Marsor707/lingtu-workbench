@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createServer as createHttpServer } from 'node:http'
+import { PNG } from 'pngjs'
 import { buildEffectivePrompt, JobStore, startServer } from '../dist-server/index.js'
 
 const server = await startServer(0)
@@ -831,6 +832,40 @@ test('启用 LLM 图片命名后使用视觉模型名称落盘，失败回退原
     const llmProviders = await (await fetch(`${base}/api/llm-providers`)).json()
     assert.deepEqual({ success: llmProviders.items[0].successCount, failure: llmProviders.items[0].failureCount }, { success: 1, failure: 1 })
     assert.equal(JSON.stringify(firstDetail).includes('llm-secret'), false)
+  } finally {
+    await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
+    await new Promise((resolve, reject) => llmServer.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('同时启用 4K 放大和 LLM 命名时使用原图命名并将放大图落盘', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-llm-naming-original-image-'))
+  const original = PNG.sync.write({ width: 2, height: 1, data: Buffer.from([255, 0, 0, 255, 0, 0, 255, 255]) })
+  let namingImageData = ''
+  const llmServer = createHttpServer(async (req, res) => {
+    let body = ''
+    for await (const chunk of req) body += chunk
+    const payload = JSON.parse(body)
+    namingImageData = payload.messages?.[1]?.content?.[0]?.image_url?.url ?? ''
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ choices: [{ message: { content: '{"name":"原图命名测试"}' } }] }))
+  })
+  await new Promise((resolve) => llmServer.listen(0, '127.0.0.1', resolve))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const app = await startServer(0, '127.0.0.1', store, { workspaceDir: directory, generateImage: async () => ({ kind: 'base64', value: original.toString('base64') }) })
+  const base = `http://127.0.0.1:${app.address().port}`
+  try {
+    await fetch(`${base}/api/llm-providers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: '本地视觉模型', baseUrl: `http://127.0.0.1:${llmServer.address().port}/v1`, apiKey: 'llm-secret', model: 'vision-model' }) })
+    await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pixelUpscale4K: true, imageNamingEnabled: true }) })
+    const created = await (await fetch(`${base}/api/jobs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'generate', prompt: '原图命名测试' }) })).json()
+    await (await fetch(`${base}/api/jobs/${created.id}/events`)).text()
+    const detail = await (await fetch(`${base}/api/jobs/${created.id}`)).json()
+
+    assert.deepEqual(Buffer.from(namingImageData.split(',')[1], 'base64'), original)
+    const saved = PNG.sync.read(readFileSync(join(directory, detail.results[0].path)))
+    assert.deepEqual({ width: saved.width, height: saved.height }, { width: 3840, height: 1920 })
   } finally {
     await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
     await new Promise((resolve, reject) => llmServer.close((error) => error ? reject(error) : resolve()))

@@ -559,7 +559,8 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
             appendExecutionLog(workspaceDir, 'image_name_failed', { jobId: id, itemIndex: index, errorCode: 'llm_not_configured', errorMessage: 'LLM 图片命名未配置' })
           } else {
             try {
-              imageName = await nameImage(namingConfig, imageBytes, runtime.controller.signal)
+              // 命名只需要识别图片内容，固定使用 Provider 原图，避免 4K 放大增加请求体和视觉模型耗时。
+              imageName = await nameImage(namingConfig, materializedBytes, runtime.controller.signal)
               const safeName = sanitizeImageName(imageName)
               if (!safeName) throw new ImageNamingError('llm_invalid_name', 'LLM 返回的图片名称不适合作为文件名')
               outputStem = safeName
