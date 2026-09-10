@@ -376,7 +376,7 @@ function App() {
   const [running, setRunning] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [maxConcurrency, setMaxConcurrency] = useState(() => readStoredMaxConcurrency())
-  const [pixelUpscale4K, setPixelUpscale4K] = useState(false)
+  const [pixelUpscale, setPixelUpscale] = useState<PixelUpscaleLevel>('off')
   const [imageNamingEnabled, setImageNamingEnabled] = useState(false)
   const [modelProviders, setModelProviders] = useState<ModelProvider[]>([])
   const [providerRunningCount, setProviderRunningCount] = useState(0)
@@ -423,17 +423,32 @@ function App() {
   useEffect(() => {
     const controller = new AbortController()
     fetch(`${LOCAL_API_BASE}/api/settings`, { signal: controller.signal })
-      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number; pixelUpscale4K?: boolean; imageNamingEnabled?: boolean }> : Promise.reject(new Error('settings unavailable')))
+      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number; pixelUpscale?: string; imageNamingEnabled?: boolean }> : Promise.reject(new Error('settings unavailable')))
       .then((body) => {
         if (typeof body.maxConcurrency === 'number' && Number.isInteger(body.maxConcurrency)) {
           setMaxConcurrency(Math.min(20, Math.max(1, body.maxConcurrency)))
         }
-        if (typeof body.pixelUpscale4K === 'boolean') setPixelUpscale4K(body.pixelUpscale4K)
+        if (body.pixelUpscale === 'off' || body.pixelUpscale === '2K' || body.pixelUpscale === '4K') setPixelUpscale(body.pixelUpscale)
         if (typeof body.imageNamingEnabled === 'boolean') setImageNamingEnabled(body.imageNamingEnabled)
       })
       .catch(() => undefined)
     return () => controller.abort()
   }, [])
+
+  // 每次打开设置弹窗前重新拉取服务端持久值，避免弹窗显示页面加载时的陈旧快照。
+  useEffect(() => {
+    if (!showSettings) return
+    const controller = new AbortController()
+    fetch(`${LOCAL_API_BASE}/api/settings`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number; pixelUpscale?: string; imageNamingEnabled?: boolean }> : Promise.reject(new Error('settings unavailable')))
+      .then((body) => {
+        if (typeof body.maxConcurrency === 'number' && Number.isInteger(body.maxConcurrency)) setMaxConcurrency(Math.min(20, Math.max(1, body.maxConcurrency)))
+        if (body.pixelUpscale === 'off' || body.pixelUpscale === '2K' || body.pixelUpscale === '4K') setPixelUpscale(body.pixelUpscale)
+        if (typeof body.imageNamingEnabled === 'boolean') setImageNamingEnabled(body.imageNamingEnabled)
+      })
+      .catch(() => undefined)
+    return () => controller.abort()
+  }, [showSettings])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -590,16 +605,16 @@ function App() {
     setTextPrompt(nextSelected?.text ?? '')
   }
 
-  const saveWorkspaceConfig = async (nextMaxConcurrency: number, nextPixelUpscale4K: boolean, nextImageNamingEnabled: boolean) => {
+  const saveWorkspaceConfig = async (nextMaxConcurrency: number, nextPixelUpscale: PixelUpscaleLevel, nextImageNamingEnabled: boolean) => {
     const settingsResponse = await fetch(`${LOCAL_API_BASE}/api/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ maxConcurrency: nextMaxConcurrency, pixelUpscale4K: nextPixelUpscale4K, imageNamingEnabled: nextImageNamingEnabled }),
+      body: JSON.stringify({ maxConcurrency: nextMaxConcurrency, pixelUpscale: nextPixelUpscale, imageNamingEnabled: nextImageNamingEnabled }),
     })
-    const settingsBody = await settingsResponse.json() as ApiErrorBody & { maxConcurrency?: number; pixelUpscale4K?: boolean; imageNamingEnabled?: boolean }
+    const settingsBody = await settingsResponse.json() as ApiErrorBody & { maxConcurrency?: number; pixelUpscale?: string; imageNamingEnabled?: boolean }
     if (!settingsResponse.ok || typeof settingsBody.maxConcurrency !== 'number') throw new Error(settingsBody.error?.message || '并发设置保存失败')
     setMaxConcurrency(settingsBody.maxConcurrency)
-    if (typeof settingsBody.pixelUpscale4K === 'boolean') setPixelUpscale4K(settingsBody.pixelUpscale4K)
+    if (settingsBody.pixelUpscale === 'off' || settingsBody.pixelUpscale === '2K' || settingsBody.pixelUpscale === '4K') setPixelUpscale(settingsBody.pixelUpscale)
     if (typeof settingsBody.imageNamingEnabled === 'boolean') setImageNamingEnabled(settingsBody.imageNamingEnabled)
   }
 
@@ -912,7 +927,7 @@ function App() {
               resolution,
               quality,
               repeat,
-              pixelUpscale4K,
+              pixelUpscale,
               sourceImage,
               idempotencyKey: `lingtu-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
             }),
@@ -1004,7 +1019,8 @@ function App() {
         {page === 'models' && <ModelSettingsPage providers={modelProviders} runningCount={providerRunningCount} llmProviders={llmProviders} llmRunningCount={llmRunningCount} onRefresh={refreshProviders} onRefreshLlm={refreshLlmProviders} />}
       </main>
 
-      {showSettings && <SettingsModal maxConcurrency={maxConcurrency} pixelUpscale4K={pixelUpscale4K} imageNamingEnabled={imageNamingEnabled} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
+      {/* key 确保每次打开都重挂载弹窗：草稿 state 从最新服务端值重新初始化，避免显示陈旧快照。 */}
+      {showSettings && <SettingsModal key={pixelUpscale + String(maxConcurrency) + String(imageNamingEnabled)} maxConcurrency={maxConcurrency} pixelUpscale={pixelUpscale} imageNamingEnabled={imageNamingEnabled} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
     </div>
   )
 }
@@ -1543,11 +1559,19 @@ function LlmSettingsSection({ providers, runningCount, onRefresh }: { providers:
   </section>
 }
 
-function SettingsModal({ maxConcurrency, pixelUpscale4K, imageNamingEnabled, onSave, onClose }: { maxConcurrency: number; pixelUpscale4K: boolean; imageNamingEnabled: boolean; onSave: (maxConcurrency: number, pixelUpscale4K: boolean, imageNamingEnabled: boolean) => Promise<void>; onClose: () => void }) {
+// 像素放大三档（关闭/2K/4K），目标长边由后端定义：2K=2560、4K=3840。
+type PixelUpscaleLevel = 'off' | '2K' | '4K'
+const pixelUpscaleOptionLabels: Record<PixelUpscaleLevel, string> = { off: '关闭', '2K': '2K', '4K': '4K' }
+const pixelUpscaleHelpText: Record<PixelUpscaleLevel, string> = {
+  off: '不在本地放大图片。',
+  '2K': '任务完成前在本机按比例放大最长边至 2560px，不调用模型。',
+  '4K': '任务完成前在本机按比例放大最长边至 3840px，不调用模型。',
+}
+
+function SettingsModal({ maxConcurrency, pixelUpscale, imageNamingEnabled, onSave, onClose }: { maxConcurrency: number; pixelUpscale: PixelUpscaleLevel; imageNamingEnabled: boolean; onSave: (maxConcurrency: number, pixelUpscale: PixelUpscaleLevel, imageNamingEnabled: boolean) => Promise<void>; onClose: () => void }) {
   const [draftMaxConcurrency, setDraftMaxConcurrency] = useState(maxConcurrency)
-  const [draftPixelUpscale4K, setDraftPixelUpscale4K] = useState(pixelUpscale4K)
+  const [draftPixelUpscale, setDraftPixelUpscale] = useState<PixelUpscaleLevel>(pixelUpscale)
   const [draftImageNamingEnabled, setDraftImageNamingEnabled] = useState(imageNamingEnabled)
-  const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
 
@@ -1555,8 +1579,9 @@ function SettingsModal({ maxConcurrency, pixelUpscale4K, imageNamingEnabled, onS
     if (saving) return
     setSaving(true)
     try {
-      await onSave(draftMaxConcurrency, draftPixelUpscale4K, draftImageNamingEnabled)
-      setSaved(true)
+      await onSave(draftMaxConcurrency, draftPixelUpscale, draftImageNamingEnabled)
+      // 保存成功后直接关闭弹窗，弹窗关闭即为成功反馈；失败时保留弹窗展示错误。
+      onClose()
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : '工作区设置保存失败')
     } finally {
@@ -1582,20 +1607,26 @@ function SettingsModal({ maxConcurrency, pixelUpscale4K, imageNamingEnabled, onS
           </div>
           <div className="setting-row">
             <div><strong>最大并发</strong><span>建议根据供应商配额逐步增加</span></div>
-            <div className="number-control compact"><input type="number" min="1" max="20" value={draftMaxConcurrency} onChange={(event) => { setSaved(false); setError(''); setDraftMaxConcurrency(Math.min(20, Math.max(1, Number(event.target.value) || 1))) }} aria-label="最大并发数" /><span>线程</span></div>
+            <div className="number-control compact"><input type="number" min="1" max="20" value={draftMaxConcurrency} onChange={(event) => { setError(''); setDraftMaxConcurrency(Math.min(20, Math.max(1, Number(event.target.value) || 1))) }} aria-label="最大并发数" /><span>线程</span></div>
           </div>
           <div className="setting-row setting-row-toggle">
-            <div><strong><Maximize2 size={15} />像素放大到 4K</strong><span>任务完成前在本机按比例放大最长边至 3840px，不调用模型。</span></div>
-            <label className="setting-switch"><input type="checkbox" aria-label="像素放大到 4K" checked={draftPixelUpscale4K} onChange={(event) => { setSaved(false); setError(''); setDraftPixelUpscale4K(event.target.checked) }} /><span aria-hidden="true" /></label>
+            <div><strong><Maximize2 size={15} />像素放大</strong><span>{pixelUpscaleHelpText[draftPixelUpscale]}</span></div>
+            <div className="segmented-control" role="radiogroup" aria-label="像素放大" data-active={(['off', '2K', '4K'] as const).findIndex((level) => level === draftPixelUpscale)}>
+              {(['off', '2K', '4K'] as const).map((level) => (
+                <label key={level} className={`segmented-option ${draftPixelUpscale === level ? 'active' : ''}`}>
+                  <input type="radio" name="pixel-upscale-level" value={level} checked={draftPixelUpscale === level} onChange={() => { setError(''); setDraftPixelUpscale(level) }} />
+                  <span>{pixelUpscaleOptionLabels[level]}</span>
+                </label>
+              ))}
+            </div>
           </div>
           <div className="setting-row setting-row-toggle">
             <div><strong><Sparkles size={15} />启用 LLM 图片命名</strong><span>生图完成后用已启用的视觉模型生成文件名；未配置或失败时保留原有命名。</span></div>
-            <label className="setting-switch"><input type="checkbox" aria-label="启用 LLM 图片命名" checked={draftImageNamingEnabled} onChange={(event) => { setSaved(false); setError(''); setDraftImageNamingEnabled(event.target.checked) }} /><span aria-hidden="true" /></label>
+            <label className="setting-switch"><input type="checkbox" aria-label="启用 LLM 图片命名" checked={draftImageNamingEnabled} onChange={(event) => { setError(''); setDraftImageNamingEnabled(event.target.checked) }} /><span aria-hidden="true" /></label>
           </div>
           {error && <div className="form-error settings-modal-error" role="alert"><AlertTriangle size={14} />{error}</div>}
         </div>
         <div className="modal-footer">
-          <span className={`save-feedback ${saved ? 'visible' : ''}`} role="status">{saved ? <><CheckCircle2 size={14} />已保存到本地配置</> : '修改后点击保存'}</span>
           <button className="button button-ghost" onClick={onClose}>取消</button>
           <button className="button button-primary" onClick={() => void handleSave()} disabled={saving}><Check size={16} />{saving ? '保存中…' : '保存设置'}</button>
         </div>

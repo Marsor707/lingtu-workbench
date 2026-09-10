@@ -1,7 +1,11 @@
 import { PNG } from 'pngjs'
 import * as jpeg from 'jpeg-js'
 
-export const PIXEL_UPSCALE_TARGET_LONG_EDGE = 3840
+export type PixelUpscaleLevel = 'off' | '2K' | '4K'
+export type PixelUpscaleTarget = Exclude<PixelUpscaleLevel, 'off'>
+
+// 目标长边取显示器体系：2K 为 QHD 2560，4K 为 UHD 3840。
+export const PIXEL_UPSCALE_LONG_EDGE: Record<PixelUpscaleTarget, number> = { '2K': 2560, '4K': 3840 }
 
 export type PixelUpscaleResult = {
   bytes: Uint8Array
@@ -11,7 +15,7 @@ export type PixelUpscaleResult = {
   targetWidth?: number
   targetHeight?: number
   upscaled: boolean
-  reason?: 'already_4k' | 'unsupported_format' | 'decode_failed'
+  reason?: 'already_target' | 'unsupported_format' | 'decode_failed'
 }
 
 function isPng(bytes: Uint8Array): boolean {
@@ -95,14 +99,14 @@ function resizeRgba(source: Uint8Array, sourceWidth: number, sourceHeight: numbe
   return target
 }
 
-function targetSize(width: number, height: number): { width: number; height: number } | undefined {
+function targetSize(width: number, height: number, targetLongEdge: number): { width: number; height: number } | undefined {
   const longEdge = Math.max(width, height)
-  if (!Number.isFinite(longEdge) || longEdge <= 0 || longEdge >= PIXEL_UPSCALE_TARGET_LONG_EDGE) return undefined
-  const scale = PIXEL_UPSCALE_TARGET_LONG_EDGE / longEdge
+  if (!Number.isFinite(longEdge) || longEdge <= 0 || longEdge >= targetLongEdge) return undefined
+  const scale = targetLongEdge / longEdge
   return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) }
 }
 
-export function pixelUpscaleTo4K(input: Uint8Array): PixelUpscaleResult {
+export function pixelUpscale(input: Uint8Array, level: PixelUpscaleTarget): PixelUpscaleResult {
   if (!isPng(input) && !isJpeg(input)) {
     return { bytes: input, format: 'unsupported', upscaled: false, reason: 'unsupported_format' }
   }
@@ -117,8 +121,8 @@ export function pixelUpscaleTo4K(input: Uint8Array): PixelUpscaleResult {
           const image = jpeg.decode(Buffer.from(input), { useTArray: true })
           return { data: image.data, width: image.width, height: image.height, format: 'jpeg' as const }
         })()
-    const next = targetSize(decoded.width, decoded.height)
-    if (!next) return { bytes: input, format: decoded.format, sourceWidth: decoded.width, sourceHeight: decoded.height, upscaled: false, reason: 'already_4k' }
+    const next = targetSize(decoded.width, decoded.height, PIXEL_UPSCALE_LONG_EDGE[level])
+    if (!next) return { bytes: input, format: decoded.format, sourceWidth: decoded.width, sourceHeight: decoded.height, upscaled: false, reason: 'already_target' }
     const data = resizeRgba(decoded.data, decoded.width, decoded.height, next.width, next.height)
     const png = new PNG({ width: next.width, height: next.height, colorType: 6 })
     png.data = data

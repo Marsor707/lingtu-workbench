@@ -534,7 +534,7 @@ test('失败或取消任务可沿用原 ID 重试并重新完成', async () => {
     const providerA = await providerResponse.json()
     const backupProviderResponse = await fetch(`${base}/api/providers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'provider-b', baseUrl: 'https://provider-b.example/v1', apiKey: 'provider-b-secret' }) })
     const providerB = await backupProviderResponse.json()
-    await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pixelUpscale4K: false }) })
+    await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pixelUpscale: 'off' }) })
     const create = async (prompt) => {
       const response = await fetch(`${base}/api/jobs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'edit', prompt, layout: 'four_up', size: '1024x1024', resolution: '1K', quality: 'high', sourceImage: { data: 'ZmFrZS1pbWFnZQ==', mimeType: 'image/png', name: 'source.png' } }) })
       assert.equal(response.status, 201)
@@ -547,7 +547,7 @@ test('失败或取消任务可沿用原 ID 重试并重新完成', async () => {
     const originalRequest = store.request(failedJob.id)
     await new Promise((resolve) => setTimeout(resolve, 2))
     assert.equal((await fetch(`${base}/api/providers/${providerB.id}/enable`, { method: 'POST' })).status, 200)
-    await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pixelUpscale4K: true }) })
+    await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pixelUpscale: '2K' }) })
 
     const retryResponse = await fetch(`${base}/api/jobs/${failedJob.id}/retry`, { method: 'POST' })
     const retryJob = await retryResponse.json()
@@ -559,7 +559,7 @@ test('失败或取消任务可沿用原 ID 重试并重新完成', async () => {
     const retriedRequest = store.request(failedJob.id)
     assert.equal(retriedRequest?.providerId, providerB.id)
     assert.equal(retriedRequest?.provider.baseUrl, 'https://provider-b.example/v1')
-    assert.equal(retriedRequest?.pixelUpscale4K, true)
+    assert.equal(retriedRequest?.pixelUpscale, '2K')
     assert.deepEqual(seenProviders.slice(0, 2), [{ baseUrl: 'https://provider-a.example/v1', apiKey: 'provider-a-secret' }, { baseUrl: 'https://provider-b.example/v1', apiKey: 'provider-b-secret' }])
     assert.deepEqual({ prompt: retriedRequest?.prompt, layout: retriedRequest?.layout, size: retriedRequest?.size, resolution: retriedRequest?.resolution, quality: retriedRequest?.quality, sourceImage: retriedRequest?.sourceImage }, { prompt: originalRequest?.prompt, layout: originalRequest?.layout, size: originalRequest?.size, resolution: originalRequest?.resolution, quality: originalRequest?.quality, sourceImage: originalRequest?.sourceImage })
     assert.match(await (await fetch(`${base}/api/jobs/${failedJob.id}/events`)).text(), /event: completed/)
@@ -704,19 +704,19 @@ test('任务队列按 maxConcurrency 限制 Provider 并发', async () => {
       body: JSON.stringify({ maxConcurrency: 2 }),
     })
     assert.equal(settingsResponse.status, 200)
-    assert.deepEqual(await settingsResponse.json(), { maxConcurrency: 2, pixelUpscale4K: false, imageNamingEnabled: false })
-    assert.deepEqual(await (await fetch(`${base}/api/settings`)).json(), { maxConcurrency: 2, pixelUpscale4K: false, imageNamingEnabled: false })
+    assert.deepEqual(await settingsResponse.json(), { maxConcurrency: 2, pixelUpscale: 'off', imageNamingEnabled: false })
+    assert.deepEqual(await (await fetch(`${base}/api/settings`)).json(), { maxConcurrency: 2, pixelUpscale: 'off', imageNamingEnabled: false })
 
     const upscaleResponse = await fetch(`${base}/api/settings`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ pixelUpscale4K: true }),
+      body: JSON.stringify({ pixelUpscale: '4K' }),
     })
-    assert.deepEqual(await upscaleResponse.json(), { maxConcurrency: 2, pixelUpscale4K: true, imageNamingEnabled: false })
-    assert.equal(store.getPixelUpscale4K(), true)
+    assert.deepEqual(await upscaleResponse.json(), { maxConcurrency: 2, pixelUpscale: '4K', imageNamingEnabled: false })
+    assert.equal(store.getPixelUpscaleLevel(), '4K')
     const snapshotted = store.create({ mode: 'generate', prompt: '快照测试' }).job
-    assert.equal(snapshotted.pixelUpscale4K, true)
-    assert.equal(store.request(snapshotted.id)?.pixelUpscale4K, true)
+    assert.equal(snapshotted.pixelUpscale, '4K')
+    assert.equal(store.request(snapshotted.id)?.pixelUpscale, '4K')
 
     const created = await Promise.all(Array.from({ length: 3 }, async (_, index) => {
       const response = await fetch(`${base}/api/jobs`, {
@@ -939,7 +939,7 @@ test('同时启用 4K 放大和 LLM 命名时使用原图命名并将放大图�
   const base = `http://127.0.0.1:${app.address().port}`
   try {
     await fetch(`${base}/api/llm-providers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: '本地视觉模型', baseUrl: `http://127.0.0.1:${llmServer.address().port}/v1`, apiKey: 'llm-secret', model: 'vision-model' }) })
-    await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pixelUpscale4K: true, imageNamingEnabled: true }) })
+    await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pixelUpscale: '4K', imageNamingEnabled: true }) })
     const created = await (await fetch(`${base}/api/jobs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'generate', prompt: '原图命名测试' }) })).json()
     await (await fetch(`${base}/api/jobs/${created.id}/events`)).text()
     const detail = await (await fetch(`${base}/api/jobs/${created.id}`)).json()
