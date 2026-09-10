@@ -397,3 +397,23 @@ h1 { font-size: clamp(25px, 2.2vw, 33px); line-height: 1.18; letter-spacing: -.4
 .add-thumb:hover { color: var(--green); border-color: var(--green); background: #e4f6eb; }
 .activity-list .empty-state { min-height: 142px; display: grid; place-items: center; margin-top: 1px; padding: 20px; color: var(--muted-2); border: 1px dashed #b9d7c6; border-radius: 6px; background: rgba(242, 250, 246, .58); font-size: 12px; text-align: center; }
 .empty-state.panel { display: grid; place-items: center; min-height: 190px; padding: 32px; color: var(--muted-2); border-style: dashed; background: rgba(242, 250, 246, .58); font-size: 12px; text-align: center; }
+
+/* 提示词编辑器：表单与卡片共用现有浅色生产主题，保存状态始终可见。 */
+.prompt-form { margin-bottom: 14px; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); }
+.prompt-form-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 18px 20px 15px; border-bottom: 1px solid var(--border); }
+.prompt-form-heading h2 { margin-top: 6px; font-size: 16px; }
+.prompt-form-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; padding: 18px 20px; }
+.prompt-form-grid .setting-field input, .prompt-form-grid .setting-field select, .prompt-form-grid .setting-field textarea { width: 100%; color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; background: #ffffff; padding: 9px 10px; font: inherit; font-size: 11px; outline: none; }
+.prompt-form-grid .setting-field input, .prompt-form-grid .setting-field select { min-height: 36px; }
+.prompt-form-grid .setting-field textarea { min-height: 170px; resize: vertical; line-height: 1.55; }
+.prompt-form-grid .setting-field input:focus, .prompt-form-grid .setting-field select:focus, .prompt-form-grid .setting-field textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(11, 143, 91, .12); }
+.prompt-form-text { grid-column: 1 / -1; }
+.prompt-form-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 20px; border-top: 1px solid var(--border); background: #fbfdfc; }
+.prompt-form-error { margin: 0 20px 12px; }
+.prompt-origin { padding: 3px 6px; border-radius: 4px; font: 9px var(--mono); }
+.prompt-origin.builtin { color: #496b5a; background: #edf4ef; }
+.prompt-origin.custom { color: #895c0a; background: #fff4d6; }
+.prompt-card-actions { display: inline-flex; align-items: center; gap: 4px; }
+.prompt-card-actions .icon-button { width: 32px; height: 32px; }
+.prompt-card-actions .selected-label { margin-left: 4px; }
+@media (max-width: 760px) { .prompt-form-grid { grid-template-columns: 1fr; padding-inline: 16px; }.prompt-form-text { grid-column: auto; }.prompt-form-heading, .prompt-form-actions { padding-inline: 16px; }.prompt-form-error { margin-inline: 16px; } }

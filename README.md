@@ -18,7 +18,7 @@
 - Tauri 2 已配置 `externalBin`、托盘菜单和 Shell 插件；macOS 本机已验证 `.app` 能启动包内 sidecar、托管 `dist` 并打开浏览器，Windows runner 尚未在本机验证。
 - `server/` 已提供 SQLite 任务元数据、异步任务编排、REST/SSE、OpenAI 兼容 Provider 适配器，并兼容 Provider 返回的 base64 或图片 URL（URL 会由后端下载后落盘）；API Key 仅保存在本地 Provider 配置表中，不写入任务快照、任务列表或接口响应。
 - 工作区设置通过 `PUT /api/provider` 写入本地 Provider 配置；页面刷新后通过 `GET /api/provider` 恢复地址，生图任务只需传地址，由后端从本地配置表补回 API Key。
-- `server/prompts.ts` 提供参考软件 v2.3.9 配置快照中的 79 条非空生成提示词，首次初始化 SQLite 时写入 `prompts` 表，前端通过 `GET /api/prompts` 读取。
+- `server/prompts.ts` 提供参考软件 v2.3.9 配置快照中的 79 条非空生成提示词，首次初始化 SQLite 时写入 `prompts` 表；提示词库支持新增、编辑和删除自定义提示词，前端通过提示词 REST 接口读写。
 - 迁移期间保留的 `backend/` Python 健康检查代码仅作为过渡证据，不属于目标生产技术栈；新增业务代码统一放在 `server/` 并使用 TypeScript。
 
 ## 本地开发
@@ -92,7 +92,7 @@ npm run build:desktop
 
 ## 内置提示词
 
-安装或首次初始化本地数据库时，后端将 79 条非空内置模板写入 `prompts` 表；前端通过 `GET /api/prompts` 读取，提示词库和工作台共用这份数据。空的“本地提示词”和“自定义提示词”槽位不会被迁移。迁移脚本 `scripts/import-reference-prompts.py` 只接受显式传入的外部快照路径，避免运行时或构建时依赖已下载的参考软件目录。
+安装或首次初始化本地数据库时，后端将 79 条非空内置模板写入 `prompts` 表；提示词库和工作台共用这份数据，支持编辑内置提示词、创建自定义提示词以及删除自定义提示词。内置项升级时仅补齐缺失记录并保留用户修改，任务提交保存当时的正文快照。迁移脚本 `scripts/import-reference-prompts.py` 只接受显式传入的外部快照路径，避免运行时或构建时依赖已下载的参考软件目录。
 
 ## Tauri 构建
 

@@ -20,6 +20,7 @@ export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancell
 export type PromptWindow = { id?: string | number; name?: string; prompt: string; enabled?: boolean }
 export type JobResult = { path: string; index: number; name?: string }
 export type Prompt = { id: string; category: string; title: string; text: string; layout: string; builtin: boolean; sourceName: string }
+type PromptFields = { title: string; category: string; text: string; layout?: string }
 export type AppStats = { completed: number; running: number; review: number; failed: number; total: number; storageBytes: number }
 export type SourceImage = { data: string; mimeType: string; name: string }
 export type Job = {
@@ -141,6 +142,21 @@ function validWindows(value: unknown): PromptWindow[] | undefined {
   return value.filter((window): window is PromptWindow => { if (!window || typeof window !== 'object') return false; const item = window as Record<string, unknown>; return typeof item.prompt === 'string' && item.prompt.trim().length > 0 && item.enabled !== false }).map((window) => ({ id: typeof window.id === 'string' || typeof window.id === 'number' ? window.id : undefined, name: typeof window.name === 'string' ? window.name : undefined, prompt: window.prompt.trim(), enabled: window.enabled !== false }))
 }
 function optionalString(value: unknown, field: string): string | undefined { if (value === undefined || value === null) return undefined; if (typeof value !== 'string' || value.trim() === '') throw new RequestValidationError(`invalid_${field}`, `${field} 必须是非空字符串`); return value.trim() }
+function promptFields(value: Record<string, unknown>): PromptFields {
+  // 提示词的标题、分类和正文是可复用资产的最小完整信息，布局只作为生图高级参数的可选默认值。
+  const required = (field: string, label: string): string => {
+    if (typeof value[field] !== 'string' || value[field].trim() === '') throw new RequestValidationError('invalid_prompt', `${label} 必须是非空字符串`)
+    return (value[field] as string).trim()
+  }
+  const rawLayout = value.layout
+  // 布局由生图工作台高级参数决定，因此未指定时允许空字符串落库；仅拒绝错误类型。
+  const layout = rawLayout === undefined || rawLayout === null
+    ? ''
+    : typeof rawLayout === 'string'
+      ? rawLayout.trim()
+      : (() => { throw new RequestValidationError('invalid_prompt', '布局必须是字符串') })()
+  return { title: required('title', '标题'), category: required('category', '分类'), text: required('text', '正文'), layout }
+}
 function repeatValue(value: unknown): number { if (value === undefined) return 1; if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 100) throw new RequestValidationError('invalid_repeat', 'repeat 必须是 1 到 100 的整数'); return value as number }
 function booleanValue(value: unknown, fallback: boolean, field: string, label: string): boolean { if (value === undefined) return fallback; if (typeof value !== 'boolean') throw new RequestValidationError(`invalid_${field}`, `${label} 必须是布尔值`); return value }
 function sourceImageValue(value: unknown): SourceImage | undefined {
@@ -205,15 +221,17 @@ export class JobStore {
     this.db = new DatabaseSync(dbPath)
     this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE, mode TEXT NOT NULL, status TEXT NOT NULL, windows_json TEXT, provider_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, cancelled_at TEXT, request_json TEXT, results_json TEXT, error_json TEXT, provider_id TEXT);`)
     for (const column of ['request_json TEXT', 'results_json TEXT', 'error_json TEXT', 'provider_id TEXT']) { try { this.db.exec(`ALTER TABLE jobs ADD COLUMN ${column}`) } catch { /* 兼容已包含列的旧数据库 */ } }
-    this.db.exec('CREATE TABLE IF NOT EXISTS prompts (id TEXT PRIMARY KEY, category TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, layout TEXT NOT NULL, builtin INTEGER NOT NULL, source_name TEXT NOT NULL)')
-    const seedPrompt = this.db.prepare('INSERT OR IGNORE INTO prompts (id, category, title, text, layout, builtin, source_name) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    this.db.exec('CREATE TABLE IF NOT EXISTS prompts (id TEXT PRIMARY KEY, category TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, layout TEXT NOT NULL, builtin INTEGER NOT NULL, source_name TEXT NOT NULL, customized INTEGER NOT NULL DEFAULT 0)')
+    try { this.db.exec('ALTER TABLE prompts ADD COLUMN customized INTEGER NOT NULL DEFAULT 0') } catch { /* 兼容已包含该列的旧数据库 */ }
+    const seedPrompt = this.db.prepare('INSERT OR IGNORE INTO prompts (id, category, title, text, layout, builtin, source_name, customized) VALUES (?, ?, ?, ?, ?, ?, ?, 0)')
     // 提示词随数据库首次初始化写入，后续启动只补齐缺失项，不覆盖用户已有记录。
     for (const prompt of builtinPrompts) seedPrompt.run(prompt.id, prompt.category, prompt.title, prompt.text, prompt.layout, prompt.builtin ? 1 : 0, prompt.sourceName)
     const migratePrompt = this.db.prepare(`UPDATE prompts
       SET category = ?, title = ?, text = ?, layout = ?, source_name = ?
       WHERE id = ? AND builtin = 1
+        AND customized = 0
         AND (text LIKE '%Output rules:%' OR text LIKE '%Output contract:%' OR text LIKE '%LT_4K_%' OR text LIKE '%Final 4K structure check:%')`)
-    // 仅迁移仍含旧输出契约的内置记录，避免覆盖人工新增或自定义提示词。
+    // 仅迁移未被用户编辑且仍含旧输出契约的内置记录，避免启动时覆盖人工修改。
     for (const prompt of builtinPrompts) migratePrompt.run(prompt.category, prompt.title, prompt.text, prompt.layout, prompt.sourceName, prompt.id)
     this.db.exec('CREATE TABLE IF NOT EXISTS provider_config (id INTEGER PRIMARY KEY CHECK (id = 1), base_url TEXT NOT NULL, api_key TEXT NOT NULL, updated_at TEXT NOT NULL)')
     this.db.exec('CREATE TABLE IF NOT EXISTS model_providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
@@ -376,6 +394,29 @@ export class JobStore {
     return (this.db.prepare('SELECT id, category, title, text, layout, builtin, source_name FROM prompts ORDER BY rowid').all() as Record<string, unknown>[]).map((row) => ({
       id: String(row.id), category: String(row.category), title: String(row.title), text: String(row.text), layout: String(row.layout), builtin: Number(row.builtin) === 1, sourceName: String(row.source_name),
     }))
+  }
+  getPrompt(id: string): Prompt | undefined {
+    const row = this.db.prepare('SELECT id, category, title, text, layout, builtin, source_name FROM prompts WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    if (!row) return undefined
+    return { id: String(row.id), category: String(row.category), title: String(row.title), text: String(row.text), layout: String(row.layout), builtin: Number(row.builtin) === 1, sourceName: String(row.source_name) }
+  }
+  createPrompt(fields: PromptFields): Prompt {
+    const id = `prompt_${randomUUID()}`
+    this.db.prepare('INSERT INTO prompts (id, category, title, text, layout, builtin, source_name, customized) VALUES (?, ?, ?, ?, ?, 0, ?, 0)').run(id, fields.category, fields.title, fields.text, fields.layout ?? '', '用户自定义')
+    return this.getPrompt(id)!
+  }
+  updatePrompt(id: string, fields: PromptFields): Prompt | undefined {
+    if (!this.getPrompt(id)) return undefined
+    // 内置提示词允许编辑，但标记为用户修改，后续内置迁移不得覆盖本次保存结果。
+    this.db.prepare('UPDATE prompts SET category = ?, title = ?, text = ?, layout = ?, customized = 1 WHERE id = ?').run(fields.category, fields.title, fields.text, fields.layout ?? '', id)
+    return this.getPrompt(id)
+  }
+  deletePrompt(id: string): boolean {
+    const existing = this.getPrompt(id)
+    if (!existing) return false
+    if (existing.builtin) throw new RequestValidationError('builtin_prompt_protected', '内置提示词不可删除')
+    this.db.prepare('DELETE FROM prompts WHERE id = ? AND builtin = 0').run(id)
+    return true
   }
   stats(workspaceDir: string): AppStats {
     const counts = { completed: 0, running: 0, review: 0, failed: 0, total: 0 }
@@ -663,6 +704,36 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       return
     }
     if (req.method === 'GET' && path === '/api/prompts') { const items = store.prompts(); json(res, 200, { items, total: items.length }); return }
+    if (req.method === 'POST' && path === '/api/prompts') {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      try {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new RequestValidationError('invalid_prompt', '请求体必须是 JSON 对象')
+        json(res, 201, store.createPrompt(promptFields(body as Record<string, unknown>)))
+      } catch (error) { if (error instanceof RequestValidationError) errorResponse(res, 400, error.code, error.message); else errorResponse(res, 500, 'internal_error', '提示词创建失败') }
+      return
+    }
+    const promptMatch = path.match(/^\/api\/prompts\/([^/]+)$/)
+    if (promptMatch && req.method === 'PUT') {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      try {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new RequestValidationError('invalid_prompt', '请求体必须是 JSON 对象')
+        const updated = store.updatePrompt(decodeURIComponent(promptMatch[1]), promptFields(body as Record<string, unknown>))
+        if (!updated) { errorResponse(res, 404, 'prompt_not_found', '提示词不存在'); return }
+        json(res, 200, updated)
+      } catch (error) { if (error instanceof RequestValidationError) errorResponse(res, 400, error.code, error.message); else errorResponse(res, 500, 'internal_error', '提示词保存失败') }
+      return
+    }
+    if (promptMatch && req.method === 'DELETE') {
+      try {
+        const id = decodeURIComponent(promptMatch[1])
+        if (!store.getPrompt(id)) { errorResponse(res, 404, 'prompt_not_found', '提示词不存在'); return }
+        store.deletePrompt(id)
+        res.writeHead(204); res.end()
+      } catch (error) { if (error instanceof RequestValidationError && error.code === 'builtin_prompt_protected') errorResponse(res, 409, error.code, error.message); else errorResponse(res, 500, 'internal_error', '提示词删除失败') }
+      return
+    }
     if (req.method === 'GET' && path === '/api/providers') {
       const active = store.activeProvider()
       json(res, 200, { items: store.listProviders(), activeId: active?.id ?? null, runningCount: store.runningCount() })

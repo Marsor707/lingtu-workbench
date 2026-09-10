@@ -60,8 +60,89 @@ test('已有数据库只迁移含旧输出契约的内置提示词', () => {
     const prompt = migrated.prompts().find((item) => item.id === 'reference-v239-two_up-000')
     assert.ok(prompt)
     assert.doesNotMatch(prompt.text, /Output rules:|1129x1254/)
+    const schemaDb = new DatabaseSync(dbPath)
+    try {
+      const columns = schemaDb.prepare('PRAGMA table_info(prompts)').all()
+      assert.ok(columns.some((column) => column.name === 'customized'))
+    } finally {
+      schemaDb.close()
+    }
   } finally {
     migrated.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('提示词支持新增、编辑持久化、重启读取和自定义删除', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-prompt-crud-'))
+  const dbPath = join(directory, 'jobs.db')
+  const store = new JobStore(dbPath)
+  const app = await startServer(0, '127.0.0.1', store)
+  const base = `http://127.0.0.1:${app.address().port}`
+  try {
+    const invalidResponse = await fetch(`${base}/api/prompts`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: '', category: '自定义', text: '正文' }),
+    })
+    assert.equal(invalidResponse.status, 400)
+    assert.equal((await invalidResponse.json()).error.code, 'invalid_prompt')
+
+    const createResponse = await fetch(`${base}/api/prompts`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: '我的模板', category: '实验', text: '初始正文', layout: '' }),
+    })
+    assert.equal(createResponse.status, 201)
+    const created = await createResponse.json()
+    assert.match(created.id, /^prompt_[0-9a-f-]+$/)
+    assert.equal(created.builtin, false)
+    assert.equal(created.layout, '')
+    assert.equal(created.sourceName, '用户自定义')
+
+    const builtin = store.prompts().find((item) => item.builtin)
+    assert.ok(builtin)
+    const editResponse = await fetch(`${base}/api/prompts/${encodeURIComponent(builtin.id)}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: '用户编辑内置模板', category: '用户分类', text: '用户编辑 Output rules: 应保留', layout: 'single' }),
+    })
+    assert.equal(editResponse.status, 200)
+    const edited = await editResponse.json()
+    assert.equal(edited.title, '用户编辑内置模板')
+    assert.equal(edited.builtin, true)
+
+    const builtinDeleteResponse = await fetch(`${base}/api/prompts/${encodeURIComponent(builtin.id)}`, { method: 'DELETE' })
+    assert.equal(builtinDeleteResponse.status, 409)
+    assert.equal((await builtinDeleteResponse.json()).error.code, 'builtin_prompt_protected')
+
+    const invalidEditResponse = await fetch(`${base}/api/prompts/${encodeURIComponent(created.id)}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: '缺正文', category: '实验' }),
+    })
+    assert.equal(invalidEditResponse.status, 400)
+    assert.equal((await invalidEditResponse.json()).error.code, 'invalid_prompt')
+  } finally {
+    await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
+    store.close()
+  }
+
+  const restoredStore = new JobStore(dbPath)
+  const restoredApp = await startServer(0, '127.0.0.1', restoredStore)
+  const restoredBase = `http://127.0.0.1:${restoredApp.address().port}`
+  try {
+    const listResponse = await fetch(`${restoredBase}/api/prompts`)
+    assert.equal(listResponse.status, 200)
+    const list = await listResponse.json()
+    const restoredCustom = list.items.find((item) => item.id.startsWith('prompt_'))
+    const restoredBuiltin = list.items.find((item) => item.title === '用户编辑内置模板')
+    assert.deepEqual({ title: restoredCustom.title, category: restoredCustom.category, text: restoredCustom.text, layout: restoredCustom.layout, builtin: restoredCustom.builtin }, { title: '我的模板', category: '实验', text: '初始正文', layout: '', builtin: false })
+    assert.deepEqual({ title: restoredBuiltin.title, category: restoredBuiltin.category, text: restoredBuiltin.text, layout: restoredBuiltin.layout, builtin: restoredBuiltin.builtin }, { title: '用户编辑内置模板', category: '用户分类', text: '用户编辑 Output rules: 应保留', layout: 'single', builtin: true })
+
+    const deleteResponse = await fetch(`${restoredBase}/api/prompts/${encodeURIComponent(restoredCustom.id)}`, { method: 'DELETE' })
+    assert.equal(deleteResponse.status, 204)
+    const afterDelete = await (await fetch(`${restoredBase}/api/prompts`)).json()
+    assert.equal(afterDelete.items.some((item) => item.id === restoredCustom.id), false)
+  } finally {
+    await new Promise((resolve, reject) => restoredApp.close((error) => error ? reject(error) : resolve()))
+    restoredStore.close()
     rmSync(directory, { recursive: true, force: true })
   }
 })

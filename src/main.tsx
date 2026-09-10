@@ -28,6 +28,7 @@ import {
   MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
@@ -61,6 +62,8 @@ type PromptItem = {
   text: string
   category: string
   layout: string
+  builtin?: boolean
+  sourceName?: string
 }
 
 type ModelProvider = {
@@ -434,7 +437,7 @@ function App() {
           const title = typeof item.title === 'string' ? item.title : typeof item.name === 'string' ? item.name : `提示词 ${index + 1}`
           const id = item.id === undefined || item.id === null ? `prompt-${index + 1}` : String(item.id)
           if (!text.trim()) return []
-          return [{ id, title, text, category: typeof item.category === 'string' ? item.category : '未分类', layout: typeof item.layout === 'string' ? item.layout : '' }]
+          return [{ id, title, text, category: typeof item.category === 'string' ? item.category : '未分类', layout: typeof item.layout === 'string' ? item.layout : '', builtin: item.builtin === true || item.builtin === 1, sourceName: typeof item.sourceName === 'string' ? item.sourceName : '' }]
         })
         setPrompts(items)
         if (items.length > 0) {
@@ -515,6 +518,16 @@ function App() {
     setSelectedPrompt(id)
     storePromptId(id)
     if (item) setTextPrompt(item.text)
+  }
+
+  const handlePromptItemsChange = (nextItems: PromptItem[]) => {
+    setPrompts(nextItems)
+    // 提示词编辑后立即更新工作台正文；删除当前项时选取首个剩余模板，避免工作台持有失效 ID。
+    const nextSelected = nextItems.find((item) => item.id === selectedPrompt) ?? nextItems[0]
+    const nextSelectedId = nextSelected?.id ?? ''
+    setSelectedPrompt(nextSelectedId)
+    storePromptId(nextSelectedId)
+    setTextPrompt(nextSelected?.text ?? '')
   }
 
   const saveWorkspaceConfig = async (nextMaxConcurrency: number, nextPixelUpscale4K: boolean, nextImageNamingEnabled: boolean) => {
@@ -869,7 +882,7 @@ function App() {
         {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProviderName={activeProvider?.name} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={refreshQueue} onCancel={cancelJob} onRetry={retryJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
-        {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} />}
+        {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} onPromptsChange={handlePromptItemsChange} />}
         {page === 'models' && <ModelSettingsPage providers={modelProviders} runningCount={providerRunningCount} llmProviders={llmProviders} llmRunningCount={llmRunningCount} onRefresh={refreshProviders} onRefreshLlm={refreshLlmProviders} />}
       </main>
 
@@ -1158,16 +1171,64 @@ function GalleryPage({ assets, focusJobId, onClearFocus }: { assets: GalleryAsse
   return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />本地资产</div><h1>生成画廊</h1><p>{focusJobId ? <>当前查看任务 <span className="mono">{focusJobId}</span> 的生成结果。</> : '浏览最近产物，按合规状态快速筛选和打开本地文件。'}</p></div><div className="heading-actions"><label className="button button-primary" htmlFor="gallery-import"><DownloadIcon />导入资产</label><input id="gallery-import" className="gallery-import-input" type="file" accept="image/png,image/jpeg,image/webp" multiple onChange={importAssets} /></div></section>{focusJobId && <div className="gallery-focus-bar" role="status"><div><Eye size={15} /><span>任务结果筛选</span><strong className="mono">{focusJobId}</strong><small>{focusedSource.length} 张图片</small></div><button className="button button-ghost button-small" type="button" onClick={onClearFocus}><X size={14} />查看全部画廊</button></div>}<div className="gallery-toolbar"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{focusedSource.length}</span></button><button className={filter === 'PASS' ? 'active' : ''} onClick={() => setFilter('PASS')}>可用 <span>{focusedSource.filter((item) => item.tag === 'PASS').length}</span></button><button className={filter === 'REVIEW' ? 'active' : ''} onClick={() => setFilter('REVIEW')}>待复核 <span>{focusedSource.filter((item) => item.tag === 'REVIEW').length}</span></button><button className={filter === 'BLOCK' ? 'active' : ''} onClick={() => setFilter('BLOCK')}>高风险 <span>{focusedSource.filter((item) => item.tag === 'BLOCK').length}</span></button></div><div className="gallery-view-toggle" role="group" aria-label="画廊视图"><button className={viewMode === 'grid' ? 'active' : ''} title="网格视图" aria-label="网格视图" aria-pressed={viewMode === 'grid'} onClick={() => setViewMode('grid')}><LayoutGrid size={16} /></button><button className={viewMode === 'list' ? 'active' : ''} title="列表视图" aria-label="列表视图" aria-pressed={viewMode === 'list'} onClick={() => setViewMode('list')}><ListChecks size={16} /></button></div></div>{visible.length === 0 ? <div className="empty-state panel">{focusJobId ? '该任务暂无可展示的生成结果。' : '暂无生成结果，点击“导入资产”添加本地图片。'}</div> : <div className={`gallery-grid ${viewMode === 'list' ? 'list-view' : ''}`}>{visible.map((image) => <article className="gallery-card" key={`${image.title}-${image.src}`}><button className="gallery-card-open" type="button" onClick={() => openAsset(image)} aria-label={`打开 ${image.title}`}><div className="gallery-image"><img src={image.src} alt={image.title} loading="lazy" /><span className={`gallery-tag ${image.tone}`}>{statusNames[image.tag] ?? image.tag}</span></div><div className="gallery-card-body"><strong>{image.title}</strong><span>{importedAssets.some((item) => item.src === image.src) ? '已导入本地图片' : '本地任务结果'}</span></div></button><div className="gallery-card-actions"><button className="image-more" type="button" title="更多操作" aria-label={`更多操作：${image.title}`} aria-expanded={openMenu === image.src} onClick={() => setOpenMenu((current) => current === image.src ? null : image.src)}><MoreHorizontal size={17} /></button>{openMenu === image.src && <div className="image-menu" role="menu"><button type="button" role="menuitem" onClick={() => openAsset(image)}><Eye size={14} />打开原图</button><button type="button" role="menuitem" onClick={() => void copyAssetUrl(image)}><Copy size={14} />复制图片地址</button></div>}</div></article>)}</div>}{feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}</div>
 }
 
-function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPrompt }: { prompts: PromptItem[]; loading: boolean; error: string; selectedPrompt: string; setSelectedPrompt: (value: string) => void }) {
+function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPrompt, onPromptsChange }: { prompts: PromptItem[]; loading: boolean; error: string; selectedPrompt: string; setSelectedPrompt: (value: string) => void; onPromptsChange: (items: PromptItem[]) => void }) {
   const [search, setSearch] = useState('')
   const [category, setCategory] = useState('全部提示词')
+  const [editing, setEditing] = useState<PromptItem | null>(null)
+  const [showForm, setShowForm] = useState(false)
+  const [title, setTitle] = useState('')
+  const [formCategory, setFormCategory] = useState('')
+  const [text, setText] = useState('')
+  const [layout, setLayout] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [formError, setFormError] = useState('')
+  const [feedback, setFeedback] = useState('')
   const categories = ['全部提示词', ...Array.from(new Set(prompts.map((item) => item.category)))]
   const filtered = prompts.filter((item) => {
     const matchesCategory = category === '全部提示词' || item.category === category
     const query = search.trim().toLowerCase()
     return matchesCategory && (!query || `${item.title}${item.category}${item.text}`.toLowerCase().includes(query))
   })
-  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>提示词由本地服务初始化并从数据库读取。</p></div></section><div className="prompt-toolbar"><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" /></div></div>{error && <div className="form-error" role="status"><AlertTriangle size={14} />{error}</div>}{loading ? <div className="empty-state">提示词加载中…</div> : filtered.length === 0 ? <div className="empty-state">暂无可用提示词</div> : <div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? prompts.length : prompts.filter((prompt) => prompt.category === item).length}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => <article className={`prompt-card panel ${selectedPrompt === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedPrompt(item.id)}><div className="prompt-card-top"><span className="category-chip">{item.category}</span></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.layout === 'four_up' ? '4K 四宫格' : item.layout === 'fifteen_up_test' ? '4K 十五宫格测试' : '两宫格'} · 后端初始化</span>{selectedPrompt === item.id && <span className="selected-label"><Check size={13} />已选中</span>}</div></article>)}</div></div>}</div>
+
+  const resetForm = () => { setEditing(null); setShowForm(false); setTitle(''); setFormCategory(''); setText(''); setLayout(''); setFormError('') }
+  const openCreate = () => { setEditing(null); setTitle(''); setFormCategory(''); setText(''); setLayout(''); setFormError(''); setShowForm(true) }
+  const openEdit = (item: PromptItem) => { setEditing(item); setTitle(item.title); setFormCategory(item.category); setText(item.text); setLayout(item.layout); setFormError(''); setShowForm(true) }
+  const parseError = async (response: Response, fallback: string) => { try { const body = await response.json() as ApiErrorBody; return body.error?.message || fallback } catch { return fallback } }
+
+  const savePrompt = async (event: React.FormEvent) => {
+    event.preventDefault()
+    if (!title.trim() || !formCategory.trim() || !text.trim()) { setFormError('标题、分类和正文不能为空。'); return }
+    setSaving(true); setFormError('')
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/api/prompts${editing ? `/${encodeURIComponent(editing.id)}` : ''}`, { method: editing ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title.trim(), category: formCategory.trim(), text: text.trim(), layout: layout.trim() }) })
+      if (!response.ok) throw new Error(await parseError(response, '提示词保存失败'))
+      const saved = await response.json() as PromptItem
+      const next = editing ? prompts.map((item) => item.id === saved.id ? saved : item) : [...prompts, saved]
+      onPromptsChange(next)
+      setSelectedPrompt(saved.id)
+      setFeedback(editing ? '提示词已保存' : '提示词已新增')
+      resetForm()
+    } catch (saveError) { setFormError(saveError instanceof Error ? saveError.message : '提示词保存失败') } finally { setSaving(false) }
+  }
+
+  const deletePrompt = async (item: PromptItem) => {
+    if (item.builtin || !window.confirm(`确定删除“${item.title}”吗？删除后无法恢复。`)) return
+    setDeletingId(item.id)
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/api/prompts/${encodeURIComponent(item.id)}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(await parseError(response, '提示词删除失败'))
+      const nextItems = prompts.filter((prompt) => prompt.id !== item.id)
+      onPromptsChange(nextItems)
+      if (category !== '全部提示词' && !nextItems.some((prompt) => prompt.category === category)) setCategory('全部提示词')
+      setFeedback('提示词已删除')
+      if (editing?.id === item.id) resetForm()
+    } catch (deleteError) { setFeedback(deleteError instanceof Error ? deleteError.message : '提示词删除失败') } finally { setDeletingId(null) }
+  }
+
+  useEffect(() => { if (!feedback) return; const timer = window.setTimeout(() => setFeedback(''), 2400); return () => window.clearTimeout(timer) }, [feedback])
+
+  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>内置提示词可编辑；自定义提示词支持新增、编辑和删除。</p></div><div className="heading-actions"><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />新增提示词</button></div></section>{showForm && <form className="prompt-form panel" onSubmit={(event) => void savePrompt(event)}><div className="prompt-form-heading"><div><span className="section-kicker">{editing ? '编辑提示词' : '新建提示词'}</span><h2>{editing ? editing.title : '创建可复用模板'}</h2></div><button className="icon-button" type="button" aria-label="取消编辑" title="取消" onClick={resetForm}><X size={17} /></button></div><div className="prompt-form-grid"><div className="setting-field"><label htmlFor="prompt-title">标题 <span className="field-required">必填</span></label><input id="prompt-title" value={title} onChange={(event) => setTitle(event.target.value)} autoFocus /></div><div className="setting-field"><label htmlFor="prompt-category">分类 <span className="field-required">必填</span></label><input id="prompt-category" value={formCategory} onChange={(event) => setFormCategory(event.target.value)} /></div><div className="setting-field"><label htmlFor="prompt-layout">布局（可选）</label><select id="prompt-layout" value={layout} onChange={(event) => setLayout(event.target.value)}><option value="">不指定，由高级参数决定</option><option value="single">单图</option><option value="two_up">二宫格</option><option value="four_up">四宫格</option><option value="nine_up">九宫格</option></select></div><div className="setting-field prompt-form-text"><label htmlFor="prompt-text">提示词正文 <span className="field-required">必填</span></label><textarea id="prompt-text" value={text} onChange={(event) => setText(event.target.value)} rows={9} /></div></div>{formError && <div className="form-error prompt-form-error" role="alert"><AlertTriangle size={14} />{formError}</div>}<div className="prompt-form-actions"><button className="button button-ghost" type="button" onClick={resetForm} disabled={saving}>取消</button><button className="button button-primary" type="submit" disabled={saving}>{saving ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}{saving ? '保存中' : '保存提示词'}</button></div></form>}<div className="prompt-toolbar"><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" aria-label="搜索提示词" /></div></div>{error && <div className="form-error" role="status"><AlertTriangle size={14} />{error}</div>}{loading ? <div className="empty-state">提示词加载中…</div> : filtered.length === 0 ? <div className="empty-state panel">暂无可用提示词，点击“新增提示词”创建。</div> : <div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} type="button" onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? prompts.length : prompts.filter((prompt) => prompt.category === item).length}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => <article className={`prompt-card panel ${selectedPrompt === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedPrompt(item.id)}><div className="prompt-card-top"><span className="category-chip">{item.category}</span><span className={`prompt-origin ${item.builtin ? 'builtin' : 'custom'}`}>{item.builtin ? '内置' : '自定义'}</span></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.layout ? `布局：${item.layout}` : '布局由高级参数决定'}</span><div className="prompt-card-actions"><button className="icon-button subtle" type="button" title="编辑提示词" aria-label={`编辑提示词：${item.title}`} onClick={(event) => { event.stopPropagation(); openEdit(item) }}><Pencil size={14} /></button>{!item.builtin && <button className="icon-button subtle danger-icon" type="button" title="删除提示词" aria-label={`删除提示词：${item.title}`} disabled={deletingId === item.id} onClick={(event) => { event.stopPropagation(); void deletePrompt(item) }}><Trash2 size={14} /></button>}{selectedPrompt === item.id && <span className="selected-label"><Check size={13} />已选中</span>}</div></div></article>)}</div></div>}{feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}</div>
 }
 
 function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCount, onRefresh, onRefreshLlm }: { providers: ModelProvider[]; runningCount: number; llmProviders: LlmProvider[]; llmRunningCount: number; onRefresh: () => Promise<void>; onRefreshLlm: () => Promise<void> }) {
