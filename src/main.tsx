@@ -103,6 +103,7 @@ type QueueItem = {
   resultCount?: number
   error?: string
   createdAt?: string
+  updatedAt?: string
 }
 
 type GalleryAsset = {
@@ -154,10 +155,34 @@ const SIZE_OPTIONS = [
   { value: '1129 × 1254', label: '9:10' },
   { value: '1024 × 1024', label: '1:1' },
   { value: '1536 × 1024', label: '3:2' },
+  { value: '1800 × 1000', label: '9:5' },
 ] as const
+const CUSTOM_SIZE_OPTION_VALUE = '__custom__'
 const ADVANCED_SETTINGS_STORAGE_KEY = 'lingtu-advanced-settings'
-type AdvancedSettings = { layout: string; size: string; resolution: string; quality: string; repeat: number }
+type AdvancedSettings = { layout: string; size: string; resolution: string; quality: string; repeat: number; customSizeEnabled?: boolean; customWidth?: string; customHeight?: string }
 const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = { layout: '四宫格', size: '3840 × 2160', resolution: '1K', quality: '高', repeat: 1 }
+
+type CustomRatioValidation = { size?: string; ratio?: string; error?: string }
+
+function isValidCustomRatioValue(value: string): boolean {
+  const text = value.trim()
+  if (!/^\d+$/.test(text)) return false
+  const number = Number(text)
+  return Number.isInteger(number) && number >= 1 && number <= 100
+}
+
+function canonicalSizeForRatio(widthValue: string, heightValue: string): CustomRatioValidation {
+  const widthText = widthValue.trim()
+  const heightText = heightValue.trim()
+  if (!widthText || !heightText) return { error: '请补充宽和高，才能使用自定义比例' }
+  if (!isValidCustomRatioValue(widthText) || !isValidCustomRatioValue(heightText)) return { error: '宽和高必须是 1-100 的正整数' }
+  const width = Number(widthText)
+  const height = Number(heightText)
+  const divisor = greatestCommonDivisor(width, height)
+  const canonicalWidth = width >= height ? 1800 : Math.max(1, Math.round(1800 * width / height))
+  const canonicalHeight = height >= width ? 1800 : Math.max(1, Math.round(1800 * height / width))
+  return { size: `${canonicalWidth} × ${canonicalHeight}`, ratio: `${width / divisor}:${height / divisor}` }
+}
 
 function readStoredAdvancedSettings(): AdvancedSettings {
   try {
@@ -169,7 +194,10 @@ function readStoredAdvancedSettings(): AdvancedSettings {
     const resolution = parsed.resolution === '1K' || parsed.resolution === '2K' || parsed.resolution === '4K' ? parsed.resolution : DEFAULT_ADVANCED_SETTINGS.resolution
     const quality = parsed.quality === '高' || parsed.quality === '中' || parsed.quality === '自动' ? parsed.quality : DEFAULT_ADVANCED_SETTINGS.quality
     const repeat = typeof parsed.repeat === 'number' && Number.isFinite(parsed.repeat) ? Math.min(20, Math.max(1, Math.round(parsed.repeat))) : DEFAULT_ADVANCED_SETTINGS.repeat
-    return { layout, size, resolution, quality, repeat }
+    const customSizeEnabled = parsed.customSizeEnabled === true
+    const customWidth = typeof parsed.customWidth === 'string' ? parsed.customWidth : ''
+    const customHeight = typeof parsed.customHeight === 'string' ? parsed.customHeight : ''
+    return { layout, size, resolution, quality, repeat, customSizeEnabled, customWidth, customHeight }
   } catch {
     // 浏览器存储损坏或不可用时回退到稳定默认值，不阻塞工作台使用。
     return { ...DEFAULT_ADVANCED_SETTINGS }
@@ -272,12 +300,37 @@ function formatLayoutLabel(layout?: string): string {
   }
 }
 
+function parseCanonicalSize(size?: string): { width: number; height: number } | undefined {
+  const match = size?.match(/^\s*(\d+)\s*[×x]\s*(\d+)\s*$/i)
+  if (!match) return undefined
+  const width = Number(match[1])
+  const height = Number(match[2])
+  return Number.isInteger(width) && Number.isInteger(height) && width > 0 && height > 0 ? { width, height } : undefined
+}
+
+function greatestCommonDivisor(left: number, right: number): number {
+  let a = Math.abs(left)
+  let b = Math.abs(right)
+  while (b !== 0) {
+    const remainder = a % b
+    a = b
+    b = remainder
+  }
+  return a || 1
+}
+
 function formatSizeRatio(size?: string): string {
-  return SIZE_OPTIONS.find((option) => option.value === size)?.label ?? size ?? '16:9'
+  const fixedOption = SIZE_OPTIONS.find((option) => option.value === size)
+  if (fixedOption) return fixedOption.label
+  const dimensions = parseCanonicalSize(size)
+  if (!dimensions) return size ?? '16:9'
+  const divisor = greatestCommonDivisor(dimensions.width, dimensions.height)
+  return `${dimensions.width / divisor}:${dimensions.height / divisor}`
 }
 
 function formatSizeAspectRatio(size?: string): string {
-  return formatSizeRatio(size).replace(':', ' / ')
+  const dimensions = parseCanonicalSize(size)
+  return dimensions ? `${dimensions.width} / ${dimensions.height}` : formatSizeRatio(size).replace(':', ' / ')
 }
 
 async function encodeFile(file: File): Promise<string> {
@@ -336,7 +389,12 @@ function App() {
   const [textPrompt, setTextPrompt] = useState('')
   const [advancedSettings] = useState<AdvancedSettings>(() => readStoredAdvancedSettings())
   const [layout, setLayout] = useState(advancedSettings.layout)
-  const [size, setSize] = useState(advancedSettings.size)
+  const storedCustomSize = canonicalSizeForRatio(advancedSettings.customWidth ?? '', advancedSettings.customHeight ?? '')
+  const [size, setSize] = useState(advancedSettings.customSizeEnabled && storedCustomSize.size ? storedCustomSize.size : advancedSettings.size)
+  const fixedSizeRef = useRef(advancedSettings.size)
+  const [customSizeEnabled, setCustomSizeEnabled] = useState(advancedSettings.customSizeEnabled === true)
+  const [customWidth, setCustomWidth] = useState(advancedSettings.customWidth ?? '')
+  const [customHeight, setCustomHeight] = useState(advancedSettings.customHeight ?? '')
   const [resolution, setResolution] = useState(advancedSettings.resolution)
   const [quality, setQuality] = useState(advancedSettings.quality)
   const [repeat, setRepeat] = useState(advancedSettings.repeat)
@@ -390,13 +448,14 @@ function App() {
   }, [])
 
   useEffect(() => {
-    // 高级参数属于本机工作偏好，实时保存后刷新页面仍恢复上次选择。
+    // 自定义比例和宽高写入浏览器本地，刷新后恢复；固定尺寸保留作非法输入时的稳定回退。
     try {
-      window.localStorage.setItem(ADVANCED_SETTINGS_STORAGE_KEY, JSON.stringify({ layout, size, resolution, quality, repeat }))
+      const persistedSize = customSizeEnabled ? fixedSizeRef.current : size
+      window.localStorage.setItem(ADVANCED_SETTINGS_STORAGE_KEY, JSON.stringify({ layout, size: persistedSize, resolution, quality, repeat, customSizeEnabled, customWidth, customHeight }))
     } catch {
       // 存储不可用时保留当前会话状态，不影响提交任务。
     }
-  }, [layout, size, resolution, quality, repeat])
+  }, [customSizeEnabled, layout, size, resolution, quality, repeat])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -502,6 +561,7 @@ function App() {
   const activeMode = modes.find((item) => item.id === mode) ?? modes[0]
   const selectedPromptItem = prompts.find((item) => item.id === selectedPrompt)
   const enabledWindows = promptWindows.filter((item) => item.enabled && item.prompt.trim())
+  const customRatioValidation = canonicalSizeForRatio(customWidth, customHeight)
   const pageTitle = useMemo(() => {
     const titles: Record<Page, string> = {
       workbench: '生产工作台',
@@ -596,9 +656,16 @@ function App() {
       time,
       createdAt: job.createdAt,
       resultCount: Array.isArray(job.results) ? job.results.length : undefined,
+      updatedAt: job.updatedAt,
       ...(job.error?.message ? { error: job.error.message } : {}),
     }
-    setQueue((items) => [item, ...items.filter((existing) => existing.id !== job.id)])
+    setQueue((items) => {
+      const existing = items.find((candidate) => candidate.id === job.id)
+      // 详情回读、SSE 和手动刷新可能乱序返回；只接受不早于当前投影的任务快照，避免 completed 被旧 running 覆盖。
+      if (existing?.status === 'done' && status !== 'done') return items
+      if (existing?.updatedAt && job.updatedAt && Date.parse(existing.updatedAt) > Date.parse(job.updatedAt)) return items
+      return [item, ...items.filter((candidate) => candidate.id !== job.id)]
+    })
     if (status === 'done' && Array.isArray(job.results)) {
       const newAssets = assetsFromJob(job)
       setGalleryAssets((items) => [...newAssets, ...items.filter((asset) => !newAssets.some((next) => next.src === asset.src))])
@@ -606,20 +673,20 @@ function App() {
     return status
   }
 
-  const refreshQueue = async () => {
+  const refreshQueue = async (): Promise<ApiJob[]> => {
     try {
       const response = await fetch(`${LOCAL_API_BASE}/api/jobs`)
       if (!response.ok) {
         // 服务失败时清空本地投影，避免把旧的演示或过期任务继续展示给用户。
         setQueue([])
         setGalleryAssets([])
-        return
+        return []
       }
       const body = await response.json() as { items?: ApiJob[] }
       if (!Array.isArray(body.items)) {
         setQueue([])
         setGalleryAssets([])
-        return
+        return []
       }
       const completedAssets = body.items.flatMap(assetsFromJob)
       setGalleryAssets(completedAssets)
@@ -641,13 +708,20 @@ function App() {
           time: job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : job.status === 'cancelled' ? '已取消' : '进行中',
           createdAt: job.createdAt,
           resultCount: Array.isArray(job.results) ? job.results.length : undefined,
+          updatedAt: job.updatedAt,
           ...(job.error?.message ? { error: job.error.message } : {}),
         } satisfies QueueItem
+      }).map((item) => {
+        const previousItem = previous.find((candidate) => candidate.id === item.id)
+        if (previousItem?.status === 'done' && item.status !== 'done') return previousItem
+        return previousItem?.updatedAt && item.updatedAt && Date.parse(previousItem.updatedAt) > Date.parse(item.updatedAt) ? previousItem : item
       }))
+      return body.items
     } catch {
       // 本地服务未启动时清空投影，空态比伪造或保留旧任务更准确。
       setQueue([])
       setGalleryAssets([])
+      return []
     }
   }
 
@@ -696,7 +770,14 @@ function App() {
   }
 
   useEffect(() => {
-    void refreshQueue()
+    let disposed = false
+    const restoreLiveSubscriptions = async () => {
+      const jobs = await refreshQueue()
+      if (disposed) return
+      jobs.filter((job) => job.status === 'queued' || job.status === 'running').forEach((job) => { void subscribeJob(job.id) })
+    }
+    void restoreLiveSubscriptions()
+    return () => { disposed = true }
   }, [])
 
   const readJobDetail = async (jobId: string): Promise<ApiJob | undefined> => {
@@ -741,6 +822,7 @@ function App() {
       source.addEventListener(eventName, handleEvent)
     })
     source.onerror = () => {
+      if (settled) return
       source.close()
       if (eventSourcesRef.current.get(jobId) === source) eventSourcesRef.current.delete(jobId)
       // SSE 断开时轮询任务详情，确保并发 worker 只在当前任务结束后领取下一张。
@@ -757,9 +839,44 @@ function App() {
     }
   })
 
+  const handleSizeChange = (value: string) => {
+    setSubmitError('')
+    if (value === CUSTOM_SIZE_OPTION_VALUE) {
+      setCustomSizeEnabled(true)
+      const validation = canonicalSizeForRatio(customWidth, customHeight)
+      if (validation.size) setSize(validation.size)
+      return
+    }
+    setCustomSizeEnabled(false)
+    fixedSizeRef.current = value
+    setSize(value)
+  }
+
+  const updateCustomWidth = (value: string) => {
+    setCustomWidth(value)
+    setSubmitError('')
+    const validation = canonicalSizeForRatio(value, customHeight)
+    if (validation.size) setSize(validation.size)
+  }
+
+  const updateCustomHeight = (value: string) => {
+    setCustomHeight(value)
+    setSubmitError('')
+    const validation = canonicalSizeForRatio(customWidth, value)
+    if (validation.size) setSize(validation.size)
+  }
+
   const startJob = async () => {
     if (running) return
     setSubmitError('')
+    if (customSizeEnabled && !customRatioValidation.size) {
+      setSubmitError(customRatioValidation.error || '请完成自定义长宽比例后再开始任务')
+      window.requestAnimationFrame(() => {
+        const targetId = isValidCustomRatioValue(customWidth) ? 'custom-ratio-height' : 'custom-ratio-width'
+        document.getElementById(targetId)?.focus()
+      })
+      return
+    }
     if (mode === 'edit' && sourceFiles.length === 0) {
       setSubmitError('请先选择至少一张源图后再开始改图')
       return
@@ -772,6 +889,7 @@ function App() {
     setRunning(true)
     setSubmissionProgress(mode === 'edit' ? { current: 0, total: sourceFiles.length } : null)
     try {
+      const submitSize = customSizeEnabled && customRatioValidation.size ? customRatioValidation.size : size
       const filesToSubmit: Array<File | undefined> = mode === 'edit' ? sourceFiles : [undefined]
       let submittedCount = 0
       let failedCount = 0
@@ -790,7 +908,7 @@ function App() {
               textPrompt: textPrompt.trim(),
               windows: mode === 'one-to-many' ? enabledWindows.map(({ id, name, prompt: windowPrompt, enabled }) => ({ id, name, prompt: windowPrompt.trim(), enabled })) : undefined,
               layout,
-              size,
+              size: submitSize,
               resolution,
               quality,
               repeat,
@@ -879,8 +997,8 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={setSize} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProviderName={activeProvider?.name} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
-        {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={refreshQueue} onCancel={cancelJob} onRetry={retryJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProviderName={activeProvider?.name} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
+        {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={async () => { await refreshQueue() }} onCancel={cancelJob} onRetry={retryJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} onPromptsChange={handlePromptItemsChange} />}
         {page === 'models' && <ModelSettingsPage providers={modelProviders} runningCount={providerRunningCount} llmProviders={llmProviders} llmRunningCount={llmRunningCount} onRefresh={refreshProviders} onRefreshLlm={refreshLlmProviders} />}
@@ -899,6 +1017,12 @@ type WorkbenchProps = {
   setLayout: (value: string) => void
   size: string
   setSize: (value: string) => void
+  customSizeEnabled: boolean
+  customWidth: string
+  customHeight: string
+  customRatioError?: string
+  setCustomWidth: (value: string) => void
+  setCustomHeight: (value: string) => void
   resolution: string
   setResolution: (value: string) => void
   quality: string
@@ -938,7 +1062,7 @@ type WorkbenchProps = {
 }
 
 function Workbench(props: WorkbenchProps) {
-  const { mode, setMode, activeMode, layout, setLayout, size, setSize, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProviderName, submitError, onRefresh, onNavigate, onViewResults } = props
+  const { mode, setMode, activeMode, layout, setLayout, size, setSize, customSizeEnabled, customWidth, customHeight, customRatioError, setCustomWidth, setCustomHeight, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProviderName, submitError, onRefresh, onNavigate, onViewResults } = props
   const [showAdvanced, setShowAdvanced] = useState(true)
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -1027,11 +1151,26 @@ function Workbench(props: WorkbenchProps) {
         {mode === 'one-to-many' ? <div className="field-block one-to-many-block"><div className="field-label"><div><label>一裂多提示词窗口</label><span className="field-hint">已启用 {enabledWindows.length} 个</span></div><button className="button button-small button-ghost" onClick={addPromptWindow}><Plus size={14} />添加窗口</button></div><div className="prompt-window-list">{promptWindows.map((item, index) => <div className={`prompt-window ${item.enabled ? 'enabled' : ''}`} key={item.id}><div className="window-grip"><GripVertical size={15} /></div><button className={`toggle ${item.enabled ? 'on' : ''}`} onClick={() => updatePromptWindow(item.id, { enabled: !item.enabled })} aria-label={`${item.name} ${item.enabled ? '已启用' : '未启用'}`}><span /></button><div className="window-fields"><input aria-label={`窗口 ${index + 1} 名称`} value={item.name} onChange={(event) => updatePromptWindow(item.id, { name: event.target.value })} /><textarea aria-label={`${item.name}提示词`} placeholder="输入这个方向的提示词" value={item.prompt} onChange={(event) => updatePromptWindow(item.id, { prompt: event.target.value })} /></div><button className="icon-button danger-icon" title="删除窗口" aria-label={`删除窗口 ${item.name}`} onClick={() => updatePromptWindow(item.id, { prompt: '', enabled: false })}><Trash2 size={15} /></button></div>)}</div>{enabledWindows.length < 2 && <div className="inline-warning"><AlertTriangle size={14} />至少启用两个非空窗口后才能开始</div>}</div> : <div className="field-block"><div className="field-label"><label htmlFor="template-select">提示词模板</label><button className="text-link" onClick={() => onNavigate('prompts')} disabled={promptsLoading || prompts.length === 0}>浏览全部 <ArrowUpRight size={13} /></button></div><div className="select-wrap"><select id="template-select" value={selectedPrompt} onChange={(event) => setSelectedPrompt(event.target.value)} disabled={promptsLoading || prompts.length === 0}><option value="">{promptsLoading ? '提示词加载中…' : promptsError ? '提示词加载失败' : '暂无可用提示词'}</option>{prompts.map((item) => <option key={item.id} value={item.id}>{item.category} · {item.title}</option>)}</select><ChevronDown size={16} /></div><div className="prompt-preview"><span className="prompt-type">{mode === 'text' ? '文字' : '图片'} / 模板</span><p>{selectedPromptItem ? `${selectedPromptItem.text.slice(0, 320)}${selectedPromptItem.text.length > 320 ? '…' : ''}` : promptsLoading ? '提示词加载中…' : promptsError ? '提示词暂时无法加载，请检查本地服务。' : '后端暂无可用提示词。'}</p><button className="icon-button subtle" title="复制提示词" aria-label="复制提示词" onClick={() => void copyPrompt()} disabled={!selectedPromptItem}><Copy size={15} /></button></div>{promptsError && <div className="form-error" role="status"><AlertTriangle size={14} />{promptsError}</div>}</div>}
 
         <div className="settings-divider"><button className="advanced-trigger" onClick={() => setShowAdvanced((open) => !open)} aria-expanded={showAdvanced}><SlidersHorizontal size={15} />高级参数 <span>默认生产规范</span><ChevronDown size={15} className={showAdvanced ? 'rotate-180' : ''} /></button></div>
-        {showAdvanced && <div className="settings-grid"><div className="compact-field"><label htmlFor="layout-select">输出布局</label><div className="select-wrap"><select id="layout-select" value={layout} onChange={(event) => setLayout(event.target.value)}><option>单图</option><option>四宫格</option><option>二宫格</option><option>九宫格</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="size-select">长宽比例</label><div className="select-wrap"><select id="size-select" value={size} onChange={(event) => setSize(event.target.value)}>{SIZE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="resolution-select">分辨率</label><div className="select-wrap"><select id="resolution-select" value={resolution} onChange={(event) => setResolution(event.target.value)}><option>1K</option><option>2K</option><option>4K</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="quality-select">质量</label><div className="select-wrap"><select id="quality-select" value={quality} onChange={(event) => setQuality(event.target.value)}><option>高</option><option>中</option><option>自动</option></select><ChevronDown size={15} /></div></div><div className="compact-field"><label htmlFor="repeat-input">重复次数</label><div className="number-control"><input id="repeat-input" type="number" min="1" max="20" value={repeat} onChange={(event) => setRepeat(Math.min(20, Math.max(1, Number(event.target.value) || 1)))} /><span>次</span></div></div></div>}
+        {showAdvanced && <div className="settings-grid">
+          <div className="compact-field"><label htmlFor="layout-select">输出布局</label><div className="select-wrap"><select id="layout-select" value={layout} onChange={(event) => setLayout(event.target.value)}><option>单图</option><option>四宫格</option><option>二宫格</option><option>九宫格</option></select><ChevronDown size={15} /></div></div>
+          <div className="compact-field"><label htmlFor="size-select">长宽比例</label><div className="select-wrap"><select id="size-select" value={customSizeEnabled ? CUSTOM_SIZE_OPTION_VALUE : size} onChange={(event) => setSize(event.target.value)} aria-expanded={customSizeEnabled} aria-controls="custom-ratio-fields">{SIZE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}<option value={CUSTOM_SIZE_OPTION_VALUE}>自定义</option></select><ChevronDown size={15} /></div></div>
+          <div className="compact-field"><label htmlFor="resolution-select">分辨率</label><div className="select-wrap"><select id="resolution-select" value={resolution} onChange={(event) => setResolution(event.target.value)}><option>1K</option><option>2K</option><option>4K</option></select><ChevronDown size={15} /></div></div>
+          <div className="compact-field"><label htmlFor="quality-select">质量</label><div className="select-wrap"><select id="quality-select" value={quality} onChange={(event) => setQuality(event.target.value)}><option>高</option><option>中</option><option>自动</option></select><ChevronDown size={15} /></div></div>
+          <div className="compact-field"><label htmlFor="repeat-input">重复次数</label><div className="number-control"><input id="repeat-input" type="number" min="1" max="20" value={repeat} onChange={(event) => setRepeat(Math.min(20, Math.max(1, Number(event.target.value) || 1)))} /><span>次</span></div></div>
+          {customSizeEnabled && <div className="compact-field custom-ratio-field" id="custom-ratio-fields">
+            <span className="custom-ratio-title">自定义比例</span>
+            <div className="custom-ratio-controls">
+              <label className="custom-ratio-input-group" htmlFor="custom-ratio-width"><span>宽</span><input className="custom-ratio-input" id="custom-ratio-width" type="number" inputMode="numeric" min="1" max="100" step="1" value={customWidth} onChange={(event) => setCustomWidth(event.target.value)} aria-invalid={!isValidCustomRatioValue(customWidth)} aria-describedby="custom-ratio-feedback" /></label>
+              <span className="custom-ratio-separator" aria-hidden="true">:</span>
+              <label className="custom-ratio-input-group" htmlFor="custom-ratio-height"><span>高</span><input className="custom-ratio-input" id="custom-ratio-height" type="number" inputMode="numeric" min="1" max="100" step="1" value={customHeight} onChange={(event) => setCustomHeight(event.target.value)} aria-invalid={!isValidCustomRatioValue(customHeight)} aria-describedby="custom-ratio-feedback" /></label>
+            </div>
+            <span className={`custom-ratio-hint ${customRatioError ? 'error' : ''}`} id="custom-ratio-feedback" role={customRatioError ? 'alert' : undefined}>{customRatioError || `当前比例 ${canonicalSizeForRatio(customWidth, customHeight).ratio || formatSizeRatio(size)}，将按模型能力返回最接近尺寸`}</span>
+          </div>}
+        </div>}
         <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>{activeProviderName ? `当前模型：${activeProviderName}` : '尚未配置模型供应商'} <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}{submissionProgress && <span className="submit-progress" role="status">已提交 {submissionProgress.current} / {submissionProgress.total} 张，后端并发处理中</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />{mode === 'edit' ? '批量提交中' : '创建任务中'}</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
       </div>
 
-      <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div aria-hidden="true" /></div><div className={`layout-preview ${layout === '单图' ? 'layout-single' : layout === '二宫格' ? 'layout-two' : layout === '九宫格' ? 'layout-nine' : ''}`} style={{ aspectRatio: formatSizeAspectRatio(size) }}>{Array.from({ length: previewCount }, (_, index) => <div className={`preview-cell cell-${String.fromCharCode(97 + index)}`} key={String.fromCharCode(65 + index)}><span>{previewCount === 1 ? '单图' : String.fromCharCode(65 + index)}</span><small>{previewCount === 1 ? '完整画布' : index === 0 ? '主视觉区域' : index === 1 ? '卖点信息区域' : '细节变体'}</small></div>)}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{formatSizeRatio(size)}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link" onClick={() => onNavigate('gallery')}>查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryAssets.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={`打开 ${image.title}`} aria-label={`打开 ${image.title}`} onClick={() => openRecentAsset(image)}><img src={image.src} alt={image.title} /><span className={`mini-status ${image.tone}`} /></button>)}{galleryAssets.length === 0 && <span className="empty-inline">暂无生成结果</span>}</div></div></div>
+      <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div aria-hidden="true" /></div><div className={`layout-preview ${layout === '单图' ? 'layout-single' : layout === '二宫格' ? 'layout-two' : layout === '九宫格' ? 'layout-nine' : ''}`} style={{ aspectRatio: customSizeEnabled && customRatioError === undefined ? `${customWidth} / ${customHeight}` : formatSizeAspectRatio(size) }}>{Array.from({ length: previewCount }, (_, index) => <div className={`preview-cell cell-${String.fromCharCode(97 + index)}`} key={String.fromCharCode(65 + index)}><span>{previewCount === 1 ? '单图' : String.fromCharCode(65 + index)}</span><small>{previewCount === 1 ? '完整画布' : index === 0 ? '主视觉区域' : index === 1 ? '卖点信息区域' : '细节变体'}</small></div>)}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{customSizeEnabled && !customRatioError ? canonicalSizeForRatio(customWidth, customHeight).ratio : formatSizeRatio(size)}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link" onClick={() => onNavigate('gallery')}>查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryAssets.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={`打开 ${image.title}`} aria-label={`打开 ${image.title}`} onClick={() => openRecentAsset(image)}><img src={image.src} alt={image.title} /><span className={`mini-status ${image.tone}`} /></button>)}{galleryAssets.length === 0 && <span className="empty-inline">暂无生成结果</span>}</div></div></div>
     </section>
 
     <section className="bottom-grid"><div className="activity-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">活动</span><h2>最近任务</h2></div><button className="text-link" onClick={() => onNavigate('queue')}>打开队列 <ArrowUpRight size={13} /></button></div><div className="activity-list">{queue.slice(0, 3).map((item) => <div className={`activity-item ${item.status === 'done' && item.resultCount ? 'has-result' : ''}`} key={item.id}><div className={`activity-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="activity-copy"><strong>{item.title}</strong><span>{item.id} · {item.meta}</span></div>{item.status === 'done' && item.resultCount ? <div className="activity-state"><button className="activity-result-button" type="button" aria-label={`查看任务 ${item.id} 的 ${item.resultCount} 张结果`} onClick={() => onViewResults(item.id)}><Eye size={14} />查看结果</button></div> : null}</div>)}{queue.length === 0 && <div className="empty-state">暂无任务记录</div>}</div></div><div className="health-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">服务状态</span><h2>本地运行健康度</h2></div><span className={`healthy-pill ${serviceOnline ? '' : 'offline'} `}><span />{serviceOnline ? '正常' : '未连接'}</span></div><div className="health-content"><div className="health-ring" style={{ '--health-score': `${healthScore}%` } as React.CSSProperties}><div><strong>{statsLoading ? '...' : healthScore}</strong><span>健康分</span></div></div><div className="health-list"><HealthRow label="本地任务引擎" value={serviceOnline ? '运行中' : '未连接'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="本地数据" value={serviceOnline ? '已就绪' : '不可用'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="工作区" value={storageText + (stats?.storageTotalGb ? ` / ${stats.storageTotalGb} GB` : '')} tone={stats?.storageUsedGb === undefined ? 'idle' : 'good'} /></div></div></div></section>
