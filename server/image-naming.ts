@@ -1,10 +1,11 @@
-export type ImageNamingConfig = { baseUrl: string; apiKey: string; model: string }
+import { LlmChatError, chatVision } from './llm-chat.js'
+import type { LlmChatConfig } from './llm-chat.js'
 
-export class ImageNamingError extends Error {
-  constructor(public readonly code: string, message: string, public readonly status?: number) {
-    super(message)
-  }
-}
+export type ImageNamingConfig = LlmChatConfig
+
+// 图片命名的错误类型与通用 LLM 调用共用同一个类，既有调用点的 instanceof 判断继续成立。
+export { LlmChatError as ImageNamingError }
+const ImageNamingError = LlmChatError
 
 const IMAGE_NAMING_PROMPT = `
 你是一名电商图片命名助手。请根据图片内容生成一个适合作为图片文件名的中文电商标题。
@@ -24,33 +25,6 @@ const IMAGE_NAMING_PROMPT = `
 JSON 格式必须严格为：{"name":"图片标题"}
 `.trim()
 
-const DEFAULT_TIMEOUT_MS = 45_000
-
-function endpoint(baseUrl: string): string {
-  let parsed: URL
-  try { parsed = new URL(baseUrl) } catch { throw new ImageNamingError('invalid_llm_url', 'LLM 服务地址格式无效') }
-  if (!['http:', 'https:'].includes(parsed.protocol)) throw new ImageNamingError('invalid_llm_url', 'LLM 服务地址必须使用 http 或 https')
-  const path = parsed.pathname.replace(/\/+$/, '')
-  parsed.pathname = path.endsWith('/chat/completions') ? path : `${path.endsWith('/v1') ? path : `${path}/v1`}/chat/completions`
-  return parsed.toString()
-}
-
-function mimeType(bytes: Uint8Array): string {
-  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png'
-  if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg'
-  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return 'image/webp'
-  return 'image/png'
-}
-
-function responseContent(body: unknown): string {
-  const choices = body && typeof body === 'object' && Array.isArray((body as { choices?: unknown }).choices) ? (body as { choices: unknown[] }).choices : []
-  const message = choices[0] && typeof choices[0] === 'object' ? (choices[0] as { message?: unknown }).message : undefined
-  const content = message && typeof message === 'object' ? (message as { content?: unknown }).content : undefined
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) return content.map((part) => part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string' ? (part as { text: string }).text : '').filter(Boolean).join('\n')
-  throw new ImageNamingError('llm_invalid_response', 'LLM 返回内容缺少 message.content')
-}
-
 function parseName(content: string): string {
   const cleaned = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
   let parsed: unknown
@@ -66,35 +40,7 @@ function parseName(content: string): string {
 }
 
 export async function nameImage(config: ImageNamingConfig, bytes: Uint8Array, signal?: AbortSignal): Promise<string> {
-  if (!config.apiKey.trim() || !config.model.trim()) throw new ImageNamingError('llm_not_configured', 'LLM 图片命名未配置完整')
-  const timeoutSignal = AbortSignal.timeout(DEFAULT_TIMEOUT_MS)
-  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
-  let response: Response
-  try {
-    response = await fetch(endpoint(config.baseUrl), {
-      method: 'POST',
-      headers: { Accept: 'application/json', Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: config.model.trim(),
-        messages: [
-          { role: 'system', content: '你是专业的电商图片命名助手。' },
-          { role: 'user', content: [
-            { type: 'image_url', image_url: { url: `data:${mimeType(bytes)};base64,${Buffer.from(bytes).toString('base64')}` } },
-            { type: 'text', text: IMAGE_NAMING_PROMPT },
-          ] },
-        ],
-      }),
-      signal: requestSignal,
-    })
-  } catch (error) {
-    if (timeoutSignal.aborted && !signal?.aborted) throw new ImageNamingError('llm_timeout', 'LLM 图片命名请求超时')
-    if (signal?.aborted) throw new DOMException('LLM 图片命名已取消', 'AbortError')
-    throw new ImageNamingError('llm_network_error', 'LLM 图片命名网络请求失败')
-  }
-  if (!response.ok) throw new ImageNamingError('llm_http_error', `LLM 图片命名请求失败（HTTP ${response.status}）`, response.status)
-  let body: unknown
-  try { body = await response.json() } catch { throw new ImageNamingError('llm_invalid_response', 'LLM 返回不是有效 JSON') }
-  return parseName(responseContent(body))
+  return parseName(await chatVision(config, '你是专业的电商图片命名助手。', IMAGE_NAMING_PROMPT, bytes, signal))
 }
 
 export function sanitizeImageName(value: string): string | undefined {

@@ -36,15 +36,21 @@ test('健康检查保持既有契约', async () => {
   assert.deepEqual(body, { status: 'ok', service: 'lingtu-workbench' })
 })
 
-test('提示词接口返回安装时初始化的 79 条内置数据', async () => {
+test('提示词接口返回安装时初始化的 80 条内置数据', async () => {
   const { response, body } = await request('/api/prompts')
   assert.equal(response.status, 200)
-  assert.equal(body.total, 79)
-  assert.equal(body.items.length, 79)
+  assert.equal(body.total, 80)
+  assert.equal(body.items.length, 80)
   assert.equal(body.items[0].id, 'reference-v239-two_up-000')
   assert.equal(body.items[0].builtin, true)
   assert.ok(body.items.every((item) => item.text.length > 0))
   assert.ok(body.items.every((item) => !/Output rules:|Output contract:|LT_4K_|Final (?:4K|4K square) structure check:|\b(?:two-up|four-panel|fifteen-panel)\b|\b(?:1129x1254|1129x627|3840x2160|1890x1050|3840x3840|1206x670)\b/i.test(item.text)))
+  // 生图提示词与商品标题提示词用途分离，后者只出现在标题生成页。
+  const titlePrompt = body.items.find((item) => item.purpose === 'title')
+  assert.equal(titlePrompt.id, 'lingtu-title-seven-categories-000')
+  assert.equal(titlePrompt.builtin, true)
+  assert.equal(body.items.filter((item) => item.purpose === 'title').length, 1)
+  assert.ok(body.items.filter((item) => item.id !== titlePrompt.id).every((item) => item.purpose === 'generation'))
 })
 
 test('已有数据库只迁移含旧输出契约的内置提示词', () => {
@@ -1010,6 +1016,66 @@ test('启用 LLM 图片命名后使用视觉模型名称落盘，失败回退原
     const llmProviders = await (await fetch(`${base}/api/llm-providers`)).json()
     assert.deepEqual({ success: llmProviders.items[0].successCount, failure: llmProviders.items[0].failureCount }, { success: 1, failure: 1 })
     assert.equal(JSON.stringify(firstDetail).includes('llm-secret'), false)
+  } finally {
+    await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
+    await new Promise((resolve, reject) => llmServer.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('标题生成复用启用的 LLM 供应商，按七个类别返回并共用统计', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-title-generation-'))
+  let llmCalls = 0
+  const llmServer = createHttpServer(async (req, res) => {
+    if (req.url !== '/v1/chat/completions') { res.statusCode = 404; res.end(); return }
+    let body = ''
+    for await (const chunk of req) body += chunk
+    const payload = JSON.parse(body)
+    assert.equal(payload.model, 'vision-model')
+    assert.equal(payload.messages?.[1]?.content?.[0]?.type, 'image_url')
+    // 发送的正文来自提示词库中的商品标题提示词，而不是写死在代码里。
+    assert.match(payload.messages?.[1]?.content?.[1]?.text ?? '', /七个类别整理后以JSON的格式输出/)
+    llmCalls += 1
+    res.setHeader('content-type', 'application/json')
+    if (llmCalls === 1) res.end(JSON.stringify({ choices: [{ message: { content: '```json\n{"浴帘":"A","地垫":"B","床上三件套":"C","扇子":"D","雨伞":"E","3/4pcs地垫":"F","1pc地垫":"G"}\n```' } }] }))
+    else res.end(JSON.stringify({ choices: [{ message: { content: '{"浴帘":"A","地垫":"B"}' } }] }))
+  })
+  await new Promise((resolve) => llmServer.listen(0, '127.0.0.1', resolve))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const app = await startServer(0, '127.0.0.1', store, { workspaceDir: directory })
+  const base = `http://127.0.0.1:${app.address().port}`
+  try {
+    const prompts = await (await fetch(`${base}/api/prompts`)).json()
+    const titlePrompt = prompts.items.find((item) => item.purpose === 'title')
+    assert.equal(titlePrompt.id, 'lingtu-title-seven-categories-000')
+    const call = (promptId) => fetch(`${base}/api/title-generation`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ promptId, image: { data: Buffer.from([1, 2, 3]).toString('base64') } }) })
+
+    // 未配置启用的 LLM 供应商时拒绝，且不计入统计。
+    const noProvider = await call(titlePrompt.id)
+    assert.equal(noProvider.status, 409)
+    assert.equal((await noProvider.json()).error.code, 'llm_not_configured')
+
+    const provider = await (await fetch(`${base}/api/llm-providers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: '本地视觉模型', baseUrl: `http://127.0.0.1:${llmServer.address().port}/v1`, apiKey: 'llm-secret', model: 'vision-model' }) })).json()
+    assert.equal(provider.enabled, true)
+
+    const success = await call(titlePrompt.id)
+    assert.equal(success.status, 200)
+    const successBody = await success.json()
+    assert.deepEqual(successBody.titles, { 浴帘: 'A', 地垫: 'B', 床上三件套: 'C', 扇子: 'D', 雨伞: 'E', '3/4pcs地垫': 'F', '1pc地垫': 'G' })
+    assert.equal(JSON.stringify(successBody).includes('llm-secret'), false)
+
+    // 类别缺失时该图判失败，不猜列。
+    const incomplete = await call(titlePrompt.id)
+    assert.equal(incomplete.status, 502)
+    assert.equal((await incomplete.json()).error.code, 'title_invalid_response')
+
+    const missingPrompt = await call('prompt_missing')
+    assert.equal(missingPrompt.status, 404)
+
+    // 标题生成与图片命名共用同一个 LLM 供应商的成功/失败统计。
+    const providers = await (await fetch(`${base}/api/llm-providers`)).json()
+    assert.deepEqual({ success: providers.items[0].successCount, failure: providers.items[0].failureCount }, { success: 1, failure: 1 })
   } finally {
     await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
     await new Promise((resolve, reject) => llmServer.close((error) => error ? reject(error) : resolve()))

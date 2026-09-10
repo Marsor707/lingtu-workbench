@@ -16,6 +16,7 @@ import {
   Eye,
   EyeOff,
   FileImage,
+  FileSpreadsheet,
   FolderOpen,
   GalleryHorizontalEnd,
   GripVertical,
@@ -43,9 +44,11 @@ import {
   X,
 } from 'lucide-react'
 import './styles.css'
+import { LOCAL_API_BASE } from './api-base'
+import { TitleGenerationPage } from './title-generation'
 
 type Mode = 'generate' | 'edit' | 'text' | 'one-to-many'
-type Page = 'workbench' | 'queue' | 'gallery' | 'prompts' | 'models'
+type Page = 'workbench' | 'queue' | 'gallery' | 'title-generation' | 'prompts' | 'models'
 
 type PromptWindow = {
   id: number
@@ -62,6 +65,7 @@ type PromptItem = {
   text: string
   category: string
   layout: string
+  purpose?: string
   builtin?: boolean
   sourceName?: string
 }
@@ -145,7 +149,6 @@ type ApiErrorBody = {
   error?: { message?: string }
 }
 
-const LOCAL_API_BASE = 'http://127.0.0.1:8765'
 const SELECTED_PROMPT_STORAGE_KEY = 'lingtu-selected-prompt'
 const MAX_CONCURRENCY_STORAGE_KEY = 'lingtu-max-concurrency'
 const DEFAULT_MAX_CONCURRENCY = 4
@@ -515,18 +518,25 @@ function App() {
           const title = typeof item.title === 'string' ? item.title : typeof item.name === 'string' ? item.name : `提示词 ${index + 1}`
           const id = item.id === undefined || item.id === null ? `prompt-${index + 1}` : String(item.id)
           if (!text.trim()) return []
-          return [{ id, title, text, category: typeof item.category === 'string' ? item.category : '未分类', layout: typeof item.layout === 'string' ? item.layout : '', builtin: item.builtin === true || item.builtin === 1, sourceName: typeof item.sourceName === 'string' ? item.sourceName : '' }]
+          return [{ id, title, text, category: typeof item.category === 'string' ? item.category : '未分类', layout: typeof item.layout === 'string' ? item.layout : '', purpose: typeof item.purpose === 'string' ? item.purpose : 'generation', builtin: item.builtin === true || item.builtin === 1, sourceName: typeof item.sourceName === 'string' ? item.sourceName : '' }]
         })
         setPrompts(items)
         if (items.length > 0) {
-          const first = items.find((item) => item.layout.includes('four') || item.layout.includes('四')) ?? items[0]
+          // 工作台的选择只在生图提示词里挑；商品标题提示词不参与生图，也不写回工作台选择。
+          const generationItems = items.filter((item) => item.purpose !== 'title')
           const storedId = readStoredPromptId()
-          const selectedId = items.some((item) => item.id === storedId) ? storedId : first.id
-          const selectedItem = items.find((item) => item.id === selectedId) ?? first
-          setSelectedPrompt(selectedId)
-          setTextPrompt(selectedItem.text)
-          storePromptId(selectedId)
-          setPromptWindows(items.slice(0, 2).map((item, index) => ({ id: index + 1, name: item.title, prompt: item.text, enabled: true })))
+          const first = generationItems.find((item) => item.layout.includes('four') || item.layout.includes('四')) ?? generationItems[0]
+          if (first) {
+            const selectedId = generationItems.some((item) => item.id === storedId) ? storedId : first.id
+            const selectedItem = generationItems.find((item) => item.id === selectedId) ?? first
+            setSelectedPrompt(selectedId)
+            setTextPrompt(selectedItem.text)
+            storePromptId(selectedId)
+          } else {
+            setSelectedPrompt('')
+            setTextPrompt('')
+          }
+          setPromptWindows(generationItems.slice(0, 2).map((item, index) => ({ id: index + 1, name: item.title, prompt: item.text, enabled: true })))
         } else {
           setSelectedPrompt('')
           setTextPrompt('')
@@ -578,14 +588,17 @@ function App() {
   }, [])
 
   const activeMode = modes.find((item) => item.id === mode) ?? modes[0]
-  const selectedPromptItem = prompts.find((item) => item.id === selectedPrompt)
+  // 生图工作台只列用途为生图的提示词；用途为商品标题的提示词属于「标题生成」页。
+  const generationPrompts = useMemo(() => prompts.filter((prompt) => prompt.purpose !== 'title'), [prompts])
+  const selectedPromptItem = generationPrompts.find((item) => item.id === selectedPrompt)
   const enabledWindows = promptWindows.filter((item) => item.enabled && item.prompt.trim())
   const customRatioValidation = canonicalSizeForRatio(customWidth, customHeight)
   const pageTitle = useMemo(() => {
     const titles: Record<Page, string> = {
-      workbench: '生产工作台',
+      workbench: '生图工作台',
       queue: '任务队列',
       gallery: '生成画廊',
+      'title-generation': '标题生成',
       prompts: '提示词库',
       models: '模型设置',
     }
@@ -593,16 +606,19 @@ function App() {
   }, [page])
 
   const handlePromptSelect = (id: PromptSelection) => {
-    const item = prompts.find((prompt) => prompt.id === id)
+    const item = generationPrompts.find((prompt) => prompt.id === id)
+    // 非生图提示词不进工作台选择，避免商品标题提示词被当生成正文使用。
+    if (!item) return
     setSelectedPrompt(id)
     storePromptId(id)
-    if (item) setTextPrompt(item.text)
+    setTextPrompt(item.text)
   }
 
   const handlePromptItemsChange = (nextItems: PromptItem[]) => {
     setPrompts(nextItems)
-    // 提示词编辑后立即更新工作台正文；删除当前项时选取首个剩余模板，避免工作台持有失效 ID。
-    const nextSelected = nextItems.find((item) => item.id === selectedPrompt) ?? nextItems[0]
+    // 提示词编辑后立即更新工作台正文；删除当前项时在生图提示词里选取首个剩余模板，避免工作台持有失效或跨用途的 ID。
+    const generationItems = nextItems.filter((item) => item.purpose !== 'title')
+    const nextSelected = generationItems.find((item) => item.id === selectedPrompt) ?? generationItems[0]
     const nextSelectedId = nextSelected?.id ?? ''
     setSelectedPrompt(nextSelectedId)
     storePromptId(nextSelectedId)
@@ -976,9 +992,10 @@ function App() {
   }
 
   const navItems: Array<{ id: Page; label: string; icon: typeof LayoutGrid; badge?: string }> = [
-    { id: 'workbench', label: '生产工作台', icon: LayoutGrid },
+    { id: 'workbench', label: '生图工作台', icon: LayoutGrid },
     { id: 'queue', label: '任务队列', icon: ListChecks, badge: `${queue.filter((item) => item.status === 'running').length}` },
     { id: 'gallery', label: '生成画廊', icon: GalleryHorizontalEnd },
+    { id: 'title-generation', label: '标题生成', icon: FileSpreadsheet },
     { id: 'prompts', label: '提示词库', icon: BookOpen },
     { id: 'models', label: '模型设置', icon: Settings2, badge: activeProvider ? '启用' : '未配' },
   ]
@@ -1019,9 +1036,10 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProvider={activeProvider} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={generationPrompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProvider={activeProvider} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={async () => { await refreshQueue() }} onCancel={cancelJob} onRetry={retryJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
+        {page === 'title-generation' && <TitleGenerationPage prompts={prompts} llmProviders={llmProviders} onOpenModelSettings={() => navigateTo('models')} onOpenPromptLibrary={() => navigateTo('prompts')} />}
         {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} onPromptsChange={handlePromptItemsChange} />}
         {page === 'models' && <ModelSettingsPage providers={modelProviders} runningCount={providerRunningCount} llmProviders={llmProviders} llmRunningCount={llmRunningCount} onRefresh={refreshProviders} onRefreshLlm={refreshLlmProviders} />}
       </main>
@@ -1336,26 +1354,31 @@ function GalleryPage({ assets, focusJobId, onClearFocus }: { assets: GalleryAsse
 function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPrompt, onPromptsChange }: { prompts: PromptItem[]; loading: boolean; error: string; selectedPrompt: string; setSelectedPrompt: (value: string) => void; onPromptsChange: (items: PromptItem[]) => void }) {
   const [search, setSearch] = useState('')
   const [category, setCategory] = useState('全部提示词')
+  // 生图提示词与商品标题提示词分开展示，避免在生图时误选标题提示词。
+  const [purposeFilter, setPurposeFilter] = useState<'generation' | 'title'>('generation')
   const [editing, setEditing] = useState<PromptItem | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [title, setTitle] = useState('')
   const [formCategory, setFormCategory] = useState('')
   const [text, setText] = useState('')
   const [layout, setLayout] = useState('')
+  const [purpose, setPurpose] = useState('generation')
   const [saving, setSaving] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [formError, setFormError] = useState('')
   const [feedback, setFeedback] = useState('')
-  const categories = ['全部提示词', ...Array.from(new Set(prompts.map((item) => item.category)))]
-  const filtered = prompts.filter((item) => {
+  const scopedPrompts = prompts.filter((item) => (item.purpose ?? 'generation') === purposeFilter)
+  const categories = ['全部提示词', ...Array.from(new Set(scopedPrompts.map((item) => item.category)))]
+  const filtered = scopedPrompts.filter((item) => {
     const matchesCategory = category === '全部提示词' || item.category === category
     const query = search.trim().toLowerCase()
     return matchesCategory && (!query || `${item.title}${item.category}${item.text}`.toLowerCase().includes(query))
   })
+  const switchPurpose = (next: 'generation' | 'title') => { setPurposeFilter(next); setCategory('全部提示词') }
 
-  const resetForm = () => { setEditing(null); setShowForm(false); setTitle(''); setFormCategory(''); setText(''); setLayout(''); setFormError('') }
-  const openCreate = () => { setEditing(null); setTitle(''); setFormCategory(''); setText(''); setLayout(''); setFormError(''); setShowForm(true) }
-  const openEdit = (item: PromptItem) => { setEditing(item); setTitle(item.title); setFormCategory(item.category); setText(item.text); setLayout(item.layout); setFormError(''); setShowForm(true) }
+  const resetForm = () => { setEditing(null); setShowForm(false); setTitle(''); setFormCategory(''); setText(''); setLayout(''); setPurpose('generation'); setFormError('') }
+  const openCreate = () => { setEditing(null); setTitle(''); setFormCategory(''); setText(''); setLayout(''); setPurpose(purposeFilter); setFormError(''); setShowForm(true) }
+  const openEdit = (item: PromptItem) => { setEditing(item); setTitle(item.title); setFormCategory(item.category); setText(item.text); setLayout(item.layout); setPurpose(item.purpose ?? 'generation'); setFormError(''); setShowForm(true) }
   const parseError = async (response: Response, fallback: string) => { try { const body = await response.json() as ApiErrorBody; return body.error?.message || fallback } catch { return fallback } }
 
   const savePrompt = async (event: React.FormEvent) => {
@@ -1363,12 +1386,14 @@ function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPr
     if (!title.trim() || !formCategory.trim() || !text.trim()) { setFormError('标题、分类和正文不能为空。'); return }
     setSaving(true); setFormError('')
     try {
-      const response = await fetch(`${LOCAL_API_BASE}/api/prompts${editing ? `/${encodeURIComponent(editing.id)}` : ''}`, { method: editing ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title.trim(), category: formCategory.trim(), text: text.trim(), layout: layout.trim() }) })
+      const response = await fetch(`${LOCAL_API_BASE}/api/prompts${editing ? `/${encodeURIComponent(editing.id)}` : ''}`, { method: editing ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title.trim(), category: formCategory.trim(), text: text.trim(), layout: layout.trim(), purpose }) })
       if (!response.ok) throw new Error(await parseError(response, '提示词保存失败'))
       const saved = await response.json() as PromptItem
       const next = editing ? prompts.map((item) => item.id === saved.id ? saved : item) : [...prompts, saved]
       onPromptsChange(next)
-      setSelectedPrompt(saved.id)
+      // 工作台的“已选中”只用于生图提示词；商品标题提示词的选择留在标题生成页。
+      if ((saved.purpose ?? 'generation') === 'generation') setSelectedPrompt(saved.id)
+      else switchPurpose('title')
       setFeedback(editing ? '提示词已保存' : '提示词已新增')
       resetForm()
     } catch (saveError) { setFormError(saveError instanceof Error ? saveError.message : '提示词保存失败') } finally { setSaving(false) }
@@ -1390,7 +1415,7 @@ function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPr
 
   useEffect(() => { if (!feedback) return; const timer = window.setTimeout(() => setFeedback(''), 2400); return () => window.clearTimeout(timer) }, [feedback])
 
-  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>内置提示词可编辑；自定义提示词支持新增、编辑和删除。</p></div><div className="heading-actions"><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />新增提示词</button></div></section>{showForm && <form className="prompt-form panel" onSubmit={(event) => void savePrompt(event)}><div className="prompt-form-heading"><div><span className="section-kicker">{editing ? '编辑提示词' : '新建提示词'}</span><h2>{editing ? editing.title : '创建可复用模板'}</h2></div><button className="icon-button" type="button" aria-label="取消编辑" title="取消" onClick={resetForm}><X size={17} /></button></div><div className="prompt-form-grid"><div className="setting-field"><label htmlFor="prompt-title">标题 <span className="field-required">必填</span></label><input id="prompt-title" value={title} onChange={(event) => setTitle(event.target.value)} autoFocus /></div><div className="setting-field"><label htmlFor="prompt-category">分类 <span className="field-required">必填</span></label><input id="prompt-category" value={formCategory} onChange={(event) => setFormCategory(event.target.value)} /></div><div className="setting-field"><label htmlFor="prompt-layout">布局（可选）</label><select id="prompt-layout" value={layout} onChange={(event) => setLayout(event.target.value)}><option value="">不指定，由高级参数决定</option><option value="single">单图</option><option value="two_up">二宫格</option><option value="four_up">四宫格</option><option value="nine_up">九宫格</option></select></div><div className="setting-field prompt-form-text"><label htmlFor="prompt-text">提示词正文 <span className="field-required">必填</span></label><textarea id="prompt-text" value={text} onChange={(event) => setText(event.target.value)} rows={9} /></div></div>{formError && <div className="form-error prompt-form-error" role="alert"><AlertTriangle size={14} />{formError}</div>}<div className="prompt-form-actions"><button className="button button-ghost" type="button" onClick={resetForm} disabled={saving}>取消</button><button className="button button-primary" type="submit" disabled={saving}>{saving ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}{saving ? '保存中' : '保存提示词'}</button></div></form>}<div className="prompt-toolbar"><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" aria-label="搜索提示词" /></div></div>{error && <div className="form-error" role="status"><AlertTriangle size={14} />{error}</div>}{loading ? <div className="empty-state">提示词加载中…</div> : filtered.length === 0 ? <div className="empty-state panel">暂无可用提示词，点击“新增提示词”创建。</div> : <div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} type="button" onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? prompts.length : prompts.filter((prompt) => prompt.category === item).length}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => <article className={`prompt-card panel ${selectedPrompt === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedPrompt(item.id)}><div className="prompt-card-top"><span className="category-chip">{item.category}</span><span className={`prompt-origin ${item.builtin ? 'builtin' : 'custom'}`}>{item.builtin ? '内置' : '自定义'}</span></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.layout ? `布局：${item.layout}` : '布局由高级参数决定'}</span><div className="prompt-card-actions"><button className="icon-button subtle" type="button" title="编辑提示词" aria-label={`编辑提示词：${item.title}`} onClick={(event) => { event.stopPropagation(); openEdit(item) }}><Pencil size={14} /></button>{!item.builtin && <button className="icon-button subtle danger-icon" type="button" title="删除提示词" aria-label={`删除提示词：${item.title}`} disabled={deletingId === item.id} onClick={(event) => { event.stopPropagation(); void deletePrompt(item) }}><Trash2 size={14} /></button>}{selectedPrompt === item.id && <span className="selected-label"><Check size={13} />已选中</span>}</div></div></article>)}</div></div>}{feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}</div>
+  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>生图提示词与商品标题提示词分开存放；内置提示词可编辑，自定义提示词支持新增、编辑和删除。</p></div><div className="heading-actions"><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />新增提示词</button></div></section>{showForm && <form className="prompt-form panel" onSubmit={(event) => void savePrompt(event)}><div className="prompt-form-heading"><div><span className="section-kicker">{editing ? '编辑提示词' : '新建提示词'}</span><h2>{editing ? editing.title : '创建可复用模板'}</h2></div><button className="icon-button" type="button" aria-label="取消编辑" title="取消" onClick={resetForm}><X size={17} /></button></div><div className="prompt-form-grid"><div className="setting-field"><label htmlFor="prompt-title">标题 <span className="field-required">必填</span></label><input id="prompt-title" value={title} onChange={(event) => setTitle(event.target.value)} autoFocus /></div><div className="setting-field"><label htmlFor="prompt-category">分类 <span className="field-required">必填</span></label><input id="prompt-category" value={formCategory} onChange={(event) => setFormCategory(event.target.value)} /></div><div className="setting-field"><label htmlFor="prompt-purpose">用途</label><select id="prompt-purpose" value={purpose} onChange={(event) => setPurpose(event.target.value)}><option value="generation">生图</option><option value="title">商品标题</option></select></div>{purpose !== 'title' && <div className="setting-field"><label htmlFor="prompt-layout">布局（可选）</label><select id="prompt-layout" value={layout} onChange={(event) => setLayout(event.target.value)}><option value="">不指定，由高级参数决定</option><option value="single">单图</option><option value="two_up">二宫格</option><option value="four_up">四宫格</option><option value="nine_up">九宫格</option></select></div>}<div className="setting-field prompt-form-text"><label htmlFor="prompt-text">提示词正文 <span className="field-required">必填</span></label><textarea id="prompt-text" value={text} onChange={(event) => setText(event.target.value)} rows={9} /></div></div>{formError && <div className="form-error prompt-form-error" role="alert"><AlertTriangle size={14} />{formError}</div>}<div className="prompt-form-actions"><button className="button button-ghost" type="button" onClick={resetForm} disabled={saving}>取消</button><button className="button button-primary" type="submit" disabled={saving}>{saving ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}{saving ? '保存中' : '保存提示词'}</button></div></form>}<div className="prompt-toolbar"><div className="filter-tabs" role="tablist" aria-label="提示词用途"><button className={purposeFilter === 'generation' ? 'active' : ''} type="button" role="tab" aria-selected={purposeFilter === 'generation'} onClick={() => switchPurpose('generation')}>生图 <span>{prompts.filter((item) => (item.purpose ?? 'generation') === 'generation').length}</span></button><button className={purposeFilter === 'title' ? 'active' : ''} type="button" role="tab" aria-selected={purposeFilter === 'title'} onClick={() => switchPurpose('title')}>商品标题 <span>{prompts.filter((item) => item.purpose === 'title').length}</span></button></div><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" aria-label="搜索提示词" /></div></div>{error && <div className="form-error" role="status"><AlertTriangle size={14} />{error}</div>}{loading ? <div className="empty-state">提示词加载中…</div> : filtered.length === 0 ? <div className="empty-state panel">暂无可用提示词，点击“新增提示词”创建。</div> : <div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} type="button" onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? scopedPrompts.length : scopedPrompts.filter((prompt) => prompt.category === item).length}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => { const selectable = (item.purpose ?? 'generation') !== 'title'; const isSelected = selectable && selectedPrompt === item.id; return <article className={`prompt-card panel ${isSelected ? 'selected' : ''}`} key={item.id} onClick={() => { if (selectable) setSelectedPrompt(item.id) }}><div className="prompt-card-top"><span className="category-chip">{item.category}</span><span className={`prompt-origin ${item.builtin ? 'builtin' : 'custom'}`}>{item.builtin ? '内置' : '自定义'}</span></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.purpose === 'title' ? '用途：商品标题' : item.layout ? `布局：${item.layout}` : '布局由高级参数决定'}</span><div className="prompt-card-actions"><button className="icon-button subtle" type="button" title="编辑提示词" aria-label={`编辑提示词：${item.title}`} onClick={(event) => { event.stopPropagation(); openEdit(item) }}><Pencil size={14} /></button>{!item.builtin && <button className="icon-button subtle danger-icon" type="button" title="删除提示词" aria-label={`删除提示词：${item.title}`} disabled={deletingId === item.id} onClick={(event) => { event.stopPropagation(); void deletePrompt(item) }}><Trash2 size={14} /></button>}{isSelected && <span className="selected-label"><Check size={13} />已选中</span>}</div></div></article>})}</div></div>}{feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}</div>
 }
 
 // 供应商配置统一使用右侧抽屉：遮罩、右滑面板、标题区、字段区和底部操作。

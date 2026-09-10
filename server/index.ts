@@ -9,6 +9,8 @@ import type { GenerationResult } from './provider.js'
 import { pixelUpscale as pixelUpscaleImage } from './image.js'
 import type { PixelUpscaleLevel, PixelUpscaleTarget } from './image.js'
 import { ImageNamingError, nameImage, sanitizeImageName } from './image-naming.js'
+import { TITLE_PROMPT_PURPOSE, builtinTitlePrompt, generateTitles } from './title-generation.js'
+import { LlmChatError } from './llm-chat.js'
 import { builtinPrompts } from './prompts.js'
 
 declare const process: { env: Record<string, string | undefined>; argv: string[]; exitCode?: number }
@@ -20,8 +22,8 @@ export type JobMode = 'generate' | 'edit' | 'text_to_image' | 'one_to_many'
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
 export type PromptWindow = { id?: string | number; name?: string; prompt: string; enabled?: boolean }
 export type JobResult = { path: string; index: number; name?: string }
-export type Prompt = { id: string; category: string; title: string; text: string; layout: string; builtin: boolean; sourceName: string }
-type PromptFields = { title: string; category: string; text: string; layout?: string }
+export type Prompt = { id: string; category: string; title: string; text: string; layout: string; purpose: string; builtin: boolean; sourceName: string }
+type PromptFields = { title: string; category: string; text: string; layout?: string; purpose?: string }
 export type AppStats = { completed: number; running: number; review: number; failed: number; total: number; storageBytes: number }
 export type SourceImage = { data: string; mimeType: string; name: string }
 export type Job = {
@@ -167,7 +169,14 @@ function promptFields(value: Record<string, unknown>): PromptFields {
     : typeof rawLayout === 'string'
       ? rawLayout.trim()
       : (() => { throw new RequestValidationError('invalid_prompt', '布局必须是字符串') })()
-  return { title: required('title', '标题'), category: required('category', '分类'), text: required('text', '正文'), layout }
+  const rawPurpose = value.purpose
+  // 用途决定提示词出现在生图工作台还是标题生成页，未指定时按生图处理。
+  const purpose = rawPurpose === undefined || rawPurpose === null || rawPurpose === ''
+    ? 'generation'
+    : rawPurpose === 'generation' || rawPurpose === TITLE_PROMPT_PURPOSE
+      ? rawPurpose
+      : (() => { throw new RequestValidationError('invalid_prompt', '用途只能是 generation 或 title') })()
+  return { title: required('title', '标题'), category: required('category', '分类'), text: required('text', '正文'), layout, purpose }
 }
 function batchIdValue(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined
@@ -245,11 +254,13 @@ export class JobStore {
     this.db = new DatabaseSync(dbPath)
     this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE, mode TEXT NOT NULL, status TEXT NOT NULL, windows_json TEXT, provider_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, cancelled_at TEXT, request_json TEXT, results_json TEXT, error_json TEXT, provider_id TEXT);`)
     for (const column of ['request_json TEXT', 'results_json TEXT', 'error_json TEXT', 'provider_id TEXT']) { try { this.db.exec(`ALTER TABLE jobs ADD COLUMN ${column}`) } catch { /* 兼容已包含列的旧数据库 */ } }
-    this.db.exec('CREATE TABLE IF NOT EXISTS prompts (id TEXT PRIMARY KEY, category TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, layout TEXT NOT NULL, builtin INTEGER NOT NULL, source_name TEXT NOT NULL, customized INTEGER NOT NULL DEFAULT 0)')
+    this.db.exec('CREATE TABLE IF NOT EXISTS prompts (id TEXT PRIMARY KEY, category TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, layout TEXT NOT NULL, purpose TEXT NOT NULL DEFAULT \'generation\', builtin INTEGER NOT NULL, source_name TEXT NOT NULL, customized INTEGER NOT NULL DEFAULT 0)')
     try { this.db.exec('ALTER TABLE prompts ADD COLUMN customized INTEGER NOT NULL DEFAULT 0') } catch { /* 兼容已包含该列的旧数据库 */ }
-    const seedPrompt = this.db.prepare('INSERT OR IGNORE INTO prompts (id, category, title, text, layout, builtin, source_name, customized) VALUES (?, ?, ?, ?, ?, ?, ?, 0)')
+    try { this.db.exec('ALTER TABLE prompts ADD COLUMN purpose TEXT NOT NULL DEFAULT \'generation\'') } catch { /* 兼容已包含该列的旧数据库 */ }
+    const seedPrompt = this.db.prepare('INSERT OR IGNORE INTO prompts (id, category, title, text, layout, purpose, builtin, source_name, customized) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)')
     // 提示词随数据库首次初始化写入，后续启动只补齐缺失项，不覆盖用户已有记录。
-    for (const prompt of builtinPrompts) seedPrompt.run(prompt.id, prompt.category, prompt.title, prompt.text, prompt.layout, prompt.builtin ? 1 : 0, prompt.sourceName)
+    for (const prompt of builtinPrompts) seedPrompt.run(prompt.id, prompt.category, prompt.title, prompt.text, prompt.layout, 'generation', prompt.builtin ? 1 : 0, prompt.sourceName)
+    seedPrompt.run(builtinTitlePrompt.id, builtinTitlePrompt.category, builtinTitlePrompt.title, builtinTitlePrompt.text, builtinTitlePrompt.layout, builtinTitlePrompt.purpose, 1, builtinTitlePrompt.sourceName)
     const migratePrompt = this.db.prepare(`UPDATE prompts
       SET category = ?, title = ?, text = ?, layout = ?, source_name = ?
       WHERE id = ? AND builtin = 1
@@ -423,24 +434,24 @@ export class JobStore {
     else this.db.prepare('INSERT INTO model_providers (id, name, base_url, api_key, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)').run('legacy-default', '默认供应商', config.baseUrl, config.apiKey, now(), now())
   }
   prompts(): Prompt[] {
-    return (this.db.prepare('SELECT id, category, title, text, layout, builtin, source_name FROM prompts ORDER BY rowid').all() as Record<string, unknown>[]).map((row) => ({
-      id: String(row.id), category: String(row.category), title: String(row.title), text: String(row.text), layout: String(row.layout), builtin: Number(row.builtin) === 1, sourceName: String(row.source_name),
+    return (this.db.prepare('SELECT id, category, title, text, layout, purpose, builtin, source_name FROM prompts ORDER BY rowid').all() as Record<string, unknown>[]).map((row) => ({
+      id: String(row.id), category: String(row.category), title: String(row.title), text: String(row.text), layout: String(row.layout), purpose: String(row.purpose), builtin: Number(row.builtin) === 1, sourceName: String(row.source_name),
     }))
   }
   getPrompt(id: string): Prompt | undefined {
-    const row = this.db.prepare('SELECT id, category, title, text, layout, builtin, source_name FROM prompts WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    const row = this.db.prepare('SELECT id, category, title, text, layout, purpose, builtin, source_name FROM prompts WHERE id = ?').get(id) as Record<string, unknown> | undefined
     if (!row) return undefined
-    return { id: String(row.id), category: String(row.category), title: String(row.title), text: String(row.text), layout: String(row.layout), builtin: Number(row.builtin) === 1, sourceName: String(row.source_name) }
+    return { id: String(row.id), category: String(row.category), title: String(row.title), text: String(row.text), layout: String(row.layout), purpose: String(row.purpose), builtin: Number(row.builtin) === 1, sourceName: String(row.source_name) }
   }
   createPrompt(fields: PromptFields): Prompt {
     const id = `prompt_${randomUUID()}`
-    this.db.prepare('INSERT INTO prompts (id, category, title, text, layout, builtin, source_name, customized) VALUES (?, ?, ?, ?, ?, 0, ?, 0)').run(id, fields.category, fields.title, fields.text, fields.layout ?? '', '用户自定义')
+    this.db.prepare('INSERT INTO prompts (id, category, title, text, layout, purpose, builtin, source_name, customized) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0)').run(id, fields.category, fields.title, fields.text, fields.layout ?? '', fields.purpose ?? 'generation', '用户自定义')
     return this.getPrompt(id)!
   }
   updatePrompt(id: string, fields: PromptFields): Prompt | undefined {
     if (!this.getPrompt(id)) return undefined
     // 内置提示词允许编辑，但标记为用户修改，后续内置迁移不得覆盖本次保存结果。
-    this.db.prepare('UPDATE prompts SET category = ?, title = ?, text = ?, layout = ?, customized = 1 WHERE id = ?').run(fields.category, fields.title, fields.text, fields.layout ?? '', id)
+    this.db.prepare('UPDATE prompts SET category = ?, title = ?, text = ?, layout = ?, purpose = ?, customized = 1 WHERE id = ?').run(fields.category, fields.title, fields.text, fields.layout ?? '', fields.purpose ?? 'generation', id)
     return this.getPrompt(id)
   }
   deletePrompt(id: string): boolean {
@@ -840,6 +851,36 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       if (providers.length <= 1) { errorResponse(res, 409, 'llm_provider_last_one', '至少保留一个 LLM 供应商'); return }
       if (existing.enabled) { errorResponse(res, 409, 'llm_provider_enabled', '请先启用其他 LLM 供应商，再删除当前供应商'); return }
       store.deleteLlmProvider(id); res.writeHead(204); res.end()
+      return
+    }
+    if (req.method === 'POST' && path === '/api/title-generation') {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      const provider = store.activeLlmProvider()
+      if (!provider) { errorResponse(res, 409, 'llm_not_configured', '未配置启用的 LLM 供应商，请先在模型设置中配置'); return }
+      let promptId: string | undefined
+      let bytes: Uint8Array
+      try {
+        const item = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
+        promptId = optionalString(item.promptId, 'prompt_id')
+        const image = item.image && typeof item.image === 'object' && !Array.isArray(item.image) ? item.image as Record<string, unknown> : {}
+        const data = typeof image.data === 'string' ? image.data : ''
+        if (!data) throw new RequestValidationError('invalid_source_image', '缺少图片数据')
+        bytes = Uint8Array.from(Buffer.from(data, 'base64'))
+        if (bytes.byteLength === 0) throw new RequestValidationError('invalid_source_image', '图片数据为空')
+      } catch (error) { if (error instanceof RequestValidationError) errorResponse(res, 400, error.code, error.message); else errorResponse(res, 400, 'invalid_source_image', '图片数据无法解析'); return }
+      const prompt = promptId ? store.getPrompt(promptId) : undefined
+      if (!prompt || prompt.purpose !== TITLE_PROMPT_PURPOSE) { errorResponse(res, 404, 'title_prompt_not_found', '标题提示词不存在'); return }
+      try {
+        const titles = await generateTitles({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: provider.model }, prompt.text, bytes)
+        // 标题生成与图片命名共用同一个 LLM 供应商的成功/失败统计（见 ADR 0008）。
+        store.recordLlmOutcome(provider.id, 'completed')
+        json(res, 200, { titles })
+      } catch (error) {
+        store.recordLlmOutcome(provider.id, 'failed')
+        if (error instanceof LlmChatError) { errorResponse(res, 502, error.code, error.message); return }
+        errorResponse(res, 500, 'internal_error', '标题生成失败')
+      }
       return
     }
     const providerMatch = path.match(/^\/api\/providers\/([^/]+)(?:\/(enable))?$/)

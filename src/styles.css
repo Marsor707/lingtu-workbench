@@ -474,3 +474,44 @@ h1 { font-size: clamp(25px, 2.2vw, 33px); line-height: 1.18; letter-spacing: -.4
   .sheet-body { padding: 18px 16px; }
   .sheet-footer { padding: 12px 16px; }
 }
+
+/* ── 标题生成页（规范见 design-system/lingtu-workbench/pages/title-generation.md） ── */
+/* 提示词库工具栏复用 .prompt-layout 的列宽，让搜索框与下方提示词卡片左对齐。 */
+.prompt-toolbar { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 15px; align-items: center; }
+.prompt-toolbar .filter-tabs { flex-wrap: wrap; }
+.title-generation-setup { margin-bottom: 16px; padding: 20px 22px; }
+.title-generation-grid { display: grid; grid-template-columns: 1.55fr 1.15fr .7fr 1.2fr; gap: 14px; align-items: start; }
+/* 文件夹选择做成与输入框同高同描边的控件，避免与相邻字段错位。 */
+.title-generation-folder { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px; padding: 0 10px; color: var(--muted); border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface); font-size: 11px; text-align: left; cursor: pointer; transition: border-color 160ms ease, background 160ms ease; }
+.title-generation-folder:hover:not(:disabled) { border-color: #6fa988; }
+.title-generation-folder.has-files { color: var(--text); }
+.title-generation-folder:disabled { color: var(--muted-2); cursor: not-allowed; background: var(--surface-soft); }
+.title-generation-folder svg { flex: 0 0 auto; }
+.title-generation-folder span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.title-generation-inline-empty { display: flex; align-items: center; gap: 8px; min-height: 36px; color: var(--muted); font-size: 11px; }
+.title-generation-provider { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-soft); }
+.title-generation-provider strong { font-size: 11px; }
+.title-generation-provider span { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.title-generation-provider svg { flex: 0 0 auto; color: var(--orange); }
+.title-generation-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.title-generation-error { margin-top: 12px; padding: 10px 12px; border: 1px solid #efb1aa; border-radius: 6px; background: #fff7f6; }
+.title-generation-metrics { margin-top: 18px; margin-bottom: 0; }
+.title-generation-progress { margin-top: 16px; }
+.title-generation-note { margin-top: 9px; color: var(--muted); font-size: 10px; }
+.title-generation-tag { padding: 4px 6px; color: var(--muted); border-radius: 4px; background: var(--surface-soft); font: 9px var(--mono); }
+.title-generation-workspace { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: 15px; }
+.title-generation-panel { min-height: 420px; padding: 20px 22px; }
+.title-generation-log-list { display: grid; align-content: start; gap: 8px; max-height: 520px; overflow: auto; }
+.title-generation-log { padding: 9px 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 6px; background: var(--surface); font-size: 11px; line-height: 1.55; word-break: break-word; }
+.title-generation-log strong { display: block; margin-bottom: 3px; color: var(--muted-2); font: 9px var(--mono); }
+.title-generation-log.is-success { color: #37674f; border-color: #a7d5b9; background: #f4fbf7; }
+.title-generation-log.is-error { color: var(--red); border-color: #efb1aa; background: #fff7f6; }
+.title-generation-table-scroll { overflow: auto; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
+.title-generation-table { width: 100%; min-width: 960px; border-collapse: collapse; }
+.title-generation-table th, .title-generation-table td { padding: 9px 11px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; font-size: 11px; line-height: 1.55; }
+.title-generation-table th { position: sticky; top: 0; z-index: 1; color: var(--muted-2); background: var(--surface-raised); font: 9px var(--mono); letter-spacing: .4px; }
+.title-generation-table tr:last-child td { border-bottom: 0; }
+.title-generation-table td:first-child { color: var(--muted); font-size: 10px; white-space: nowrap; }
+
+@media (max-width: 1100px) { .title-generation-workspace { grid-template-columns: 1fr; } .title-generation-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 760px) { .title-generation-grid { grid-template-columns: 1fr; } .title-generation-panel { min-height: 320px; padding: 17px 15px; } .prompt-toolbar { grid-template-columns: 1fr; } }
