@@ -906,6 +906,8 @@ function App() {
     try {
       const submitSize = customSizeEnabled && customRatioValidation.size ? customRatioValidation.size : size
       const filesToSubmit: Array<File | undefined> = mode === 'edit' ? sourceFiles : [undefined]
+      // 一次「开始任务」属于同一个提交批次，批次内所有任务共享一个结果文件夹。
+      const batchId = `batch_${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
       let submittedCount = 0
       let failedCount = 0
       let firstError = ''
@@ -929,6 +931,7 @@ function App() {
               repeat,
               pixelUpscale,
               sourceImage,
+              batchId,
               idempotencyKey: `lingtu-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
             }),
           })

@@ -592,6 +592,67 @@ test('失败或取消任务可沿用原 ID 重试并重新完成', async () => {
   }
 })
 
+test('同一提交批次的多个任务共享结果文件夹，重试仍写回原文件夹', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-batch-workspace-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  let failedAttempts = 0
+  const mockGenerate = async ({ prompt }) => {
+    if (prompt.startsWith('批次失败') && failedAttempts === 0) {
+      failedAttempts += 1
+      throw new Error('mock provider failure')
+    }
+    return { kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' }
+  }
+  const server = await startServer(0, '127.0.0.1', store, { workspaceDir: directory, generateImage: mockGenerate })
+  const base = `http://127.0.0.1:${server.address().port}`
+  const batchId = 'batch_test_001'
+  try {
+    const create = async (prompt) => {
+      const response = await fetch(`${base}/api/jobs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: 'text_to_image', prompt, batchId, provider: { baseUrl: 'https://provider.invalid', apiKey: 'secret' } }),
+      })
+      assert.equal(response.status, 201)
+      return response.json()
+    }
+
+    const invalidResponse = await fetch(`${base}/api/jobs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'text_to_image', prompt: '非法批次', batchId: '../escape' }),
+    })
+    assert.equal(invalidResponse.status, 400)
+    assert.equal((await invalidResponse.json()).error.code, 'invalid_batch_id')
+
+    const first = await create('批次任务一')
+    const second = await create('批次任务二')
+    assert.match(await (await fetch(`${base}/api/jobs/${first.id}/events`)).text(), /event: completed/)
+    assert.match(await (await fetch(`${base}/api/jobs/${second.id}/events`)).text(), /event: completed/)
+    const firstDetail = await (await fetch(`${base}/api/jobs/${first.id}`)).json()
+    const secondDetail = await (await fetch(`${base}/api/jobs/${second.id}`)).json()
+    assert.equal(firstDetail.results[0].path, `jobs/${batchId}/${first.id}-001.png`)
+    assert.equal(secondDetail.results[0].path, `jobs/${batchId}/${second.id}-001.png`)
+    assert.deepEqual(readdirSync(join(directory, 'jobs', batchId)).sort(), [`${first.id}-001.png`, `${second.id}-001.png`])
+    assert.equal(store.request(first.id)?.batchId, batchId)
+
+    const failed = await create('批次失败')
+    assert.match(await (await fetch(`${base}/api/jobs/${failed.id}/events`)).text(), /event: failed/)
+    // 模拟用户手工删除批次文件夹后重试，文件夹应被重建并继续接收本轮结果。
+    rmSync(join(directory, 'jobs', batchId), { recursive: true, force: true })
+    const retryResponse = await fetch(`${base}/api/jobs/${failed.id}/retry`, { method: 'POST' })
+    assert.equal(retryResponse.status, 200)
+    assert.match(await (await fetch(`${base}/api/jobs/${failed.id}/events`)).text(), /event: completed/)
+    const retryDetail = await (await fetch(`${base}/api/jobs/${failed.id}`)).json()
+    assert.equal(retryDetail.results[0].path, `jobs/${batchId}/${failed.id}-001.png`)
+    assert.deepEqual(readdirSync(join(directory, 'jobs', batchId)), [`${failed.id}-001.png`])
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
 test('任务元数据可从 SQLite 跨实例回读', () => {
   const directory = mkdtempSync(join(tmpdir(), 'lingtu-server-'))
   const dbPath = join(directory, 'jobs.db')
@@ -799,8 +860,8 @@ test('Mock Provider 完成异步生图、SSE 推送并将 base64 结果落盘', 
     const detail = await detailResponse.json()
     assert.equal(detail.status, 'completed')
     assert.equal(detail.results.length, 2)
-    assert.deepEqual(detail.results.map((result) => result.path), [`jobs/${created.id}-001.png`, `jobs/${created.id}-002.png`])
-    assert.deepEqual(readdirSync(join(directory, 'jobs')).sort(), [`${created.id}-001.png`, `${created.id}-002.png`])
+    assert.deepEqual(detail.results.map((result) => result.path), [`jobs/${created.id}/${created.id}-001.png`, `jobs/${created.id}/${created.id}-002.png`])
+    assert.deepEqual(readdirSync(join(directory, 'jobs', created.id)).sort(), [`${created.id}-001.png`, `${created.id}-002.png`])
     assert.equal(readFileSync(join(directory, detail.results[0].path), 'utf8'), 'fake-image')
     const resultResponse = await fetch(`${mockBaseUrl}/api/jobs/${created.id}/results/0`)
     assert.equal(resultResponse.status, 200)
@@ -903,13 +964,13 @@ test('启用 LLM 图片命名后使用视觉模型名称落盘，失败回退原
     await (await fetch(`${base}/api/jobs/${first.id}/events`)).text()
     const firstDetail = await (await fetch(`${base}/api/jobs/${first.id}`)).json()
     assert.equal(firstDetail.results[0].name, '花卉浴室套装')
-    assert.equal(firstDetail.results[0].path, 'jobs/花卉浴室套装.png')
+    assert.equal(firstDetail.results[0].path, `jobs/${first.id}/花卉浴室套装.png`)
     assert.equal(readFileSync(join(directory, firstDetail.results[0].path), 'utf8'), 'fake-image')
     const second = await createJob('命名失败')
     await (await fetch(`${base}/api/jobs/${second.id}/events`)).text()
     const secondDetail = await (await fetch(`${base}/api/jobs/${second.id}`)).json()
     assert.equal(secondDetail.results[0].name, undefined)
-    assert.match(secondDetail.results[0].path, new RegExp(`jobs/${second.id}-001\\.png`))
+    assert.match(secondDetail.results[0].path, new RegExp(`jobs/${second.id}/${second.id}-001\\.png`))
     const llmProviders = await (await fetch(`${base}/api/llm-providers`)).json()
     assert.deepEqual({ success: llmProviders.items[0].successCount, failure: llmProviders.items[0].failureCount }, { success: 1, failure: 1 })
     assert.equal(JSON.stringify(firstDetail).includes('llm-secret'), false)

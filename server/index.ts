@@ -35,9 +35,9 @@ export type ModelProvider = { id: string; name: string; baseUrl: string; configu
 type StoredProvider = ModelProvider & { apiKey: string }
 export type LlmProvider = { id: string; name: string; baseUrl: string; model: string; configured: boolean; enabled: boolean; successCount: number; failureCount: number; createdAt: string; updatedAt: string }
 type StoredLlmProvider = LlmProvider & { apiKey: string }
-type JobInput = { mode?: unknown; idempotencyKey?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; resolution?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown; maxConcurrency?: unknown; pixelUpscale?: unknown; imageNamingEnabled?: unknown }
+type JobInput = { mode?: unknown; idempotencyKey?: unknown; batchId?: unknown; windows?: unknown; promptWindows?: unknown; prompt?: unknown; layout?: unknown; size?: unknown; resolution?: unknown; quality?: unknown; repeat?: unknown; provider?: unknown; sourceImage?: unknown; maxConcurrency?: unknown; pixelUpscale?: unknown; imageNamingEnabled?: unknown }
 // 旧任务 JSON 里保存的是 pixelUpscale4K 布尔；读取时统一归一为三态。
-type StoredRequest = { prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; pixelUpscale: PixelUpscaleLevel; imageNamingEnabled: boolean; provider: ProviderConfig; providerId?: string; sourceImage?: SourceImage; llmProvider?: { baseUrl: string; apiKey: string; model: string }; llmProviderId?: string }
+type StoredRequest = { prompt?: string; layout?: string; size?: string; resolution?: string; quality?: string; repeat: number; pixelUpscale: PixelUpscaleLevel; imageNamingEnabled: boolean; provider: ProviderConfig; providerId?: string; batchId?: string; sourceImage?: SourceImage; llmProvider?: { baseUrl: string; apiKey: string; model: string }; llmProviderId?: string }
 type Runtime = { controller: AbortController; listeners: Set<HttpResponse> }
 type GenerateImage = typeof generateImage
 type EditImage = typeof editImage
@@ -120,11 +120,15 @@ function appendExecutionLog(workspaceDir: string, event: string, fields: Record<
     // 日志属于旁路诊断能力，目录不可写时不能改变任务本身的成功或失败结果。
   }
 }
-function uniqueImagePath(workspaceDir: string, stem: string): string {
+function resultDirectory(id: string, batchId?: string): string {
+  // 一次提交批次共用一个文件夹；历史任务没有批次标识时退回任务自身作为目录。
+  return join(RESULTS_DIRECTORY, batchId ?? id).replaceAll('\\', '/')
+}
+function uniqueImagePath(workspaceDir: string, directory: string, stem: string): string {
   let suffix = 1
   while (true) {
     const candidateStem = suffix === 1 ? stem : `${stem} (${suffix})`
-    const relativePath = join(RESULTS_DIRECTORY, `${candidateStem}.png`).replaceAll('\\', '/')
+    const relativePath = `${directory}/${candidateStem}.png`
     if (!existsSync(join(workspaceDir, relativePath))) return relativePath
     suffix += 1
   }
@@ -158,6 +162,12 @@ function promptFields(value: Record<string, unknown>): PromptFields {
       ? rawLayout.trim()
       : (() => { throw new RequestValidationError('invalid_prompt', '布局必须是字符串') })()
   return { title: required('title', '标题'), category: required('category', '分类'), text: required('text', '正文'), layout }
+}
+function batchIdValue(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
+  // 批次标识会作为目录名直接落盘，只允许文件系统安全的字符集，避免路径穿越。
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,72}$/.test(value)) throw new RequestValidationError('invalid_batch_id', 'batchId 必须是 1 到 72 位的字母、数字、下划线或连字符')
+  return value
 }
 function repeatValue(value: unknown): number { if (value === undefined) return 1; if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 100) throw new RequestValidationError('invalid_repeat', 'repeat 必须是 1 到 100 的整数'); return value as number }
 function booleanValue(value: unknown, fallback: boolean, field: string, label: string): boolean { if (value === undefined) return fallback; if (typeof value !== 'boolean') throw new RequestValidationError(`invalid_${field}`, `${label} 必须是布尔值`); return value }
@@ -268,8 +278,9 @@ export class JobStore {
     if (mode === 'edit' && !sourceImage) throw new RequestValidationError('invalid_source_image', 'edit 模式必须提供 sourceImage')
     if (mode === 'edit' && !prompt) throw new RequestValidationError('invalid_prompt', 'edit 模式必须提供 prompt')
     const imageNamingEnabled = booleanValue(input.imageNamingEnabled, this.getImageNamingEnabled(), 'image_naming_enabled', 'imageNamingEnabled')
+    const batchId = batchIdValue(input.batchId)
     const activeLlm = imageNamingEnabled ? this.activeLlmProvider() : undefined
-    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), resolution: optionalString(input.resolution, 'resolution'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), pixelUpscale: pixelUpscaleLevelValue(input.pixelUpscale, this.getPixelUpscaleLevel(), 'pixel_upscale', 'pixelUpscale'), imageNamingEnabled, provider: providerConfig(input.provider, { ...this.activeProviderConfig(), ...this.getProviderConfig(), ...defaults }), ...(providerId ? { providerId } : {}), ...(activeLlm ? { llmProviderId: activeLlm.id, llmProvider: { baseUrl: activeLlm.baseUrl, apiKey: activeLlm.apiKey, model: activeLlm.model } } : {}), ...(sourceImage ? { sourceImage } : {}) }
+    const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), resolution: optionalString(input.resolution, 'resolution'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), pixelUpscale: pixelUpscaleLevelValue(input.pixelUpscale, this.getPixelUpscaleLevel(), 'pixel_upscale', 'pixelUpscale'), imageNamingEnabled, provider: providerConfig(input.provider, { ...this.activeProviderConfig(), ...this.getProviderConfig(), ...defaults }), ...(providerId ? { providerId } : {}), ...(batchId ? { batchId } : {}), ...(activeLlm ? { llmProviderId: activeLlm.id, llmProvider: { baseUrl: activeLlm.baseUrl, apiKey: activeLlm.apiKey, model: activeLlm.model } } : {}), ...(sourceImage ? { sourceImage } : {}) }
     const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.resolution ? { resolution: request.resolution } : {}), ...(request.quality ? { quality: request.quality } : {}), ...(request.pixelUpscale !== 'off' ? { pixelUpscale: request.pixelUpscale } : {}), ...(request.imageNamingEnabled ? { imageNamingEnabled: true } : {}), repeat: request.repeat, ...(request.providerId ? { providerId: request.providerId } : {}), ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
     const persistedRequest = { ...request, provider: { baseUrl: request.provider.baseUrl, apiKey: '' }, ...(request.llmProvider ? { llmProvider: { baseUrl: request.llmProvider.baseUrl, model: request.llmProvider.model, apiKey: '' } } : {}) }
     this.db.prepare('INSERT INTO jobs (id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, request_json, provider_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(job.id, idempotencyKey ?? null, job.mode, job.status, job.windows ? JSON.stringify(job.windows) : null, JSON.stringify(job.provider), job.createdAt, job.updatedAt, JSON.stringify(persistedRequest), request.providerId ?? null)
@@ -562,8 +573,8 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     const total = prompts.length * request.repeat; const results: JobResult[] = []
     let providerStage: 'request' | 'materialize' | undefined
     try {
-      // 所有结果平铺到统一目录；未启用命名时使用任务 ID 作为稳定回退名称。
-      mkdirSync(join(workspaceDir, RESULTS_DIRECTORY), { recursive: true })
+      // 同一个提交批次的结果共用一个文件夹；未启用命名时使用任务 ID 作为稳定回退名称。
+      const directory = resultDirectory(id, request.batchId)
       for (const prompt of prompts) for (let repeatIndex = 0; repeatIndex < request.repeat; repeatIndex += 1) {
         if (runtime.controller.signal.aborted) throw new DOMException('任务已取消', 'AbortError')
         // 页面关闭或服务重启后，任务仍可从本地 Provider 配置恢复执行凭据。
@@ -625,7 +636,9 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
             }
           }
         }
-        const relativePath = uniqueImagePath(workspaceDir, outputStem)
+        // 落盘前才建目录，失败任务不留空文件夹，重试时被删除的批次文件夹也会自动重建。
+        mkdirSync(join(workspaceDir, directory), { recursive: true })
+        const relativePath = uniqueImagePath(workspaceDir, directory, outputStem)
         writeFileSync(join(workspaceDir, relativePath), imageBytes)
         results.push({ path: relativePath, index, ...(imageName ? { name: imageName } : {}) })
         providerStage = undefined
