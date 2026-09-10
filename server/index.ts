@@ -4,7 +4,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFil
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { isSea } from 'node:sea'
-import { editImage, generateImage, materializeImageResult, ProviderError } from './provider.js'
+import { DEFAULT_IMAGE_MODEL, IMAGE_MODELS, editImage, generateImage, isImageModel, materializeImageResult, ProviderError } from './provider.js'
 import type { GenerationResult } from './provider.js'
 import { pixelUpscale as pixelUpscaleImage } from './image.js'
 import type { PixelUpscaleLevel, PixelUpscaleTarget } from './image.js'
@@ -30,8 +30,8 @@ export type Job = {
   provider: { status: 'not_implemented' | 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'; invoked: boolean }
   createdAt: string; updatedAt: string; cancelledAt?: string
 }
-type ProviderConfig = { baseUrl: string; apiKey: string }
-export type ModelProvider = { id: string; name: string; baseUrl: string; configured: boolean; enabled: boolean; successCount: number; failureCount: number; createdAt: string; updatedAt: string }
+type ProviderConfig = { baseUrl: string; apiKey: string; model?: string }
+export type ModelProvider = { id: string; name: string; baseUrl: string; model: string; configured: boolean; enabled: boolean; successCount: number; failureCount: number; createdAt: string; updatedAt: string }
 type StoredProvider = ModelProvider & { apiKey: string }
 export type LlmProvider = { id: string; name: string; baseUrl: string; model: string; configured: boolean; enabled: boolean; successCount: number; failureCount: number; createdAt: string; updatedAt: string }
 type StoredLlmProvider = LlmProvider & { apiKey: string }
@@ -148,6 +148,12 @@ function validWindows(value: unknown): PromptWindow[] | undefined {
   return value.filter((window): window is PromptWindow => { if (!window || typeof window !== 'object') return false; const item = window as Record<string, unknown>; return typeof item.prompt === 'string' && item.prompt.trim().length > 0 && item.enabled !== false }).map((window) => ({ id: typeof window.id === 'string' || typeof window.id === 'number' ? window.id : undefined, name: typeof window.name === 'string' ? window.name : undefined, prompt: window.prompt.trim(), enabled: window.enabled !== false }))
 }
 function optionalString(value: unknown, field: string): string | undefined { if (value === undefined || value === null) return undefined; if (typeof value !== 'string' || value.trim() === '') throw new RequestValidationError(`invalid_${field}`, `${field} 必须是非空字符串`); return value.trim() }
+// 生图模型只接受白名单值；字段缺省时返回 undefined，由调用方决定是沿用旧值还是回落默认值。
+function providerModel(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string' || !isImageModel(value.trim())) throw new RequestValidationError('invalid_provider_model', `生图模型仅支持 ${IMAGE_MODELS.join('、')}`)
+  return value.trim()
+}
 function promptFields(value: Record<string, unknown>): PromptFields {
   // 提示词的标题、分类和正文是可复用资产的最小完整信息，布局只作为生图高级参数的可选默认值。
   const required = (field: string, label: string): string => {
@@ -220,6 +226,8 @@ function providerConfig(value: unknown, defaults: Partial<ProviderConfig>): Prov
     // 后端环境变量是最终生效配置；请求体只在未配置环境变量时作为兼容回退。
     baseUrl: env.baseUrl ?? optionalString(item.baseUrl ?? defaults.baseUrl, 'provider_base_url') ?? '',
     apiKey: env.apiKey ?? optionalString(item.apiKey ?? defaults.apiKey, 'provider_api_key') ?? '',
+    // 生图模型随任务快照固化；已有配置和历史任务没有该字段时回落到默认生图模型。
+    model: providerModel(item.model) ?? defaults.model ?? DEFAULT_IMAGE_MODEL,
   }
 }
 function effectiveProviderMetadata(store: JobStore): { baseUrl: string; configured: boolean } {
@@ -250,7 +258,9 @@ export class JobStore {
     // 仅迁移未被用户编辑且仍含旧输出契约的内置记录，避免启动时覆盖人工修改。
     for (const prompt of builtinPrompts) migratePrompt.run(prompt.category, prompt.title, prompt.text, prompt.layout, prompt.sourceName, prompt.id)
     this.db.exec('CREATE TABLE IF NOT EXISTS provider_config (id INTEGER PRIMARY KEY CHECK (id = 1), base_url TEXT NOT NULL, api_key TEXT NOT NULL, updated_at TEXT NOT NULL)')
-    this.db.exec('CREATE TABLE IF NOT EXISTS model_providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
+    this.db.exec('CREATE TABLE IF NOT EXISTS model_providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, model TEXT NOT NULL DEFAULT \'gpt-image-2\', enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
+    // 旧数据库的供应商表没有生图模型列，补列时用默认模型初始化已有供应商。
+    try { this.db.exec('ALTER TABLE model_providers ADD COLUMN model TEXT NOT NULL DEFAULT \'gpt-image-2\'') } catch { /* 兼容已包含该列的旧数据库 */ }
     this.db.exec('CREATE TABLE IF NOT EXISTS llm_providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, model TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)), success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')
     this.db.exec('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)')
     this.migrateLegacyProvider()
@@ -282,7 +292,7 @@ export class JobStore {
     const activeLlm = imageNamingEnabled ? this.activeLlmProvider() : undefined
     const request: StoredRequest = { prompt, layout: optionalString(input.layout, 'layout'), size: optionalString(input.size, 'size'), resolution: optionalString(input.resolution, 'resolution'), quality: optionalString(input.quality, 'quality'), repeat: repeatValue(input.repeat), pixelUpscale: pixelUpscaleLevelValue(input.pixelUpscale, this.getPixelUpscaleLevel(), 'pixel_upscale', 'pixelUpscale'), imageNamingEnabled, provider: providerConfig(input.provider, { ...this.activeProviderConfig(), ...this.getProviderConfig(), ...defaults }), ...(providerId ? { providerId } : {}), ...(batchId ? { batchId } : {}), ...(activeLlm ? { llmProviderId: activeLlm.id, llmProvider: { baseUrl: activeLlm.baseUrl, apiKey: activeLlm.apiKey, model: activeLlm.model } } : {}), ...(sourceImage ? { sourceImage } : {}) }
     const timestamp = now(); const job: Job = { id: `job_${randomUUID()}`, mode, status: 'queued', ...(idempotencyKey ? { idempotencyKey } : {}), ...(request.prompt ? { prompt: request.prompt } : {}), ...(request.layout ? { layout: request.layout } : {}), ...(request.size ? { size: request.size } : {}), ...(request.resolution ? { resolution: request.resolution } : {}), ...(request.quality ? { quality: request.quality } : {}), ...(request.pixelUpscale !== 'off' ? { pixelUpscale: request.pixelUpscale } : {}), ...(request.imageNamingEnabled ? { imageNamingEnabled: true } : {}), repeat: request.repeat, ...(request.providerId ? { providerId: request.providerId } : {}), ...(windows ? { windows } : {}), provider: { status: request.prompt || windows ? 'pending' : 'not_implemented', invoked: false }, createdAt: timestamp, updatedAt: timestamp }
-    const persistedRequest = { ...request, provider: { baseUrl: request.provider.baseUrl, apiKey: '' }, ...(request.llmProvider ? { llmProvider: { baseUrl: request.llmProvider.baseUrl, model: request.llmProvider.model, apiKey: '' } } : {}) }
+    const persistedRequest = { ...request, provider: { baseUrl: request.provider.baseUrl, apiKey: '', model: request.provider.model }, ...(request.llmProvider ? { llmProvider: { baseUrl: request.llmProvider.baseUrl, model: request.llmProvider.model, apiKey: '' } } : {}) }
     this.db.prepare('INSERT INTO jobs (id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, request_json, provider_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(job.id, idempotencyKey ?? null, job.mode, job.status, job.windows ? JSON.stringify(job.windows) : null, JSON.stringify(job.provider), job.createdAt, job.updatedAt, JSON.stringify(persistedRequest), request.providerId ?? null)
     this.runtimeProviders.set(job.id, request.provider)
     return { job, created: true }
@@ -293,38 +303,40 @@ export class JobStore {
     return row?.base_url && row.api_key ? { baseUrl: String(row.base_url), apiKey: String(row.api_key) } : undefined
   }
   private providerFromRow(row: Record<string, unknown>): StoredProvider {
-    return { id: String(row.id), name: String(row.name), baseUrl: String(row.base_url), apiKey: String(row.api_key), configured: Boolean(String(row.api_key)), enabled: Number(row.enabled) === 1, successCount: Number(row.success_count ?? 0), failureCount: Number(row.failure_count ?? 0), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }
+    return { id: String(row.id), name: String(row.name), baseUrl: String(row.base_url), apiKey: String(row.api_key), model: String(row.model ?? DEFAULT_IMAGE_MODEL), configured: Boolean(String(row.api_key)), enabled: Number(row.enabled) === 1, successCount: Number(row.success_count ?? 0), failureCount: Number(row.failure_count ?? 0), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }
   }
   listProviders(): ModelProvider[] {
     // 启用状态只影响标识和任务路由，列表始终保持供应商首次添加的顺序。
-    return (this.db.prepare('SELECT id, name, base_url, api_key, enabled, success_count, failure_count, created_at, updated_at FROM model_providers ORDER BY rowid ASC').all() as Record<string, unknown>[]).map((row) => {
+    return (this.db.prepare('SELECT id, name, base_url, api_key, model, enabled, success_count, failure_count, created_at, updated_at FROM model_providers ORDER BY rowid ASC').all() as Record<string, unknown>[]).map((row) => {
       const provider = this.providerFromRow(row)
       const { apiKey: _apiKey, ...publicProvider } = provider
       return publicProvider
     })
   }
   getProvider(id: string): StoredProvider | undefined {
-    const row = this.db.prepare('SELECT id, name, base_url, api_key, enabled, success_count, failure_count, created_at, updated_at FROM model_providers WHERE id = ?').get(id) as Record<string, unknown> | undefined
+    const row = this.db.prepare('SELECT id, name, base_url, api_key, model, enabled, success_count, failure_count, created_at, updated_at FROM model_providers WHERE id = ?').get(id) as Record<string, unknown> | undefined
     return row ? this.providerFromRow(row) : undefined
   }
   activeProvider(): StoredProvider | undefined {
-    const row = this.db.prepare('SELECT id, name, base_url, api_key, enabled, success_count, failure_count, created_at, updated_at FROM model_providers WHERE enabled = 1 LIMIT 1').get() as Record<string, unknown> | undefined
+    const row = this.db.prepare('SELECT id, name, base_url, api_key, model, enabled, success_count, failure_count, created_at, updated_at FROM model_providers WHERE enabled = 1 LIMIT 1').get() as Record<string, unknown> | undefined
     return row ? this.providerFromRow(row) : undefined
   }
   activeProviderConfig(): ProviderConfig | undefined {
     const provider = this.activeProvider()
-    return provider?.baseUrl && provider.apiKey ? { baseUrl: provider.baseUrl, apiKey: provider.apiKey } : undefined
+    return provider?.baseUrl && provider.apiKey ? { baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: provider.model } : undefined
   }
   createProvider(name: string, config: ProviderConfig): ModelProvider {
     const id = `provider_${randomUUID()}`; const timestamp = now(); const shouldEnable = !this.activeProvider()
     if (shouldEnable) this.db.prepare('UPDATE model_providers SET enabled = 0, updated_at = ?').run(timestamp)
-    this.db.prepare('INSERT INTO model_providers (id, name, base_url, api_key, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, name, config.baseUrl, config.apiKey, shouldEnable ? 1 : 0, timestamp, timestamp)
+    this.db.prepare('INSERT INTO model_providers (id, name, base_url, api_key, model, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(id, name, config.baseUrl, config.apiKey, config.model ?? DEFAULT_IMAGE_MODEL, shouldEnable ? 1 : 0, timestamp, timestamp)
     return this.listProviders().find((provider) => provider.id === id)!
   }
-  updateProvider(id: string, name: string, baseUrl: string, apiKey?: string): ModelProvider | undefined {
+  updateProvider(id: string, name: string, baseUrl: string, apiKey?: string, model?: string): ModelProvider | undefined {
     const existing = this.getProvider(id); if (!existing) return undefined
     const timestamp = now(); const nextKey = apiKey?.trim() ? apiKey.trim() : existing.apiKey
-    this.db.prepare('UPDATE model_providers SET name = ?, base_url = ?, api_key = ?, updated_at = ? WHERE id = ?').run(name, baseUrl, nextKey, timestamp, id)
+    // 未传模型表示保留当前模型，兼容只改地址和密钥的调用方。
+    const nextModel = model?.trim() || existing.model
+    this.db.prepare('UPDATE model_providers SET name = ?, base_url = ?, api_key = ?, model = ?, updated_at = ? WHERE id = ?').run(name, baseUrl, nextKey, nextModel, timestamp, id)
     return this.listProviders().find((provider) => provider.id === id)
   }
   enableProvider(id: string): ModelProvider | undefined {
@@ -497,7 +509,7 @@ export class JobStore {
       ...(latest?.llmProvider ? { llmProvider: latest.llmProvider } : latest?.imageNamingEnabled !== undefined ? { llmProvider: undefined, llmProviderId: undefined } : {}),
       ...(latest?.llmProviderId ? { llmProviderId: latest.llmProviderId } : {}),
     }
-    const persistedRequest = { ...nextRequest, provider: { baseUrl: nextRequest.provider.baseUrl, apiKey: '' }, ...(nextRequest.llmProvider ? { llmProvider: { baseUrl: nextRequest.llmProvider.baseUrl, model: nextRequest.llmProvider.model, apiKey: '' } } : {}) }
+    const persistedRequest = { ...nextRequest, provider: { baseUrl: nextRequest.provider.baseUrl, apiKey: '', model: nextRequest.provider.model }, ...(nextRequest.llmProvider ? { llmProvider: { baseUrl: nextRequest.llmProvider.baseUrl, model: nextRequest.llmProvider.model, apiKey: '' } } : {}) }
     const candidateTimestamp = now()
     // 极快重试可能落在同一毫秒，至少向后推进 1ms 以保证列表排序可观察到变化。
     const timestamp = candidateTimestamp > job.createdAt ? candidateTimestamp : new Date(Date.parse(job.createdAt) + 1).toISOString()
@@ -579,17 +591,19 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         if (runtime.controller.signal.aborted) throw new DOMException('任务已取消', 'AbortError')
         // 页面关闭或服务重启后，任务仍可从本地 Provider 配置恢复执行凭据。
         const storedProvider = request.providerId ? store.getProvider(request.providerId) : undefined
-        const selectedProvider = store.provider(id) ?? (storedProvider ? { baseUrl: request.provider.baseUrl || storedProvider.baseUrl, apiKey: storedProvider.apiKey } : undefined) ?? store.activeProviderConfig() ?? store.getProviderConfig() ?? request.provider
+        const selectedProvider = store.provider(id) ?? (storedProvider ? { baseUrl: request.provider.baseUrl || storedProvider.baseUrl, apiKey: storedProvider.apiKey, model: storedProvider.model } : undefined) ?? store.activeProviderConfig() ?? store.getProviderConfig() ?? request.provider
         // 环境变量是最终覆盖层，确保重试和普通任务都不会因供应商缓存而回退到旧密钥。
         const envProvider = environmentProvider()
         const provider = { baseUrl: envProvider.baseUrl ?? selectedProvider.baseUrl, apiKey: envProvider.apiKey ?? selectedProvider.apiKey }
+        // 生图模型随任务快照固化，已提交任务不因后续编辑供应商模型而改变。
+        const imageModel = selectedProvider.model ?? request.provider.model ?? DEFAULT_IMAGE_MODEL
         const requestStartedAt = Date.now()
         providerStage = 'request'
-        appendExecutionLog(workspaceDir, 'provider_request_started', { jobId: id, mode: initial.mode, itemIndex: results.length, providerHost: providerHost(provider.baseUrl), size: request.size, resolution: request.resolution, quality: request.quality })
+        appendExecutionLog(workspaceDir, 'provider_request_started', { jobId: id, mode: initial.mode, itemIndex: results.length, providerHost: providerHost(provider.baseUrl), model: imageModel, size: request.size, resolution: request.resolution, quality: request.quality })
         const effectivePrompt = buildEffectivePrompt(prompt, request.layout, request.size, request.resolution)
         const result: GenerationResult = initial.mode === 'edit'
-          ? await imageEditor({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, prompt: effectivePrompt, sourceImage: request.sourceImage!, size: request.size, quality: request.quality, signal: runtime.controller.signal })
-          : await imageGenerator({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, prompt: effectivePrompt, size: request.size, quality: request.quality, signal: runtime.controller.signal })
+          ? await imageEditor({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: imageModel, prompt: effectivePrompt, sourceImage: request.sourceImage!, size: request.size, quality: request.quality, signal: runtime.controller.signal })
+          : await imageGenerator({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: imageModel, prompt: effectivePrompt, size: request.size, quality: request.quality, signal: runtime.controller.signal })
         appendExecutionLog(workspaceDir, 'provider_response_received', {
           jobId: id,
           itemIndex: results.length,
@@ -691,7 +705,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   const latestRetryConfig = (): { provider: ProviderConfig; providerId?: string; imageNamingEnabled: boolean; llmProvider?: { baseUrl: string; apiKey: string; model: string }; llmProviderId?: string } => {
     const activeProvider = store.activeProvider()
     const defaults = activeProvider
-      ? { baseUrl: activeProvider.baseUrl, apiKey: activeProvider.apiKey }
+      ? { baseUrl: activeProvider.baseUrl, apiKey: activeProvider.apiKey, model: activeProvider.model }
       : store.getProviderConfig() ?? options.defaultProvider ?? {}
     const activeLlm = imageNamingEnabled ? store.activeLlmProvider() : undefined
     return { provider: providerConfig(undefined, defaults), ...(activeProvider ? { providerId: activeProvider.id } : {}), imageNamingEnabled, ...(activeLlm ? { llmProviderId: activeLlm.id, llmProvider: { baseUrl: activeLlm.baseUrl, apiKey: activeLlm.apiKey, model: activeLlm.model } } : {}) }
@@ -772,7 +786,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         const baseUrl = optionalString(item.baseUrl, 'provider_base_url')
         const apiKey = optionalString(item.apiKey, 'provider_api_key')
         if (!name || !baseUrl || !apiKey) throw new RequestValidationError('invalid_provider', '供应商名称、Base URL 和 API Key 均不能为空')
-        json(res, 201, store.createProvider(name, { baseUrl, apiKey }))
+        json(res, 201, store.createProvider(name, { baseUrl, apiKey, model: providerModel(item.model) }))
       } catch (error) { if (error instanceof RequestValidationError) errorResponse(res, 400, error.code, error.message); else errorResponse(res, 500, 'internal_error', '供应商创建失败') }
       return
     }
@@ -837,7 +851,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         const name = optionalString(item.name, 'provider_name')
         const baseUrl = optionalString(item.baseUrl, 'provider_base_url')
         if (!name || !baseUrl) throw new RequestValidationError('invalid_provider', '供应商名称和 Base URL 不能为空')
-        const updated = store.updateProvider(decodeURIComponent(providerMatch[1]), name, baseUrl, typeof item.apiKey === 'string' ? item.apiKey : undefined)
+        const updated = store.updateProvider(decodeURIComponent(providerMatch[1]), name, baseUrl, typeof item.apiKey === 'string' ? item.apiKey : undefined, providerModel(item.model))
         if (!updated) { errorResponse(res, 404, 'provider_not_found', '供应商不存在'); return }
         json(res, 200, updated)
       } catch (error) { if (error instanceof RequestValidationError) errorResponse(res, 400, error.code, error.message); else errorResponse(res, 500, 'internal_error', '供应商保存失败') }
@@ -891,7 +905,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       try {
         // 新任务绑定当前启用供应商；请求体不再承载密钥，旧版显式 provider 仍保留兼容能力。
         const activeProvider = input.provider === undefined ? store.activeProvider() : undefined
-        const result = store.create(input, idempotencyKey, activeProvider ? { baseUrl: activeProvider.baseUrl, apiKey: activeProvider.apiKey } : options.defaultProvider, activeProvider?.id)
+        const result = store.create(input, idempotencyKey, activeProvider ? { baseUrl: activeProvider.baseUrl, apiKey: activeProvider.apiKey, model: activeProvider.model } : options.defaultProvider, activeProvider?.id)
         json(res, result.created ? 201 : 200, result.job)
         if (result.created && (result.job.prompt || result.job.windows)) queue(result.job.id)
       } catch (error) { if (error instanceof RequestValidationError) { errorResponse(res, 400, error.code, error.message); return }; errorResponse(res, 500, 'internal_error', '创建任务失败') }; return

@@ -51,6 +51,16 @@ test('Provider 发送 OpenAI 兼容请求并解析 base64 图片', async () => {
   })
 })
 
+test('Provider 使用调用方指定的生图模型', async () => {
+  await generateImage({
+    baseUrl: `http://127.0.0.1:${port}`,
+    apiKey: 'test-secret',
+    model: 'gpt-image-2.5-sunburst',
+    prompt: '模型透传',
+  })
+  assert.equal(requests.at(-1).body.model, 'gpt-image-2.5-sunburst')
+})
+
 test('Provider 未配置 Key 时在本地校验失败', async () => {
   await assert.rejects(
     generateImage({ baseUrl: `http://127.0.0.1:${port}`, apiKey: '', prompt: '测试' }),
@@ -177,6 +187,7 @@ test('Provider 使用 multipart 调用改图接口并上传源图片', async () 
   const result = await editImage({
     baseUrl: `http://127.0.0.1:${port}/v1`,
     apiKey: 'test-secret',
+    model: 'gpt-image-2.5-flare',
     prompt: '把背景改成蓝色',
     sourceImage: { data: 'ZmFrZS1pbWFnZQ==', mimeType: 'image/png', name: 'source.png' },
     size: '1024x1024',
@@ -188,6 +199,7 @@ test('Provider 使用 multipart 调用改图接口并上传源图片', async () 
   assert.equal(request.headers.authorization, 'Bearer test-secret')
   assert.match(request.headers['content-type'], /^multipart\/form-data; boundary=/)
   assert.match(request.body, /name="model"/)
+  assert.match(request.body, /gpt-image-2\.5-flare/)
   assert.match(request.body, /name="prompt"/)
   assert.match(request.body, /把背景改成蓝色/)
   assert.match(request.body, /filename="source\.png"/)

@@ -181,7 +181,7 @@ test('旧版单 Provider 配置首次启动自动迁移为默认启用供应商'
     const providers = store.listProviders()
     assert.equal(providers.length, 1)
     assert.deepEqual(providers[0], {
-      id: 'legacy-default', name: '默认供应商', baseUrl: 'https://legacy.example/v1', configured: true, enabled: true, successCount: 0, failureCount: 0,
+      id: 'legacy-default', name: '默认供应商', baseUrl: 'https://legacy.example/v1', model: 'gpt-image-2', configured: true, enabled: true, successCount: 0, failureCount: 0,
       createdAt: '2026-09-01T00:00:00.000Z', updatedAt: providers[0].updatedAt,
     })
     assert.equal(JSON.stringify(providers).includes('legacy-secret'), false)
@@ -316,6 +316,42 @@ test('模型供应商支持新增、编辑、唯一启用和受约束删除，�
     const lastDelete = await fetch(`${base}/api/providers/${second.id}`, { method: 'DELETE' })
     assert.equal(lastDelete.status, 409)
     assert.equal((await lastDelete.json()).error.code, 'provider_last_one')
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('生图模型默认 gpt-image-2、拒绝白名单之外的模型并随任务快照传到 Provider', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-image-model-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const requestedModels = []
+  const server = await startServer(0, '127.0.0.1', store, {
+    workspaceDir: directory,
+    generateImage: async ({ model }) => { requestedModels.push(model); return { kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' } },
+  })
+  const base = `http://127.0.0.1:${server.address().port}`
+  try {
+    const create = (body) => fetch(`${base}/api/providers`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    const created = await (await create({ name: '默认模型供应商', baseUrl: 'https://provider.example/v1', apiKey: 'secret' })).json()
+    assert.equal(created.model, 'gpt-image-2')
+
+    const invalid = await create({ name: '非法模型', baseUrl: 'https://provider.example/v1', apiKey: 'secret', model: 'gpt-image-3' })
+    assert.equal(invalid.status, 400)
+    assert.equal((await invalid.json()).error.code, 'invalid_provider_model')
+
+    const edited = await fetch(`${base}/api/providers/${created.id}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: created.name, baseUrl: created.baseUrl, model: 'gpt-image-2.5-flare' }),
+    })
+    assert.equal(edited.status, 200)
+    assert.equal((await edited.json()).model, 'gpt-image-2.5-flare')
+
+    const job = await (await fetch(`${base}/api/jobs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'text_to_image', prompt: '模型路由' }) })).json()
+    assert.match(await (await fetch(`${base}/api/jobs/${job.id}/events`)).text(), /event: completed/)
+    assert.deepEqual(requestedModels, ['gpt-image-2.5-flare'])
+    // 模型随任务快照保存，后续编辑供应商不会改变已提交任务。
+    assert.equal(store.request(job.id)?.provider.model, 'gpt-image-2.5-flare')
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     store.close()
@@ -633,7 +669,7 @@ test('同一提交批次的多个任务共享结果文件夹，重试仍写回�
     const secondDetail = await (await fetch(`${base}/api/jobs/${second.id}`)).json()
     assert.equal(firstDetail.results[0].path, `jobs/${batchId}/${first.id}-001.png`)
     assert.equal(secondDetail.results[0].path, `jobs/${batchId}/${second.id}-001.png`)
-    assert.deepEqual(readdirSync(join(directory, 'jobs', batchId)).sort(), [`${first.id}-001.png`, `${second.id}-001.png`])
+    assert.deepEqual(readdirSync(join(directory, 'jobs', batchId)).sort(), [`${first.id}-001.png`, `${second.id}-001.png`].sort())
     assert.equal(store.request(first.id)?.batchId, batchId)
 
     const failed = await create('批次失败')

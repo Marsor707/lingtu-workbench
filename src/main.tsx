@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { Dispatch, ReactNode, SetStateAction } from 'react'
 import { createRoot } from 'react-dom/client'
 import {
@@ -70,6 +70,7 @@ type ModelProvider = {
   id: string
   name: string
   baseUrl: string
+  model: string
   configured: boolean
   enabled: boolean
   successCount: number
@@ -158,6 +159,9 @@ const SIZE_OPTIONS = [
   { value: '1800 × 1000', label: '9:5' },
 ] as const
 const CUSTOM_SIZE_OPTION_VALUE = '__custom__'
+// 生图模型选项与后端白名单（server/provider.ts 的 IMAGE_MODELS）保持一致；后端会拒绝白名单之外的模型。
+const IMAGE_MODEL_OPTIONS = ['gpt-image-2', 'gpt-image-2.5-sunburst', 'gpt-image-2.5-flare'] as const
+const DEFAULT_IMAGE_MODEL = IMAGE_MODEL_OPTIONS[0]
 const ADVANCED_SETTINGS_STORAGE_KEY = 'lingtu-advanced-settings'
 type AdvancedSettings = { layout: string; size: string; resolution: string; quality: string; repeat: number; customSizeEnabled?: boolean; customWidth?: string; customHeight?: string }
 const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = { layout: '四宫格', size: '3840 × 2160', resolution: '1K', quality: '高', repeat: 1 }
@@ -1015,7 +1019,7 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProviderName={activeProvider?.name} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={prompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProvider={activeProvider} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={async () => { await refreshQueue() }} onCancel={cancelJob} onRetry={retryJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} onPromptsChange={handlePromptItemsChange} />}
@@ -1073,7 +1077,7 @@ type WorkbenchProps = {
   statsLoading: boolean
   statsError: string
   serviceOnline: boolean
-  activeProviderName?: string
+  activeProvider?: ModelProvider
   submitError: string
   onRefresh: () => Promise<void>
   onNavigate: (page: Page) => void
@@ -1081,7 +1085,7 @@ type WorkbenchProps = {
 }
 
 function Workbench(props: WorkbenchProps) {
-  const { mode, setMode, activeMode, layout, setLayout, size, setSize, customSizeEnabled, customWidth, customHeight, customRatioError, setCustomWidth, setCustomHeight, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProviderName, submitError, onRefresh, onNavigate, onViewResults } = props
+  const { mode, setMode, activeMode, layout, setLayout, size, setSize, customSizeEnabled, customWidth, customHeight, customRatioError, setCustomWidth, setCustomHeight, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProvider, submitError, onRefresh, onNavigate, onViewResults } = props
   const [showAdvanced, setShowAdvanced] = useState(true)
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -1186,7 +1190,7 @@ function Workbench(props: WorkbenchProps) {
             <span className={`custom-ratio-hint ${customRatioError ? 'error' : ''}`} id="custom-ratio-feedback" role={customRatioError ? 'alert' : undefined}>{customRatioError || `当前比例 ${canonicalSizeForRatio(customWidth, customHeight).ratio || formatSizeRatio(size)}，将按模型能力返回最接近尺寸`}</span>
           </div>}
         </div>}
-        <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>{activeProviderName ? `当前模型：${activeProviderName}` : '尚未配置模型供应商'} <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}{submissionProgress && <span className="submit-progress" role="status">已提交 {submissionProgress.current} / {submissionProgress.total} 张，后端并发处理中</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />{mode === 'edit' ? '批量提交中' : '创建任务中'}</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
+        <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>{activeProvider ? `当前供应商：${activeProvider.name} · 模型：${activeProvider.model}` : '尚未配置模型供应商'} <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}{submissionProgress && <span className="submit-progress" role="status">已提交 {submissionProgress.current} / {submissionProgress.total} 张，后端并发处理中</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />{mode === 'edit' ? '批量提交中' : '创建任务中'}</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
       </div>
 
       <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div aria-hidden="true" /></div><div className={`layout-preview ${layout === '单图' ? 'layout-single' : layout === '二宫格' ? 'layout-two' : layout === '九宫格' ? 'layout-nine' : ''}`} style={{ aspectRatio: customSizeEnabled && customRatioError === undefined ? `${customWidth} / ${customHeight}` : formatSizeAspectRatio(size) }}>{Array.from({ length: previewCount }, (_, index) => <div className={`preview-cell cell-${String.fromCharCode(97 + index)}`} key={String.fromCharCode(65 + index)}><span>{previewCount === 1 ? '单图' : String.fromCharCode(65 + index)}</span><small>{previewCount === 1 ? '完整画布' : index === 0 ? '主视觉区域' : index === 1 ? '卖点信息区域' : '细节变体'}</small></div>)}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{customSizeEnabled && !customRatioError ? canonicalSizeForRatio(customWidth, customHeight).ratio : formatSizeRatio(size)}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link" onClick={() => onNavigate('gallery')}>查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryAssets.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={`打开 ${image.title}`} aria-label={`打开 ${image.title}`} onClick={() => openRecentAsset(image)}><img src={image.src} alt={image.title} /><span className={`mini-status ${image.tone}`} /></button>)}{galleryAssets.length === 0 && <span className="empty-inline">暂无生成结果</span>}</div></div></div>
@@ -1389,16 +1393,55 @@ function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPr
   return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>内置提示词可编辑；自定义提示词支持新增、编辑和删除。</p></div><div className="heading-actions"><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />新增提示词</button></div></section>{showForm && <form className="prompt-form panel" onSubmit={(event) => void savePrompt(event)}><div className="prompt-form-heading"><div><span className="section-kicker">{editing ? '编辑提示词' : '新建提示词'}</span><h2>{editing ? editing.title : '创建可复用模板'}</h2></div><button className="icon-button" type="button" aria-label="取消编辑" title="取消" onClick={resetForm}><X size={17} /></button></div><div className="prompt-form-grid"><div className="setting-field"><label htmlFor="prompt-title">标题 <span className="field-required">必填</span></label><input id="prompt-title" value={title} onChange={(event) => setTitle(event.target.value)} autoFocus /></div><div className="setting-field"><label htmlFor="prompt-category">分类 <span className="field-required">必填</span></label><input id="prompt-category" value={formCategory} onChange={(event) => setFormCategory(event.target.value)} /></div><div className="setting-field"><label htmlFor="prompt-layout">布局（可选）</label><select id="prompt-layout" value={layout} onChange={(event) => setLayout(event.target.value)}><option value="">不指定，由高级参数决定</option><option value="single">单图</option><option value="two_up">二宫格</option><option value="four_up">四宫格</option><option value="nine_up">九宫格</option></select></div><div className="setting-field prompt-form-text"><label htmlFor="prompt-text">提示词正文 <span className="field-required">必填</span></label><textarea id="prompt-text" value={text} onChange={(event) => setText(event.target.value)} rows={9} /></div></div>{formError && <div className="form-error prompt-form-error" role="alert"><AlertTriangle size={14} />{formError}</div>}<div className="prompt-form-actions"><button className="button button-ghost" type="button" onClick={resetForm} disabled={saving}>取消</button><button className="button button-primary" type="submit" disabled={saving}>{saving ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}{saving ? '保存中' : '保存提示词'}</button></div></form>}<div className="prompt-toolbar"><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" aria-label="搜索提示词" /></div></div>{error && <div className="form-error" role="status"><AlertTriangle size={14} />{error}</div>}{loading ? <div className="empty-state">提示词加载中…</div> : filtered.length === 0 ? <div className="empty-state panel">暂无可用提示词，点击“新增提示词”创建。</div> : <div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} type="button" onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? prompts.length : prompts.filter((prompt) => prompt.category === item).length}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => <article className={`prompt-card panel ${selectedPrompt === item.id ? 'selected' : ''}`} key={item.id} onClick={() => setSelectedPrompt(item.id)}><div className="prompt-card-top"><span className="category-chip">{item.category}</span><span className={`prompt-origin ${item.builtin ? 'builtin' : 'custom'}`}>{item.builtin ? '内置' : '自定义'}</span></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.layout ? `布局：${item.layout}` : '布局由高级参数决定'}</span><div className="prompt-card-actions"><button className="icon-button subtle" type="button" title="编辑提示词" aria-label={`编辑提示词：${item.title}`} onClick={(event) => { event.stopPropagation(); openEdit(item) }}><Pencil size={14} /></button>{!item.builtin && <button className="icon-button subtle danger-icon" type="button" title="删除提示词" aria-label={`删除提示词：${item.title}`} disabled={deletingId === item.id} onClick={(event) => { event.stopPropagation(); void deletePrompt(item) }}><Trash2 size={14} /></button>}{selectedPrompt === item.id && <span className="selected-label"><Check size={13} />已选中</span>}</div></div></article>)}</div></div>}{feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}</div>
 }
 
+// 供应商配置统一使用右侧抽屉：遮罩、右滑面板、标题区、字段区和底部操作。
+function ProviderSheet({ open, eyebrow, title, description, onClose, footer, children }: { open: boolean; eyebrow: string; title: string; description: string; onClose: () => void; footer: ReactNode; children: ReactNode }) {
+  const titleId = useId()
+  const panelRef = useRef<HTMLDivElement | null>(null)
+  const triggerRef = useRef<HTMLElement | null>(null)
+
+  // 抽屉打开时 Esc 关闭、焦点移入第一个字段，关闭后焦点回到触发按钮。
+  useEffect(() => {
+    if (!open) return
+    triggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const timer = window.setTimeout(() => {
+      const firstField = panelRef.current?.querySelector<HTMLElement>('input, select, textarea')
+      ;(firstField ?? panelRef.current)?.focus({ preventScroll: true })
+    }, 0)
+    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.clearTimeout(timer)
+      window.removeEventListener('keydown', handleKeyDown)
+      triggerRef.current?.focus()
+      triggerRef.current = null
+    }
+  }, [open, onClose])
+
+  return (
+    <div className={`sheet-overlay ${open ? 'open' : ''}`} onMouseDown={(event) => { if (event.target !== event.currentTarget) return; event.preventDefault(); onClose() }}>
+      <div className="sheet-panel" ref={panelRef} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
+        <button className="sheet-close" type="button" onClick={onClose} title="关闭表单" aria-label="关闭表单"><X size={18} /></button>
+        <div className="sheet-header"><span className="sheet-eyebrow">{eyebrow}</span><h2 id={titleId}>{title}</h2><p className="sheet-description">{description}</p></div>
+        <div className="sheet-body">{children}</div>
+        <div className="sheet-footer">{footer}</div>
+      </div>
+    </div>
+  )
+}
+
 function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCount, onRefresh, onRefreshLlm }: { providers: ModelProvider[]; runningCount: number; llmProviders: LlmProvider[]; llmRunningCount: number; onRefresh: () => Promise<void>; onRefreshLlm: () => Promise<void> }) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
+  const [model, setModel] = useState<string>(DEFAULT_IMAGE_MODEL)
   const [apiKey, setApiKey] = useState('')
   const [showKey, setShowKey] = useState(false)
   const [saving, setSaving] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
+  // 页面错误（切换/删除/刷新失败）和表单错误（校验、保存失败）分开，否则抽屉打开时错误会被遮罩挡住。
   const [error, setError] = useState('')
+  const [formError, setFormError] = useState('')
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
 
@@ -1413,16 +1456,17 @@ function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCo
     return () => window.clearTimeout(timer)
   }, [feedback])
 
-  const resetForm = () => {
-    setEditingId(null); setShowForm(false); setName(''); setBaseUrl(''); setApiKey(''); setShowKey(false); setError('')
-  }
+  const resetForm = useCallback(() => {
+    setEditingId(null); setShowForm(false); setName(''); setBaseUrl(''); setModel(DEFAULT_IMAGE_MODEL); setApiKey(''); setShowKey(false); setFormError('')
+  }, [])
 
+  // 抽屉的 Esc、焦点进出由 ProviderSheet 统一处理。
   const openCreate = () => {
-    setEditingId(null); setName(''); setBaseUrl(''); setApiKey(''); setShowKey(false); setError(''); setShowForm(true)
+    setEditingId(null); setName(''); setBaseUrl(''); setModel(DEFAULT_IMAGE_MODEL); setApiKey(''); setShowKey(false); setFormError(''); setShowForm(true)
   }
 
   const openEdit = (provider: ModelProvider) => {
-    setEditingId(provider.id); setName(provider.name); setBaseUrl(provider.baseUrl); setApiKey(''); setShowKey(false); setError(''); setShowForm(true)
+    setEditingId(provider.id); setName(provider.name); setBaseUrl(provider.baseUrl); setModel(provider.model); setApiKey(''); setShowKey(false); setFormError(''); setShowForm(true)
   }
 
   const parseError = async (response: Response, fallback: string): Promise<string> => {
@@ -1430,28 +1474,28 @@ function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCo
   }
 
   const validateForm = (): boolean => {
-    if (!name.trim()) { setError('请填写供应商名称。'); return false }
-    if (!baseUrl.trim()) { setError('请填写 Base URL。'); return false }
+    if (!name.trim()) { setFormError('请填写供应商名称。'); return false }
+    if (!baseUrl.trim()) { setFormError('请填写 Base URL。'); return false }
     try {
       const url = new URL(baseUrl.trim())
       if (!['http:', 'https:'].includes(url.protocol)) throw new Error('unsupported protocol')
-    } catch { setError('Base URL 需填写完整的 http:// 或 https:// 地址。'); return false }
-    if (!editingId && !apiKey.trim()) { setError('新增供应商时必须填写 API Key。'); return false }
+    } catch { setFormError('Base URL 需填写完整的 http:// 或 https:// 地址。'); return false }
+    if (!editingId && !apiKey.trim()) { setFormError('新增供应商时必须填写 API Key。'); return false }
     return true
   }
 
   const saveProvider = async () => {
     if (saving || !validateForm()) return
-    setSaving(true); setError('')
+    setSaving(true); setFormError('')
     try {
       const response = await fetch(`${LOCAL_API_BASE}/api/providers${editingId ? `/${encodeURIComponent(editingId)}` : ''}`, {
         method: editingId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name.trim(), baseUrl: baseUrl.trim(), ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) }),
+        body: JSON.stringify({ name: name.trim(), baseUrl: baseUrl.trim(), model, ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) }),
       })
       if (!response.ok) throw new Error(await parseError(response, editingId ? '供应商保存失败' : '供应商创建失败'))
       await onRefresh(); setFeedback(editingId ? '供应商配置已更新' : '供应商已添加'); resetForm()
-    } catch (saveError) { setError(saveError instanceof Error ? saveError.message : '供应商保存失败') } finally { setSaving(false) }
+    } catch (saveError) { setFormError(saveError instanceof Error ? saveError.message : '供应商保存失败') } finally { setSaving(false) }
   }
 
   const enableProvider = async (provider: ModelProvider) => {
@@ -1494,8 +1538,12 @@ function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCo
     <section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />连接管理</div><h1>模型设置</h1><p>分别配置生图模型和图片命名模型，为新任务选择执行通道。</p></div><div className="heading-actions"><button className="button button-ghost" type="button" onClick={() => void handleRefresh()} disabled={refreshing} aria-busy={refreshing}><RefreshCw size={16} className={refreshing ? 'refreshing-icon' : ''} />{refreshing ? '刷新中…' : '刷新'}</button><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加供应商</button></div></section>
     {runningCount > 0 && <div className="provider-lock-banner locked" role="status"><div><ShieldCheck size={17} /><span>当前有 {runningCount} 个任务执行中，暂不能切换模型供应商</span></div><small>任务结束前不能切换或删除供应商，配置编辑不受影响。</small></div>}
     {error && <div className="form-error provider-page-error" role="alert"><AlertTriangle size={15} />{error}</div>}
-    {showForm && <section className="provider-form-panel" aria-labelledby="provider-form-title"><div className="provider-form-heading"><div><span className="section-kicker">{editingId ? '编辑配置' : '新增配置'}</span><h2 id="provider-form-title">{editingId ? '更新模型供应商' : '添加模型供应商'}</h2></div><button className="icon-button subtle" type="button" onClick={resetForm} title="关闭表单" aria-label="关闭供应商表单"><X size={18} /></button></div><div className="provider-form-grid"><div className="setting-field"><label htmlFor="provider-name">供应商名称</label><input id="provider-name" value={name} onChange={(event) => { setName(event.target.value); setError('') }} placeholder="例如：主力模型" autoFocus /></div><div className="setting-field provider-url-field"><label htmlFor="provider-base-url">服务地址</label><input id="provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="provider-api-key">API 秘钥</label><div className="secret-input"><input id="provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">秘钥仅保存在本地服务，不会出现在任务、日志或接口响应中。</span></div></div><div className="provider-form-actions"><button className="button button-ghost" type="button" onClick={resetForm}>取消</button><button className="button button-primary" type="button" onClick={() => void saveProvider()} disabled={saving}><Check size={16} />{saving ? '保存中…' : editingId ? '保存修改' : '添加供应商'}</button></div></section>}
-    {providers.length === 0 ? <div className="empty-state panel provider-empty"><Settings2 size={24} /><strong>尚未配置模型供应商</strong><span>添加名称、Base URL 和 API Key 后即可创建生图任务。</span><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加第一个供应商</button></div> : <div className="provider-list">{providers.map((provider) => <article className={`provider-row ${provider.enabled ? 'enabled' : ''}`} key={provider.id}><div className="provider-status-mark"><span /><small>{provider.enabled ? '已启用' : '未启用'}</small></div><div className="provider-identity"><div><h2>{provider.name}</h2>{provider.enabled && <span className="provider-active-badge"><CheckCircle2 size={13} />当前使用</span>}</div><span className="mono" title={provider.baseUrl}>{provider.baseUrl}</span><small>API Key {provider.configured ? '已配置' : '未配置'} · 更新于 {new Date(provider.updatedAt).toLocaleString('zh-CN', { hour12: false })}</small></div><div className="provider-stats" aria-label={`${provider.name}任务统计`}><div><span>成功</span><strong>{provider.successCount}</strong></div><div><span>失败</span><strong>{provider.failureCount}</strong></div></div><div className="provider-actions"><button className="icon-button subtle" type="button" onClick={() => openEdit(provider)} title={`编辑 ${provider.name}`} aria-label={`编辑 ${provider.name}`}><Settings2 size={16} /></button><button className="button button-small button-ghost provider-enable-button" type="button" disabled={provider.enabled || runningCount > 0 || busyId !== null} onClick={() => void enableProvider(provider)} title={runningCount > 0 ? '有任务执行中，暂不能切换' : provider.enabled ? '当前已启用' : `启用 ${provider.name}`}>{provider.enabled ? <><Check size={14} />已启用</> : <><Play size={14} />启用</>}</button><button className="icon-button danger-icon" type="button" disabled={provider.enabled || runningCount > 0 || providers.length <= 1 || busyId !== null} onClick={() => void deleteProvider(provider)} title={provider.enabled ? '当前启用供应商不能删除' : providers.length <= 1 ? '至少保留一个供应商' : `删除 ${provider.name}`} aria-label={`删除 ${provider.name}`}><Trash2 size={16} /></button></div></article>)}</div>}
+    <ProviderSheet open={showForm} eyebrow={editingId ? '编辑配置' : '新增配置'} title={editingId ? '更新模型供应商' : '添加模型供应商'} description="配置接口地址、密钥和该供应商使用的生图模型；仅保存在本机。" onClose={resetForm} footer={<><button className="button button-ghost" type="button" onClick={resetForm}>取消</button><button className="button button-primary" type="button" onClick={() => void saveProvider()} disabled={saving}><Check size={16} />{saving ? '保存中…' : editingId ? '保存修改' : '添加供应商'}</button></>}>
+      <div className="provider-form-grid"><div className="setting-field"><label htmlFor="provider-name">供应商名称</label><input id="provider-name" value={name} onChange={(event) => { setName(event.target.value); setFormError('') }} placeholder="例如：主力模型" /></div><div className="setting-field provider-url-field"><label htmlFor="provider-base-url">服务地址</label><input id="provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setFormError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="provider-api-key">API 秘钥</label><div className="secret-input"><input id="provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setFormError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">秘钥仅保存在本地服务，不会出现在任务、日志或接口响应中。</span></div><div className="setting-field"><label htmlFor="provider-model">生图模型</label><div className="select-wrap"><select id="provider-model" value={model} onChange={(event) => { setModel(event.target.value); setFormError('') }}>{IMAGE_MODEL_OPTIONS.map((option) => <option key={option} value={option}>{option}</option>)}</select><ChevronDown size={15} /></div><span className="field-help">该供应商实际调用的生图模型；修改只影响之后创建的新任务。</span></div>
+      </div>
+      {formError && <div className="form-error provider-form-error" role="alert"><AlertTriangle size={15} />{formError}</div>}
+    </ProviderSheet>
+    {providers.length === 0 ? <div className="empty-state panel provider-empty"><Settings2 size={24} /><strong>尚未配置模型供应商</strong><span>添加名称、Base URL、API Key 和生图模型后即可创建生图任务。</span><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加第一个供应商</button></div> : <div className="provider-list">{providers.map((provider) => <article className={`provider-row ${provider.enabled ? 'enabled' : ''}`} key={provider.id}><div className="provider-status-mark"><span /><small>{provider.enabled ? '已启用' : '未启用'}</small></div><div className="provider-identity"><div><h2>{provider.name}</h2>{provider.enabled && <span className="provider-active-badge"><CheckCircle2 size={13} />当前使用</span>}</div><span className="mono" title={provider.baseUrl}>{provider.baseUrl}</span><small>生图模型 <span className="mono">{provider.model}</span> · API Key {provider.configured ? '已配置' : '未配置'} · 更新于 {new Date(provider.updatedAt).toLocaleString('zh-CN', { hour12: false })}</small></div><div className="provider-stats" aria-label={`${provider.name}任务统计`}><div><span>成功</span><strong>{provider.successCount}</strong></div><div><span>失败</span><strong>{provider.failureCount}</strong></div></div><div className="provider-actions"><button className="icon-button subtle" type="button" onClick={() => openEdit(provider)} title={`编辑 ${provider.name}`} aria-label={`编辑 ${provider.name}`}><Settings2 size={16} /></button><button className="button button-small button-ghost provider-enable-button" type="button" disabled={provider.enabled || runningCount > 0 || busyId !== null} onClick={() => void enableProvider(provider)} title={runningCount > 0 ? '有任务执行中，暂不能切换' : provider.enabled ? '当前已启用' : `启用 ${provider.name}`}>{provider.enabled ? <><Check size={14} />已启用</> : <><Play size={14} />启用</>}</button><button className="icon-button danger-icon" type="button" disabled={provider.enabled || runningCount > 0 || providers.length <= 1 || busyId !== null} onClick={() => void deleteProvider(provider)} title={provider.enabled ? '当前启用供应商不能删除' : providers.length <= 1 ? '至少保留一个供应商' : `删除 ${provider.name}`} aria-label={`删除 ${provider.name}`}><Trash2 size={16} /></button></div></article>)}</div>}
     {feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}
     <LlmSettingsSection providers={llmProviders} runningCount={llmRunningCount} onRefresh={onRefreshLlm} />
   </div>
@@ -1511,27 +1559,29 @@ function LlmSettingsSection({ providers, runningCount, onRefresh }: { providers:
   const [showKey, setShowKey] = useState(false)
   const [busy, setBusy] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
+  // 页面错误（切换/删除/刷新失败）和表单错误（校验、保存失败）分开，否则抽屉打开时错误会被遮罩挡住。
   const [error, setError] = useState('')
+  const [formError, setFormError] = useState('')
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
 
-  const resetForm = () => { setEditingId(null); setShowForm(false); setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setShowKey(false); setError('') }
-  const openCreate = () => { setEditingId(null); setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setShowKey(false); setError(''); setShowForm(true) }
-  const openEdit = (provider: LlmProvider) => { setEditingId(provider.id); setName(provider.name); setBaseUrl(provider.baseUrl); setModel(provider.model); setApiKey(''); setShowKey(false); setError(''); setShowForm(true) }
+  const resetForm = useCallback(() => { setEditingId(null); setShowForm(false); setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setShowKey(false); setFormError('') }, [])
+  const openCreate = () => { setEditingId(null); setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setShowKey(false); setFormError(''); setShowForm(true) }
+  const openEdit = (provider: LlmProvider) => { setEditingId(provider.id); setName(provider.name); setBaseUrl(provider.baseUrl); setModel(provider.model); setApiKey(''); setShowKey(false); setFormError(''); setShowForm(true) }
   const parseError = async (response: Response, fallback: string) => { try { return (await response.json() as ApiErrorBody).error?.message || fallback } catch { return fallback } }
   const validate = () => {
-    if (!name.trim() || !baseUrl.trim() || !model.trim() || (!editingId && !apiKey.trim())) { setError('名称、服务地址、模型名称和 API 秘钥均不能为空。'); return false }
+    if (!name.trim() || !baseUrl.trim() || !model.trim() || (!editingId && !apiKey.trim())) { setFormError('名称、服务地址、模型名称和 API 秘钥均不能为空。'); return false }
     try { const url = new URL(baseUrl.trim()); if (!['http:', 'https:'].includes(url.protocol)) throw new Error() } catch { setError('服务地址需填写完整的 http:// 或 https:// 地址。'); return false }
     return true
   }
   const save = async () => {
     if (busy || !validate()) return
-    setBusy(true); setError('')
+    setBusy(true); setFormError('')
     try {
       const response = await fetch(`${LOCAL_API_BASE}/api/llm-providers${editingId ? `/${encodeURIComponent(editingId)}` : ''}`, { method: editingId ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim(), baseUrl: baseUrl.trim(), model: model.trim(), ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) }) })
       if (!response.ok) throw new Error(await parseError(response, 'LLM 供应商保存失败'))
       await onRefresh(); setFeedback(editingId ? 'LLM 供应商配置已更新' : 'LLM 供应商已添加'); resetForm()
-    } catch (saveError) { setError(saveError instanceof Error ? saveError.message : 'LLM 供应商保存失败') } finally { setBusy(false) }
+    } catch (saveError) { setFormError(saveError instanceof Error ? saveError.message : 'LLM 供应商保存失败') } finally { setBusy(false) }
   }
   const enable = async (provider: LlmProvider) => {
     if (provider.enabled || busyId || runningCount > 0) return
@@ -1556,7 +1606,10 @@ function LlmSettingsSection({ providers, runningCount, onRefresh }: { providers:
     <div className="page-heading heading-row llm-heading"><div><div className="eyebrow"><span className="eyebrow-line" />图片命名</div><h2 id="llm-settings-title">LLM 模型</h2><p>为生图结果生成文件名，需要配置支持视觉输入的 OpenAI 兼容模型。</p></div><div className="heading-actions"><button className="button button-ghost" type="button" onClick={() => void handleRefresh()} disabled={refreshing} aria-busy={refreshing}><RefreshCw size={16} className={refreshing ? 'refreshing-icon' : ''} />{refreshing ? '刷新中…' : '刷新'}</button><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加 LLM 供应商</button></div></div>
     {runningCount > 0 && <div className="provider-lock-banner locked" role="status"><div><ShieldCheck size={17} /><span>当前有 {runningCount} 个任务执行中，暂不能切换 LLM 供应商</span></div><small>配置编辑不受影响，切换仅影响新任务。</small></div>}
     {error && <div className="form-error provider-page-error" role="alert"><AlertTriangle size={15} />{error}</div>}
-    {showForm && <section className="provider-form-panel" aria-labelledby="llm-form-title"><div className="provider-form-heading"><div><span className="section-kicker">{editingId ? '编辑配置' : '新增配置'}</span><h3 id="llm-form-title">{editingId ? '更新 LLM 供应商' : '添加 LLM 供应商'}</h3></div><button className="icon-button subtle" type="button" onClick={resetForm} title="关闭表单" aria-label="关闭 LLM 供应商表单"><X size={18} /></button></div><div className="provider-form-grid llm-provider-form-grid"><div className="setting-field"><label htmlFor="llm-provider-name">供应商名称</label><input id="llm-provider-name" value={name} onChange={(event) => { setName(event.target.value); setError('') }} placeholder="例如：视觉命名模型" autoFocus /></div><div className="setting-field"><label htmlFor="llm-provider-base-url">服务地址</label><input id="llm-provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="llm-provider-model">模型名称</label><input id="llm-provider-model" value={model} onChange={(event) => { setModel(event.target.value); setError('') }} placeholder="例如：gpt-4o" /></div><div className="setting-field"><label htmlFor="llm-provider-api-key">API 秘钥</label><div className="secret-input"><input id="llm-provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">仅保存到本地服务，不会出现在任务、日志或接口响应中。</span></div></div><div className="provider-form-actions"><button className="button button-ghost" type="button" onClick={resetForm}>取消</button><button className="button button-primary" type="button" onClick={() => void save()} disabled={busy}><Check size={16} />{busy ? '保存中…' : editingId ? '保存修改' : '添加供应商'}</button></div></section>}
+    <ProviderSheet open={showForm} eyebrow={editingId ? '编辑配置' : '新增配置'} title={editingId ? '更新 LLM 供应商' : '添加 LLM 供应商'} description="为生图结果生成文件名，需要支持视觉输入的 OpenAI 兼容模型；仅保存在本机。" onClose={resetForm} footer={<><button className="button button-ghost" type="button" onClick={resetForm}>取消</button><button className="button button-primary" type="button" onClick={() => void save()} disabled={busy}><Check size={16} />{busy ? '保存中…' : editingId ? '保存修改' : '添加供应商'}</button></>}>
+      <div className="provider-form-grid"><div className="setting-field"><label htmlFor="llm-provider-name">供应商名称</label><input id="llm-provider-name" value={name} onChange={(event) => { setName(event.target.value); setFormError('') }} placeholder="例如：视觉命名模型" /></div><div className="setting-field"><label htmlFor="llm-provider-base-url">服务地址</label><input id="llm-provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setFormError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="llm-provider-model">模型名称</label><input id="llm-provider-model" value={model} onChange={(event) => { setModel(event.target.value); setFormError('') }} placeholder="例如：gpt-4o" /></div><div className="setting-field"><label htmlFor="llm-provider-api-key">API 秘钥</label><div className="secret-input"><input id="llm-provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setFormError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">仅保存到本地服务，不会出现在任务、日志或接口响应中。</span></div></div>
+      {formError && <div className="form-error provider-form-error" role="alert"><AlertTriangle size={15} />{formError}</div>}
+    </ProviderSheet>
     {providers.length === 0 ? <div className="empty-state panel provider-empty"><Sparkles size={24} /><strong>尚未配置 LLM 图片命名模型</strong><span>添加供应商并启用工作区设置中的“LLM 图片命名”。</span><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加第一个 LLM 供应商</button></div> : <div className="provider-list llm-provider-list">{providers.map((provider) => <article className={`provider-row ${provider.enabled ? 'enabled' : ''}`} key={provider.id}><div className="provider-status-mark"><span /><small>{provider.enabled ? '已启用' : '未启用'}</small></div><div className="provider-identity"><div><h3>{provider.name}</h3>{provider.enabled && <span className="provider-active-badge"><CheckCircle2 size={13} />当前使用</span>}</div><span className="mono" title={provider.baseUrl}>{provider.baseUrl}</span><small>模型 {provider.model} · API 秘钥 {provider.configured ? '已配置' : '未配置'}</small></div><div className="provider-stats" aria-label={`${provider.name}命名统计`}><div><span>成功</span><strong>{provider.successCount}</strong></div><div><span>失败</span><strong>{provider.failureCount}</strong></div></div><div className="provider-actions"><button className="icon-button subtle" type="button" onClick={() => openEdit(provider)} title={`编辑 ${provider.name}`} aria-label={`编辑 ${provider.name}`}><Settings2 size={16} /></button><button className="button button-small button-ghost provider-enable-button" type="button" disabled={provider.enabled || runningCount > 0 || busyId !== null} onClick={() => void enable(provider)} title={runningCount > 0 ? '有任务执行中，暂不能切换' : provider.enabled ? '当前已启用' : `启用 ${provider.name}`}>{provider.enabled ? <><Check size={14} />已启用</> : <><Play size={14} />启用</>}</button><button className="icon-button danger-icon" type="button" disabled={provider.enabled || runningCount > 0 || providers.length <= 1 || busyId !== null} onClick={() => void remove(provider)} title={provider.enabled ? '当前启用供应商不能删除' : '删除供应商'} aria-label={`删除 ${provider.name}`}><Trash2 size={16} /></button></div></article>)}</div>}
     {feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}
   </section>

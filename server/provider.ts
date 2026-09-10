@@ -1,6 +1,7 @@
 export type GenerationRequest = {
   baseUrl: string
   apiKey: string
+  model?: string
   prompt: string
   size?: string
   quality?: string
@@ -10,6 +11,7 @@ export type GenerationRequest = {
 export type EditImageRequest = {
   baseUrl: string
   apiKey: string
+  model?: string
   prompt: string
   sourceImage: { data: string; mimeType: string; name: string }
   size?: string
@@ -21,6 +23,12 @@ export type GenerationResult = {
   kind: 'base64' | 'url'
   value: string
 }
+
+// 生图模型白名单：与供应商侧可用模型一一对应，模型名写错应在保存时就被拒绝，而不是等到计费调用才失败。
+export const IMAGE_MODELS: readonly string[] = ['gpt-image-2', 'gpt-image-2.5-sunburst', 'gpt-image-2.5-flare']
+export const DEFAULT_IMAGE_MODEL = 'gpt-image-2'
+
+export function isImageModel(value: string): boolean { return IMAGE_MODELS.includes(value) }
 
 export const DEFAULT_PROVIDER_TIMEOUT_MS = 3 * 60 * 1000
 const MAX_RESULT_DOWNLOAD_ATTEMPTS = 4
@@ -147,7 +155,7 @@ export async function generateImage(request: GenerationRequest): Promise<Generat
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'gpt-image-2',
+        model: request.model ?? DEFAULT_IMAGE_MODEL,
         prompt: request.prompt.trim(),
         ...(request.size ? { size: request.size } : {}),
         ...(request.quality ? { quality: request.quality } : {}),
@@ -170,7 +178,7 @@ export async function editImage(request: EditImageRequest): Promise<GenerationRe
   }
 
   const form = new FormData()
-  form.append('model', 'gpt-image-2')
+  form.append('model', request.model ?? DEFAULT_IMAGE_MODEL)
   form.append('prompt', request.prompt.trim())
   form.append('image', new Blob([Uint8Array.from(Buffer.from(request.sourceImage.data, 'base64'))], { type: request.sourceImage.mimeType }), request.sourceImage.name)
   if (request.size) form.append('size', request.size)
