@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "lingtu-workbench"
-version = "1.0.2"
+version = "1.0.4"
 dependencies = [
  "log",
  "serde",
