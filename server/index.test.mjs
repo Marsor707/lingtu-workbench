@@ -695,6 +695,72 @@ test('同一提交批次的多个任务共享结果文件夹，重试仍写回�
   }
 })
 
+test('批量重试只重新入队失败任务，已取消任务不受影响', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-bulk-retry-workspace-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const previousEnvironment = Object.fromEntries(environmentKeys.map((name) => [name, process.env[name]]))
+  for (const name of environmentKeys) delete process.env[name]
+  let failOnce = true
+  let holdCancel = false
+  const mockGenerate = async ({ prompt, signal }) => {
+    // Provider 收到的是拼上高级参数的完整提示词，只能用前缀匹配。
+    if (prompt.startsWith('失败甲') && failOnce) throw new Error('mock provider failure')
+    if (prompt.startsWith('失败乙') && failOnce) throw new Error('mock provider failure')
+    if (prompt.startsWith('取消任务') && holdCancel) return new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(new DOMException('任务已取消', 'AbortError')), { once: true }))
+    return { kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' }
+  }
+  const server = await startServer(0, '127.0.0.1', store, { workspaceDir: directory, generateImage: mockGenerate })
+  const base = `http://127.0.0.1:${server.address().port}`
+  try {
+    const create = async (prompt) => {
+      const response = await fetch(`${base}/api/jobs`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'text_to_image', prompt, provider: { baseUrl: 'https://provider-a.example/v1', apiKey: 'provider-a-secret' } }) })
+      assert.equal(response.status, 201)
+      return response.json()
+    }
+
+    const first = await create('失败甲')
+    const second = await create('失败乙')
+    assert.match(await (await fetch(`${base}/api/jobs/${first.id}/events`)).text(), /event: failed/)
+    assert.match(await (await fetch(`${base}/api/jobs/${second.id}/events`)).text(), /event: failed/)
+
+    holdCancel = true
+    const cancelled = await create('取消任务')
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if ((await (await fetch(`${base}/api/jobs/${cancelled.id}`)).json()).status === 'running') break
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    }
+    await fetch(`${base}/api/jobs/${cancelled.id}/cancel`, { method: 'POST' })
+    holdCancel = false
+    await new Promise((resolve) => setTimeout(resolve, 2))
+
+    failOnce = false
+    const bulk = await fetch(`${base}/api/jobs/retry-failed`, { method: 'POST' })
+    const bulkBody = await bulk.json()
+    assert.equal(bulk.status, 200)
+    assert.equal(bulkBody.total, 2)
+    assert.deepEqual(bulkBody.items.map((item) => item.id).sort(), [first.id, second.id].sort())
+    assert.ok(bulkBody.items.every((item) => item.status === 'queued' && item.error === undefined))
+    for (const item of bulkBody.items) {
+      assert.match(await (await fetch(`${base}/api/jobs/${item.id}/events`)).text(), /event: completed/)
+      assert.equal((await (await fetch(`${base}/api/jobs/${item.id}`)).json()).status, 'completed')
+    }
+    // 已取消任务不属于“失败堆积”，批量入口不应把它一并重跑。
+    assert.equal((await (await fetch(`${base}/api/jobs/${cancelled.id}`)).json()).status, 'cancelled')
+
+    const empty = await fetch(`${base}/api/jobs/retry-failed`, { method: 'POST' })
+    assert.equal(empty.status, 200)
+    assert.deepEqual(await empty.json(), { items: [], total: 0 })
+  } finally {
+    for (const name of environmentKeys) {
+      if (previousEnvironment[name] === undefined) delete process.env[name]
+      else process.env[name] = previousEnvironment[name]
+    }
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
 test('任务元数据可从 SQLite 跨实例回读', () => {
   const directory = mkdtempSync(join(tmpdir(), 'lingtu-server-'))
   const dbPath = join(directory, 'jobs.db')

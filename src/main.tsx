@@ -150,6 +150,13 @@ type ApiErrorBody = {
   error?: { message?: string; code?: string }
 }
 
+// 批量重试结果：服务端只返回真正重新入队的任务，total 用于汇总提示。
+type RetryFailedResult = {
+  items?: ApiJob[]
+  total?: number
+  error?: { message?: string; code?: string }
+}
+
 // 检查更新结果对应后端 /api/update/check；state 是唯一驱动 UI 的判据。
 type UpdateCheck = {
   currentVersion: string
@@ -817,6 +824,18 @@ function App() {
     void readJobDetail(body.id)
   }
 
+  // 批量重试只处理失败任务；目标集合由服务端判定，前端只负责挂上后续的进度订阅。
+  const retryFailedJobs = async (): Promise<number> => {
+    const response = await fetch(`${LOCAL_API_BASE}/api/jobs/retry-failed`, { method: 'POST' })
+    const body = await response.json() as RetryFailedResult
+    if (!response.ok) throw new Error(body.error?.message || '重试失败任务失败，请稍后再试')
+    const items = Array.isArray(body.items) ? body.items : []
+    items.forEach((item) => updateQueueFromJob(item))
+    void refreshStats()
+    items.forEach((item) => { void subscribeJob(item.id); void readJobDetail(item.id) })
+    return items.length
+  }
+
   const openJobResults = (jobId: string) => {
     // 任务结果通过画廊统一查看，并保留任务 ID 作为可见筛选上下文。
     setGalleryJobId(jobId)
@@ -1061,7 +1080,7 @@ function App() {
         </header>
 
         {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={generationPrompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProvider={activeProvider} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
-        {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={async () => { await refreshQueue() }} onCancel={cancelJob} onRetry={retryJob} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
+        {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={async () => { await refreshQueue() }} onCancel={cancelJob} onRetry={retryJob} onRetryFailed={retryFailedJobs} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'title-generation' && <TitleGenerationPage prompts={prompts} llmProviders={llmProviders} onOpenModelSettings={() => navigateTo('models')} onOpenPromptLibrary={() => navigateTo('prompts')} />}
         {page === 'prompts' && <ApiPromptsPage prompts={prompts} loading={promptsLoading} error={promptsError} selectedPrompt={selectedPrompt} setSelectedPrompt={handlePromptSelect} onPromptsChange={handlePromptItemsChange} />}
@@ -1268,17 +1287,26 @@ function HealthRow({ label, value, tone }: { label: string; value: string; tone:
 
 type QueueFilter = '全部' | 'running' | 'review' | 'done' | 'failed' | 'cancelled'
 
-function QueueFilterBar({ queue, filter, setFilter, search, setSearch }: { queue: QueueItem[]; filter: QueueFilter; setFilter: (value: QueueFilter) => void; search: string; setSearch: (value: string) => void }) {
-  return <div className="queue-toolbar panel"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{queue.length}</span></button><button className={filter === 'running' ? 'active' : ''} onClick={() => setFilter('running')}>运行中 <span>{queue.filter((item) => item.status === 'running').length}</span></button><button className={filter === 'review' ? 'active' : ''} onClick={() => setFilter('review')}>待复核 <span>{queue.filter((item) => item.status === 'review').length}</span></button><button className={filter === 'done' ? 'active' : ''} onClick={() => setFilter('done')}>已完成 <span>{queue.filter((item) => item.status === 'done').length}</span></button><button className={filter === 'failed' ? 'active' : ''} onClick={() => setFilter('failed')}>失败 <span>{queue.filter((item) => item.status === 'failed').length}</span></button><button className={filter === 'cancelled' ? 'active' : ''} onClick={() => setFilter('cancelled')}>已取消 <span>{queue.filter((item) => item.status === 'cancelled').length}</span></button></div><div className="queue-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务名称或编号" /></div></div>
+function QueueFilterBar({ queue, filter, setFilter, search, setSearch, children }: { queue: QueueItem[]; filter: QueueFilter; setFilter: (value: QueueFilter) => void; search: string; setSearch: (value: string) => void; children?: ReactNode }) {
+  return <div className="queue-toolbar panel"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{queue.length}</span></button><button className={filter === 'running' ? 'active' : ''} onClick={() => setFilter('running')}>运行中 <span>{queue.filter((item) => item.status === 'running').length}</span></button><button className={filter === 'review' ? 'active' : ''} onClick={() => setFilter('review')}>待复核 <span>{queue.filter((item) => item.status === 'review').length}</span></button><button className={filter === 'done' ? 'active' : ''} onClick={() => setFilter('done')}>已完成 <span>{queue.filter((item) => item.status === 'done').length}</span></button><button className={filter === 'failed' ? 'active' : ''} onClick={() => setFilter('failed')}>失败 <span>{queue.filter((item) => item.status === 'failed').length}</span></button><button className={filter === 'cancelled' ? 'active' : ''} onClick={() => setFilter('cancelled')}>已取消 <span>{queue.filter((item) => item.status === 'cancelled').length}</span></button></div><div className="queue-toolbar-actions"><div className="queue-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务名称或编号" /></div>{children}</div></div>
 }
 
-function QueuePage({ queue, setQueue, onRefresh, onCancel, onRetry, onCreate, onViewResults }: { queue: QueueItem[]; setQueue: Dispatch<SetStateAction<QueueItem[]>>; onRefresh: () => Promise<void>; onCancel: (jobId: string) => Promise<void>; onRetry: (jobId: string) => Promise<void>; onCreate: () => void; onViewResults: (jobId: string) => void }) {
+function QueuePage({ queue, setQueue, onRefresh, onCancel, onRetry, onRetryFailed, onCreate, onViewResults }: { queue: QueueItem[]; setQueue: Dispatch<SetStateAction<QueueItem[]>>; onRefresh: () => Promise<void>; onCancel: (jobId: string) => Promise<void>; onRetry: (jobId: string) => Promise<void>; onRetryFailed: () => Promise<number>; onCreate: () => void; onViewResults: (jobId: string) => void }) {
   const [filter, setFilter] = useState<QueueFilter>('全部')
   const [search, setSearch] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const [retryingIds, setRetryingIds] = useState<Set<string>>(new Set())
+  const [bulkRetrying, setBulkRetrying] = useState(false)
   const [actionError, setActionError] = useState('')
+  const [actionNotice, setActionNotice] = useState<{ tone: 'success' | 'warning'; text: string } | null>(null)
   const visible = queue.filter((item) => (filter === '全部' || item.status === filter) && (!search.trim() || `${item.title}${item.id}${item.meta}`.toLowerCase().includes(search.trim().toLowerCase())))
+  // 批量重试只覆盖失败任务，数量直接写在按钮上，让用户在点击前就知道规模。
+  const failedCount = queue.filter((item) => item.status === 'failed').length
+  useEffect(() => {
+    if (!actionNotice) return
+    const timer = window.setTimeout(() => setActionNotice(null), 6000)
+    return () => window.clearTimeout(timer)
+  }, [actionNotice])
   const handleRefresh = async () => {
     if (refreshing) return
     setRefreshing(true)
@@ -1304,10 +1332,30 @@ function QueuePage({ queue, setQueue, onRefresh, onCancel, onRetry, onCreate, on
       })
     }
   }
+  const handleRetryFailed = async () => {
+    if (bulkRetrying || failedCount === 0) return
+    if (!window.confirm(`确认重试全部 ${failedCount} 个失败任务？将重新调用生图接口并可能产生费用。`)) return
+    setActionError('')
+    setActionNotice(null)
+    setBulkRetrying(true)
+    try {
+      const retried = await onRetryFailed()
+      // 服务端在同一时刻取目标集合，数量差异说明这些任务已被其他操作抢先处理。
+      setActionNotice(retried < failedCount
+        ? { tone: 'warning', text: `已重新入队 ${retried} 个失败任务，另有 ${failedCount - retried} 个状态已变化` }
+        : { tone: 'success', text: `已重新入队 ${retried} 个失败任务` })
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '重试失败任务失败，请稍后再试')
+    } finally {
+      setBulkRetrying(false)
+    }
+  }
+  const bulkRetryButton = <button className="button button-ghost queue-retry-all" type="button" title={failedCount === 0 ? '当前没有失败任务' : `重试全部 ${failedCount} 个失败任务`} aria-label={`重试全部失败任务，共 ${failedCount} 个`} aria-busy={bulkRetrying} disabled={failedCount === 0 || bulkRetrying} onClick={() => void handleRetryFailed()}><RotateCcw size={16} className={bulkRetrying ? 'spin' : ''} />{bulkRetrying ? '重试中' : `全部重试 ${failedCount}`}</button>
+  const noticeElement = actionNotice ? <div className={`queue-action-notice ${actionNotice.tone}`} role="status" aria-live="polite"><CheckCircle2 size={14} />{actionNotice.text}</div> : null
   const refreshButton = <button className="button button-ghost" onClick={() => void handleRefresh()} disabled={refreshing} aria-label="刷新任务队列" aria-busy={refreshing}><RefreshCw size={16} className={refreshing ? 'spin' : ''} />{refreshing ? '刷新中' : '刷新'}</button>
   const createButton = <button className="button button-primary" onClick={onCreate}><Plus size={16} />创建任务</button>
-  if (visible.length === 0) return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions">{refreshButton}{createButton}</div></section><QueueFilterBar queue={queue} filter={filter} setFilter={setFilter} search={search} setSearch={setSearch} /><div className="empty-state panel">暂无任务记录</div></div>
-  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions">{refreshButton}{createButton}</div></section><div className="queue-toolbar panel"><div className="filter-tabs"><button className={filter === '全部' ? 'active' : ''} onClick={() => setFilter('全部')}>全部 <span>{queue.length}</span></button><button className={filter === 'running' ? 'active' : ''} onClick={() => setFilter('running')}>运行中 <span>{queue.filter((item) => item.status === 'running').length}</span></button><button className={filter === 'review' ? 'active' : ''} onClick={() => setFilter('review')}>待复核 <span>{queue.filter((item) => item.status === 'review').length}</span></button><button className={filter === 'done' ? 'active' : ''} onClick={() => setFilter('done')}>已完成 <span>{queue.filter((item) => item.status === 'done').length}</span></button><button className={filter === 'failed' ? 'active' : ''} onClick={() => setFilter('failed')}>失败 <span>{queue.filter((item) => item.status === 'failed').length}</span></button><button className={filter === 'cancelled' ? 'active' : ''} onClick={() => setFilter('cancelled')}>已取消 <span>{queue.filter((item) => item.status === 'cancelled').length}</span></button></div><div className="queue-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务名称或编号" /></div></div>{actionError && <div className="form-error queue-action-error" role="alert"><AlertTriangle size={14} />{actionError}</div>}<div className="queue-list panel">{visible.map((item) => <div className={`queue-row ${item.status === 'done' && item.resultCount ? 'has-result' : ''}`} key={item.id}><div className={`queue-status-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="queue-main"><div className="queue-title-line"><strong>{item.title}</strong><span className="mono">{item.id}</span></div><div className="queue-meta-line"><span>{item.meta}</span><time dateTime={item.createdAt}>{formatQueueCreatedAt(item.createdAt)}</time></div><div className="progress-track" role="progressbar" aria-label={`${item.title}进度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.progress}><i className={item.status} style={{ width: `${item.progress}%` }} /></div></div><div className="queue-summary"><div className="queue-progress"><strong>{item.progress}%</strong></div><StatusLabel status={item.status} />{item.status === 'done' && item.resultCount ? <button className="queue-result-button" type="button" aria-label={`查看任务 ${item.id} 的 ${item.resultCount} 张结果`} onClick={() => onViewResults(item.id)}><Eye size={15} />查看结果<span>{item.resultCount} 张</span></button> : null}{(item.status === 'failed' || item.status === 'cancelled') && <button className="queue-retry-button" type="button" title="重试任务" aria-label={`重试任务 ${item.title}`} aria-busy={retryingIds.has(item.id)} disabled={retryingIds.has(item.id)} onClick={() => void handleRetry(item.id)}><RotateCcw size={15} className={retryingIds.has(item.id) ? 'spin' : ''} /><span>{retryingIds.has(item.id) ? '重试中' : '重试'}</span></button>}{(item.status === 'queued' || item.status === 'running') && <button className="queue-cancel-button" title="取消任务" aria-label={`取消任务 ${item.title}`} onClick={() => void onCancel(item.id)}><X size={15} /><span>取消</span></button>}</div></div>)}</div><div className="queue-footnote"><CircleHelp size={15} />生图接口超时会进入“待确认”，不会自动重复计费请求。</div></div>
+  if (visible.length === 0) return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions">{refreshButton}{createButton}</div></section><QueueFilterBar queue={queue} filter={filter} setFilter={setFilter} search={search} setSearch={setSearch}>{bulkRetryButton}</QueueFilterBar>{noticeElement}<div className="empty-state panel">暂无任务记录</div></div>
+  return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />生产监控</div><h1>任务队列</h1><p>查看批次进度、失败原因和需要人工确认的请求。</p></div><div className="heading-actions">{refreshButton}{createButton}</div></section><QueueFilterBar queue={queue} filter={filter} setFilter={setFilter} search={search} setSearch={setSearch}>{bulkRetryButton}</QueueFilterBar>{noticeElement}{actionError && <div className="form-error queue-action-error" role="alert"><AlertTriangle size={14} />{actionError}</div>}<div className="queue-list panel">{visible.map((item) => <div className={`queue-row ${item.status === 'done' && item.resultCount ? 'has-result' : ''}`} key={item.id}><div className={`queue-status-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="queue-main"><div className="queue-title-line"><strong>{item.title}</strong><span className="mono">{item.id}</span></div><div className="queue-meta-line"><span>{item.meta}</span><time dateTime={item.createdAt}>{formatQueueCreatedAt(item.createdAt)}</time></div><div className="progress-track" role="progressbar" aria-label={`${item.title}进度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.progress}><i className={item.status} style={{ width: `${item.progress}%` }} /></div></div><div className="queue-summary"><div className="queue-progress"><strong>{item.progress}%</strong></div><StatusLabel status={item.status} />{item.status === 'done' && item.resultCount ? <button className="queue-result-button" type="button" aria-label={`查看任务 ${item.id} 的 ${item.resultCount} 张结果`} onClick={() => onViewResults(item.id)}><Eye size={15} />查看结果<span>{item.resultCount} 张</span></button> : null}{(item.status === 'failed' || item.status === 'cancelled') && <button className="queue-retry-button" type="button" title="重试任务" aria-label={`重试任务 ${item.title}`} aria-busy={retryingIds.has(item.id)} disabled={retryingIds.has(item.id)} onClick={() => void handleRetry(item.id)}><RotateCcw size={15} className={retryingIds.has(item.id) ? 'spin' : ''} /><span>{retryingIds.has(item.id) ? '重试中' : '重试'}</span></button>}{(item.status === 'queued' || item.status === 'running') && <button className="queue-cancel-button" title="取消任务" aria-label={`取消任务 ${item.title}`} onClick={() => void onCancel(item.id)}><X size={15} /><span>取消</span></button>}</div></div>)}</div><div className="queue-footnote"><CircleHelp size={15} />生图接口超时会进入“待确认”，不会自动重复计费请求。</div></div>
 }
 
 function GalleryPage({ assets, focusJobId, onClearFocus }: { assets: GalleryAsset[]; focusJobId: string | null; onClearFocus: () => void }) {

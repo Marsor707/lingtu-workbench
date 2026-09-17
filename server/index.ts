@@ -529,6 +529,13 @@ export class JobStore {
     this.db.prepare('UPDATE jobs SET status = ?, created_at = ?, cancelled_at = NULL, provider_json = ?, results_json = NULL, error_json = NULL, provider_id = ?, request_json = ?, updated_at = ? WHERE id = ? AND status IN (?, ?)').run('queued', timestamp, JSON.stringify({ status: 'pending', invoked: false }), nextRequest.providerId ?? null, JSON.stringify(persistedRequest), timestamp, id, 'failed', 'cancelled')
     return this.get(id)
   }
+  // 批量重试只覆盖失败任务：已取消是用户主动终止，不属于"失败堆积"，且批量重跑会放大误操作。
+  retryFailed(latest?: { provider?: ProviderConfig; providerId?: string; pixelUpscale?: PixelUpscaleLevel; imageNamingEnabled?: boolean; llmProvider?: { baseUrl: string; apiKey: string; model: string }; llmProviderId?: string }): Job[] {
+    return this.list().filter((job) => job.status === 'failed').flatMap((job) => {
+      const retried = this.retry(job.id, latest)
+      return retried ? [retried] : []
+    })
+  }
 }
 export class RequestValidationError extends Error { constructor(public readonly code: string, message: string) { super(message) } }
 function portFromEnvironment(): number { const value = process.env.LINGTU_PORT; if (value === undefined || value === '') return DEFAULT_PORT; const port = Number(value); if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('LINGTU_PORT must be an integer between 0 and 65535'); return port }
@@ -724,6 +731,15 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   const dropPending = (id: string): void => {
     pendingJobIds.delete(id)
     for (let index = pendingJobs.length - 1; index >= 0; index -= 1) if (pendingJobs[index] === id) pendingJobs.splice(index, 1)
+  }
+  // 重试前清掉上一轮的执行痕迹：旧 SSE 通道和调度占用都会让新任务被 queue() 误判为“已在跑”而永远不执行。
+  const resetJobExecution = (id: string): void => {
+    runtimes.get(id)?.controller.abort()
+    runtimes.delete(id)
+    store.forgetProvider(id)
+    executionTokens.delete(id)
+    runningJobIds.delete(id)
+    dropPending(id)
   }
   const latestRetryConfig = (): { provider: ProviderConfig; providerId?: string; imageNamingEnabled: boolean; llmProvider?: { baseUrl: string; apiKey: string; model: string }; llmProviderId?: string } => {
     const activeProvider = store.activeProvider()
@@ -985,12 +1001,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         if (!current) { errorResponse(res, 404, 'job_not_found', '任务不存在'); return }
         if (!['failed', 'cancelled'].includes(current.status)) { errorResponse(res, 409, 'retry_not_allowed', '仅失败或已取消的任务可以重试'); return }
         // 取消旧执行并使其失效，避免旧请求在新一轮任务中回写状态或结果。
-        runtimes.get(id)?.controller.abort()
-        runtimes.delete(id)
-        store.forgetProvider(id)
-        executionTokens.delete(id)
-        runningJobIds.delete(id)
-        dropPending(id)
+        resetJobExecution(id)
         const latest = latestRetryConfig()
         const job = store.retry(id, { ...latest, pixelUpscale })
         if (!job) { errorResponse(res, 409, 'retry_conflict', '任务状态已发生变化，请刷新后重试'); return }
@@ -999,6 +1010,24 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         if (job.prompt || job.windows) queue(job.id)
         return
       }
+    }
+    // 批量重试固定在单任务路由之前匹配，否则 `retry-failed` 会被当成任务 ID 吞掉。
+    if (req.method === 'POST' && path === '/api/jobs/retry-failed') {
+      // 目标集合由服务端自己判定，不接受前端传入的 ID 列表，避免越权与刷新造成的竞态。
+      const targets = store.list().filter((job) => job.status === 'failed')
+      if (targets.length === 0) { json(res, 200, { items: [], total: 0 }); return }
+      // 供应商与工作区设置只读一次，保证同一批重试使用同一套配置。
+      const latest = latestRetryConfig()
+      const items = targets.flatMap((target) => {
+        resetJobExecution(target.id)
+        const job = store.retry(target.id, { ...latest, pixelUpscale })
+        if (!job) return []
+        appendExecutionLog(workspaceDir, 'job_retried', { jobId: target.id, previousStatus: target.status, batch: true })
+        return [job]
+      })
+      json(res, 200, { items, total: items.length })
+      for (const job of items) if (job.prompt || job.windows) queue(job.id)
+      return
     }
     if (req.method === 'GET' && path === '/api/update/check') {
       // 检查更新只读远端，不改本地状态；失败必须报错，不能退化成"没有新版本"。
