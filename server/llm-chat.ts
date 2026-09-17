@@ -17,7 +17,11 @@ export function chatEndpoint(baseUrl: string): string {
   try { parsed = new URL(baseUrl) } catch { throw new LlmChatError('invalid_llm_url', 'LLM 服务地址格式无效') }
   if (!['http:', 'https:'].includes(parsed.protocol)) throw new LlmChatError('invalid_llm_url', 'LLM 服务地址必须使用 http 或 https')
   const path = parsed.pathname.replace(/\/+$/, '')
-  parsed.pathname = path.endsWith('/chat/completions') ? path : `${path.endsWith('/v1') ? path : `${path}/v1`}/chat/completions`
+  // 服务地址既可填到 API 根（如 /v1、豆包的 /api/v3），也可直接填完整端点。停在版本段时只补 chat/completions，
+  // 否则豆包地址会被拼成 /api/v3/v1/chat/completions 而收到 404。
+  parsed.pathname = path.endsWith('/chat/completions')
+    ? path
+    : /\/v\d+$/.test(path) ? `${path}/chat/completions` : `${path}/v1/chat/completions`
   return parsed.toString()
 }
 
@@ -41,9 +45,10 @@ export async function chatVision(config: LlmChatConfig, system: string, text: st
   if (!config.apiKey.trim() || !config.model.trim()) throw new LlmChatError('llm_not_configured', 'LLM 未配置完整')
   const timeoutSignal = AbortSignal.timeout(DEFAULT_TIMEOUT_MS)
   const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+  const endpoint = chatEndpoint(config.baseUrl)
   let response: Response
   try {
-    response = await fetch(chatEndpoint(config.baseUrl), {
+    response = await fetch(endpoint, {
       method: 'POST',
       headers: { Accept: 'application/json', Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -63,7 +68,8 @@ export async function chatVision(config: LlmChatConfig, system: string, text: st
     if (signal?.aborted) throw new DOMException('LLM 请求已取消', 'AbortError')
     throw new LlmChatError('llm_network_error', 'LLM 网络请求失败')
   }
-  if (!response.ok) throw new LlmChatError('llm_http_error', `LLM 请求失败（HTTP ${response.status}）`, response.status)
+  // 带出实际请求路径，地址或模型拼错时能直接定位（此处只暴露路径，不带查询参数以免泄露密钥）。
+  if (!response.ok) throw new LlmChatError('llm_http_error', `LLM 请求失败（HTTP ${response.status}，请求地址 ${new URL(endpoint).pathname}）`, response.status)
   let body: unknown
   try { body = await response.json() } catch { throw new LlmChatError('llm_invalid_response', 'LLM 返回不是有效 JSON') }
   return responseContent(body)
