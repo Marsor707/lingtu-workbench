@@ -124,7 +124,7 @@ src-tauri/binaries/lingtu-server-x86_64-pc-windows-msvc.exe
 
 没有 Windows 开发环境时，使用 GitHub Actions 的平台 runner：
 
-- `macos-latest`：构建 Apple Silicon 和 Intel 的 macOS 包。
+- `macos-14`：构建 Apple Silicon（ARM64）的 macOS 包。仅发布 ARM64，不再产出 Intel 包。
 - `windows-latest`：构建 Windows x64 的 NSIS `.exe` 或 MSI 包。
 
 每个平台的 job 都应执行 `npm ci`、构建对应平台的 Node sidecar、放置 target triple 文件，然后运行 `tauri build`。Windows 安装包由 Windows runner 生成，不依赖本地 Windows 机器。发布前再配置 macOS 签名/公证、Windows 代码签名和构建产物 SHA-256。
