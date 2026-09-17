@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client'
 import {
   AlertTriangle,
   Archive,
+  ArrowRight,
   ArrowUpRight,
   BarChart3,
   BookOpen,
@@ -146,10 +147,30 @@ type DashboardStats = {
 }
 
 type ApiErrorBody = {
-  error?: { message?: string }
+  error?: { message?: string; code?: string }
 }
 
+// 检查更新结果对应后端 /api/update/check；state 是唯一驱动 UI 的判据。
+type UpdateCheck = {
+  currentVersion: string
+  latestVersion: string
+  minSupportedVersion: string
+  notes: string
+  state: 'latest' | 'update' | 'manual'
+  platform: string
+  asset: { name: string; url: string; size?: number } | null
+}
+
+type UpdatePhase =
+  | { kind: 'idle' }
+  | { kind: 'checking' }
+  | { kind: 'checked'; result: UpdateCheck; skipped: boolean }
+  | { kind: 'downloading'; result: UpdateCheck; downloaded: number; total: number; percent: number }
+  | { kind: 'downloaded'; result: UpdateCheck; path: string }
+  | { kind: 'failed'; message: string }
+
 const SELECTED_PROMPT_STORAGE_KEY = 'lingtu-selected-prompt'
+const SKIPPED_VERSION_STORAGE_KEY = 'lingtu.skipped-version'
 const MAX_CONCURRENCY_STORAGE_KEY = 'lingtu-max-concurrency'
 const DEFAULT_MAX_CONCURRENCY = 4
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024
@@ -376,12 +397,15 @@ function assetsFromJob(job: ApiJob): GalleryAsset[] {
   }))
 }
 
+type AppUpdate = ReturnType<typeof useAppUpdate>
+
 function App() {
   const [page, setPage] = useState<Page>('workbench')
   const [mode, setMode] = useState<Mode>('generate')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [running, setRunning] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const update = useAppUpdate()
   const [maxConcurrency, setMaxConcurrency] = useState(() => readStoredMaxConcurrency())
   const [pixelUpscale, setPixelUpscale] = useState<PixelUpscaleLevel>('off')
   const [imageNamingEnabled, setImageNamingEnabled] = useState(false)
@@ -1045,7 +1069,7 @@ function App() {
       </main>
 
       {/* key 确保每次打开都重挂载弹窗：草稿 state 从最新服务端值重新初始化，避免显示陈旧快照。 */}
-      {showSettings && <SettingsModal key={pixelUpscale + String(maxConcurrency) + String(imageNamingEnabled)} maxConcurrency={maxConcurrency} pixelUpscale={pixelUpscale} imageNamingEnabled={imageNamingEnabled} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsModal key={pixelUpscale + String(maxConcurrency) + String(imageNamingEnabled)} maxConcurrency={maxConcurrency} pixelUpscale={pixelUpscale} imageNamingEnabled={imageNamingEnabled} hasRunningTasks={queue.some((item) => item.status === 'running' || item.status === 'queued')} update={update} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
     </div>
   )
 }
@@ -1649,7 +1673,167 @@ const pixelUpscaleHelpText: Record<PixelUpscaleLevel, string> = {
   '4K': '任务完成前在本机按比例放大最长边至 3840px，不调用模型。',
 }
 
-function SettingsModal({ maxConcurrency, pixelUpscale, imageNamingEnabled, onSave, onClose }: { maxConcurrency: number; pixelUpscale: PixelUpscaleLevel; imageNamingEnabled: boolean; onSave: (maxConcurrency: number, pixelUpscale: PixelUpscaleLevel, imageNamingEnabled: boolean) => Promise<void>; onClose: () => void }) {
+async function readErrorMessage(response: Response, fallback: string): Promise<string> {
+  try {
+    const body = await response.json() as ApiErrorBody
+    return body.error?.message || fallback
+  } catch {
+    return fallback
+  }
+}
+
+/**
+ * 应用更新状态机与下载逻辑。
+ * 放在 App 层而不是弹窗内：关掉设置弹窗不会中断正在进行的下载（43MB 重新下代价很高）。
+ * 本区块不做就地更新，也不会杀掉正在运行的服务，因此下载本身无需拦截。
+ */
+function useAppUpdate() {
+  const [phase, setPhase] = useState<UpdatePhase>({ kind: 'idle' })
+  const downloadAbortRef = useRef<AbortController | null>(null)
+  useEffect(() => () => downloadAbortRef.current?.abort(), [])
+
+  const skippedVersion = (): string => { try { return localStorage.getItem(SKIPPED_VERSION_STORAGE_KEY) ?? '' } catch { return '' } }
+
+  const check = useCallback(async () => {
+    setPhase({ kind: 'checking' })
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/api/update/check`)
+      if (!response.ok) throw new Error(await readErrorMessage(response, '检查更新失败'))
+      const result = await response.json() as UpdateCheck
+      setPhase({ kind: 'checked', result, skipped: skippedVersion() === result.latestVersion })
+    } catch (checkError) {
+      setPhase({ kind: 'failed', message: checkError instanceof Error ? checkError.message : '检查更新失败' })
+    }
+  }, [])
+
+  const download = useCallback(async (result: UpdateCheck) => {
+    if (!result.asset) return false
+    const controller = new AbortController()
+    downloadAbortRef.current = controller
+    setPhase({ kind: 'downloading', result, downloaded: 0, total: result.asset.size ?? 0, percent: 0 })
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/api/update/download`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version: result.latestVersion }),
+        signal: controller.signal,
+      })
+      if (!response.ok) throw new Error(await readErrorMessage(response, '下载更新包失败'))
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error('下载更新包失败：当前浏览器不支持流式进度')
+      const decoder = new TextDecoder()
+      // 后端按 SSE 推送进度，分片边界可能切断报文，用 buffer 拼回完整事件。
+      let buffer = ''
+      let path = ''
+      let failure = ''
+      const consume = (text: string) => {
+        buffer += text
+        const blocks = buffer.split('\n\n')
+        buffer = blocks.pop() ?? ''
+        for (const block of blocks) {
+          const eventName = block.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim() ?? ''
+          const raw = block.split('\n').find((line) => line.startsWith('data:'))?.slice(5).trim()
+          if (!raw) continue
+          const data = JSON.parse(raw) as { downloaded?: number; total?: number; percent?: number; path?: string; message?: string }
+          if (eventName === 'progress') setPhase({ kind: 'downloading', result, downloaded: data.downloaded ?? 0, total: data.total ?? 0, percent: data.percent ?? 0 })
+          if (eventName === 'completed' && data.path) path = data.path
+          if (eventName === 'failed') failure = data.message ?? '下载更新包失败'
+        }
+      }
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        consume(decoder.decode(value, { stream: true }))
+      }
+      consume(decoder.decode())
+      if (failure) throw new Error(failure)
+      if (!path) throw new Error('下载完成但未拿到安装包路径')
+      setPhase({ kind: 'downloaded', result, path })
+      return true
+    } catch (downloadError) {
+      // 用户主动取消属于正常路径，回到可重新下载的状态而不是报错。
+      if (controller.signal.aborted) { setPhase({ kind: 'checked', result, skipped: false }); return false }
+      setPhase({ kind: 'failed', message: downloadError instanceof Error ? downloadError.message : '下载更新包失败' })
+      return false
+    } finally {
+      downloadAbortRef.current = null
+    }
+  }, [])
+
+  const cancelDownload = useCallback(() => { downloadAbortRef.current?.abort() }, [])
+  const skip = useCallback((version: string, result: UpdateCheck) => {
+    try { localStorage.setItem(SKIPPED_VERSION_STORAGE_KEY, version) } catch { /* 存储不可用时仅本次生效 */ }
+    setPhase({ kind: 'checked', result, skipped: true })
+  }, [])
+
+  return { phase, check, download, cancelDownload, skip }
+}
+
+function UpdateRow({ hasRunningTasks, phase, check, download, cancelDownload, skip }: {
+  hasRunningTasks: boolean
+  phase: UpdatePhase
+  check: () => Promise<void>
+  download: (result: UpdateCheck) => Promise<boolean>
+  cancelDownload: () => void
+  skip: (version: string, result: UpdateCheck) => void
+}) {
+  const [copied, setCopied] = useState(false)
+
+  const copyPath = async (path: string) => {
+    try {
+      await navigator.clipboard.writeText(path)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 2400)
+    } catch { /* 剪贴板不可用时用户仍可手动选中路径复制 */ }
+  }
+
+  const actions = (() => {
+    if (phase.kind === 'checking') return <button className="button button-ghost button-small" disabled><LoaderCircle size={14} className="spin" />检查中…</button>
+    if (phase.kind === 'downloading') return <button className="button button-ghost button-small" onClick={cancelDownload}><X size={14} />取消</button>
+    if (phase.kind === 'downloaded') return <button className="button button-primary button-small" onClick={() => void copyPath(phase.path)}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? '已复制' : '复制路径'}</button>
+    if (phase.kind === 'failed') return <button className="button button-ghost button-small" onClick={() => void check()}><RefreshCw size={14} />重试</button>
+    if (phase.kind === 'checked' && phase.result.state === 'update') {
+      return <>
+        <button className="button button-primary button-small" onClick={() => void download(phase.result)} disabled={hasRunningTasks} title={hasRunningTasks ? '有任务正在执行，请结束后再下载' : undefined}><DownloadIcon />立即更新</button>
+        <button className="button button-ghost button-small" onClick={() => skip(phase.result.latestVersion, phase.result)}>跳过此版本</button>
+      </>
+    }
+    return <button className="button button-ghost button-small" onClick={() => void check()}><RefreshCw size={14} />检查更新</button>
+  })()
+
+  const detail = (() => {
+    if (phase.kind === 'idle') return <span>当前版本 {APP_VERSION || '未知'}</span>
+    if (phase.kind === 'checking') return <span>正在从更新源获取最新版本…</span>
+    if (phase.kind === 'failed') return <span className="update-error" role="alert"><AlertTriangle size={13} />{phase.message}</span>
+    if (phase.kind === 'downloaded') return <span className="update-path" title={phase.path}><CheckCircle2 size={13} />已下载到 <span className="mono">{phase.path}</span></span>
+    if (phase.kind === 'downloading') {
+      const { downloaded, total, percent } = phase
+      return <>
+        <span>正在下载 {phase.result.latestVersion} · {formatBytes(downloaded)}{total > 0 ? ` / ${formatBytes(total)}` : ''}</span>
+        <div className="update-progress" role="progressbar" aria-label="更新包下载进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={total > 0 ? percent : undefined}><i style={{ width: total > 0 ? `${Math.max(percent, 1)}%` : '100%' }} /></div>
+      </>
+    }
+    const item = phase.result
+    if (item.state === 'manual') return <span className="update-error" role="alert"><AlertTriangle size={13} />当前版本过旧，请手动下载 {item.latestVersion} 重新安装</span>
+    if (item.state === 'latest') return <span>已是最新版本（{item.currentVersion}）</span>
+    return <>
+      <span className="update-version">当前 {item.currentVersion} <ArrowRight size={12} /> <strong>{item.latestVersion}</strong></span>
+      {item.notes && <span className="update-notes" title={item.notes}>{item.notes.split('\n')[0]}</span>}
+      {phase.skipped && <span>已跳过此版本，出现更高版本时会再次提示</span>}
+      {hasRunningTasks && <span className="update-error"><AlertTriangle size={13} />有任务正在执行，请结束后再下载安装</span>}
+    </>
+  })()
+
+  return (
+    <div className="setting-row setting-row-update">
+      <div className="update-label"><strong><RefreshCw size={15} />应用更新</strong></div>
+      <div className="update-control">{detail}</div>
+      <div className="update-actions">{actions}</div>
+    </div>
+  )
+}
+
+function SettingsModal({ maxConcurrency, pixelUpscale, imageNamingEnabled, hasRunningTasks, update, onSave, onClose }: { maxConcurrency: number; pixelUpscale: PixelUpscaleLevel; imageNamingEnabled: boolean; hasRunningTasks: boolean; update: AppUpdate; onSave: (maxConcurrency: number, pixelUpscale: PixelUpscaleLevel, imageNamingEnabled: boolean) => Promise<void>; onClose: () => void }) {
   const [draftMaxConcurrency, setDraftMaxConcurrency] = useState(maxConcurrency)
   const [draftPixelUpscale, setDraftPixelUpscale] = useState<PixelUpscaleLevel>(pixelUpscale)
   const [draftImageNamingEnabled, setDraftImageNamingEnabled] = useState(imageNamingEnabled)
@@ -1705,6 +1889,7 @@ function SettingsModal({ maxConcurrency, pixelUpscale, imageNamingEnabled, onSav
             <div><strong><Sparkles size={15} />启用 LLM 图片命名</strong><span>生图完成后用已启用的视觉模型生成文件名；未配置或失败时保留原有命名。</span></div>
             <label className="setting-switch"><input type="checkbox" aria-label="启用 LLM 图片命名" checked={draftImageNamingEnabled} onChange={(event) => { setError(''); setDraftImageNamingEnabled(event.target.checked) }} /><span aria-hidden="true" /></label>
           </div>
+          <UpdateRow hasRunningTasks={hasRunningTasks} phase={update.phase} check={update.check} download={update.download} cancelDownload={update.cancelDownload} skip={update.skip} />
           {error && <div className="form-error settings-modal-error" role="alert"><AlertTriangle size={14} />{error}</div>}
         </div>
         <div className="modal-footer">

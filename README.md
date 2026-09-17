@@ -129,6 +129,32 @@ src-tauri/binaries/lingtu-server-x86_64-pc-windows-msvc.exe
 
 每个平台的 job 都应执行 `npm ci`、构建对应平台的 Node sidecar、放置 target triple 文件，然后运行 `tauri build`。Windows 安装包由 Windows runner 生成，不依赖本地 Windows 机器。发布前再配置 macOS 签名/公证、Windows 代码签名和构建产物 SHA-256。
 
+### 发版流程
+
+版本号同时存在于 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json`，不一致会让检查更新静默失灵（永远提示有新版本，或永远不提示）。
+
+```bash
+npm run version:set -- 1.0.5   # 一次同步三处
+npm run version:check          # 构建前会自动跑，也可单独校验
+git commit -am "升级版本至 1.0.5" && git tag v1.0.5 && git push origin main v1.0.5
+```
+
+推 tag 后 CI 构建安装包、创建 Release，然后由 `scripts/generate-latest-json.mjs` 列出 Release 资产、生成 `latest.json` 并补传到该 Release。
+
+> `latest.json` 的下载地址与字节数取自已上传的资产，所以必须在 Release 创建后单独生成上传，不能和安装包一起提交。本地可用
+> `node scripts/generate-latest-json.mjs v1.0.5 Marsor707/lingtu-workbench` 验证匹配逻辑（需要已登录的 `gh`）。
+
+## 应用更新
+
+当前版本会在设置弹窗的「应用更新」一栏展示，用户点「检查更新」比对更新源；有新版本时下载安装包到系统下载目录，再手动双击安装。
+
+- 更新源固定为 `releases/latest/download/latest.json`，字段契约：`version`、`min_supported_version`、`notes`、`platforms.{darwin-arm64,windows-x64}.{url,size,name}`。
+- **不做就地更新**，因此不需要签名密钥；`latest.json` 只告知版本与安装包位置。原因与代价见 ADR 0009。
+- 更新逻辑跑在 Node 本地服务里（`GET /api/update/check`、`POST /api/update/download`），复用 sidecar 的系统代理环境；原因见 ADR 0010。
+- 下载地址由服务端重新解析，不接受前端传入的 URL；文件名只取 basename，防止写出下载目录。
+
+> 本能力只能对已安装该版本的客户端生效。低版本用户（含 v1.0.4）必须手动安装一次，自动更新从这一版之后才开始工作。
+
 ## 生图体验约束
 
 - 提交后立即进入队列，显示总进度及每个任务项的独立状态。

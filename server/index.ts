@@ -4,6 +4,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFil
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { isSea } from 'node:sea'
+import { checkForUpdate, downloadUpdateAsset, defaultDownloadDirectory, UpdateSourceError } from './update.js'
 import { DEFAULT_IMAGE_MODEL, IMAGE_MODELS, editImage, generateImage, isImageModel, materializeImageResult, ProviderError } from './provider.js'
 import type { GenerationResult } from './provider.js'
 import { pixelUpscale as pixelUpscaleImage } from './image.js'
@@ -43,7 +44,7 @@ type StoredRequest = { prompt?: string; layout?: string; size?: string; resoluti
 type Runtime = { controller: AbortController; listeners: Set<HttpResponse> }
 type GenerateImage = typeof generateImage
 type EditImage = typeof editImage
-export type AppOptions = { workspaceDir?: string; staticDir?: string; generateImage?: GenerateImage; editImage?: EditImage; defaultProvider?: Partial<ProviderConfig> }
+export type AppOptions = { workspaceDir?: string; staticDir?: string; generateImage?: GenerateImage; editImage?: EditImage; defaultProvider?: Partial<ProviderConfig>; currentVersion?: string; updateSourceUrl?: string; downloadDir?: string }
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 8765
@@ -539,6 +540,13 @@ function maxConcurrencyValue(value: unknown, fallback = DEFAULT_MAX_CONCURRENCY)
 }
 function setCors(res: HttpResponse): void { res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS') }
 function dataEvent(event: string, data: unknown): string { return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n` }
+// 客户端断开时中止上游请求，避免用户关掉页面后仍继续下载几十兆。
+function requestAbortSignal(req: HttpRequest, res: HttpResponse): AbortSignal {
+  const controller = new AbortController()
+  const abort = (): void => controller.abort()
+  req.on('close', abort); res.on?.('close', abort)
+  return controller.signal
+}
 const STATIC_CONTENT_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.webp': 'image/webp',
@@ -565,6 +573,10 @@ function serveStatic(res: HttpResponse, staticDir: string, pathname: string): bo
 
 export function createApp(store = new JobStore(), options: AppOptions = {}): NativeServer {
   const runtimes = new Map<string, Runtime>(); const workspaceDir = resolve(options.workspaceDir ?? process.env.LINGTU_WORKSPACE ?? 'workspace'); const staticDirValue = options.staticDir ?? process.env.LINGTU_STATIC_DIR; const staticDir = staticDirValue?.trim() ? resolve(staticDirValue) : undefined; const imageGenerator = options.generateImage ?? generateImage; const imageEditor = options.editImage ?? editImage
+  // 应用版本决定检查更新结果，由启动方注入；缺省时从环境变量读，缺省即不比较。
+  const currentVersion = options.currentVersion ?? process.env.LINGTU_APP_VERSION ?? ''
+  const updateSourceUrl = options.updateSourceUrl ?? process.env.LINGTU_UPDATE_SOURCE_URL
+  const downloadDir = options.downloadDir ?? defaultDownloadDirectory()
   const environmentMaxConcurrency = process.env.LINGTU_MAX_CONCURRENCY
   let maxConcurrency = environmentMaxConcurrency === undefined || environmentMaxConcurrency === ''
     ? store.getMaxConcurrency() ?? DEFAULT_MAX_CONCURRENCY
@@ -986,6 +998,58 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         json(res, 200, job)
         if (job.prompt || job.windows) queue(job.id)
         return
+      }
+    }
+    if (req.method === 'GET' && path === '/api/update/check') {
+      // 检查更新只读远端，不改本地状态；失败必须报错，不能退化成"没有新版本"。
+      if (!currentVersion) { errorResponse(res, 503, 'update_version_unknown', '当前应用版本未知，无法检查更新'); return }
+      try {
+        const result = await checkForUpdate({ currentVersion, sourceUrl: updateSourceUrl, signal: requestAbortSignal(req, res) })
+        json(res, 200, result); return
+      } catch (error) {
+        errorResponse(res, 502, error instanceof UpdateSourceError ? error.code : 'update_check_failed', (error as Error).message); return
+      }
+    }
+    if (req.method === 'POST' && path === '/api/update/download') {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      const item = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
+      const version = typeof item.version === 'string' ? item.version.trim() : ''
+      // 不直接相信前端传来的 URL：版本号必须与当前更新源一致，由服务端重新解析出下载地址。
+      if (!version) { errorResponse(res, 400, 'invalid_version', '缺少版本号'); return }
+      if (!currentVersion) { errorResponse(res, 503, 'update_version_unknown', '当前应用版本未知，无法下载更新'); return }
+      let checked
+      try {
+        checked = await checkForUpdate({ currentVersion, sourceUrl: updateSourceUrl, signal: requestAbortSignal(req, res) })
+      } catch (error) {
+        errorResponse(res, 502, error instanceof UpdateSourceError ? error.code : 'update_check_failed', (error as Error).message); return
+      }
+      if (!checked.asset || checked.latestVersion !== version.replace(/^v/, '')) { errorResponse(res, 409, 'update_not_available', '该版本不可下载，请重新检查更新'); return }
+      res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' })
+      res.write(dataEvent('started', { version: checked.latestVersion, name: checked.asset.name, total: checked.asset.size ?? 0 }))
+      // 进度按变更分档发送，避免 43MB 下载产生上千条事件；本次请求独立计数。
+      let lastStage = -1
+      try {
+        const result = await downloadUpdateAsset({
+          asset: checked.asset,
+          directory: downloadDir,
+          signal: requestAbortSignal(req, res),
+          // 更新源给出总字节数时按百分比去重，否则按 1MB 粒度去重。
+          onProgress: ({ downloaded, total }) => {
+            const percent = total > 0 ? Math.floor((downloaded / total) * 100) : -1
+            const stage = total > 0 ? percent : Math.floor(downloaded / (1024 * 1024))
+            if (stage === lastStage) return
+            lastStage = stage
+            res.write(dataEvent('progress', { downloaded, total, percent }))
+          },
+        })
+        appendExecutionLog(workspaceDir, 'update_downloaded', { version: checked.latestVersion, bytes: result.bytes, name: checked.asset.name })
+        res.write(dataEvent('completed', { version: checked.latestVersion, path: result.path, bytes: result.bytes }))
+        res.end(); return
+      } catch (error) {
+        appendExecutionLog(workspaceDir, 'update_download_failed', { version: checked.latestVersion, errorMessage: (error as Error).message })
+        res.write(dataEvent('failed', { code: error instanceof UpdateSourceError ? error.code : 'update_download_failed', message: (error as Error).message }))
+        res.end(); return
       }
     }
     // API 路由处理完后再托管静态文件，避免把未知 API 请求误返回前端首页。

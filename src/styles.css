@@ -247,6 +247,26 @@ h1 { font-size: clamp(25px, 2.2vw, 33px); line-height: 1.18; letter-spacing: -.4
 .modal-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 20px; background: rgba(1, 8, 5, .7); backdrop-filter: blur(5px); }.settings-modal { width: min(530px, 100%); border: 1px solid var(--border-strong); border-radius: 10px; background: #0c1a15; box-shadow: 0 25px 80px rgba(0,0,0,.45); }.modal-heading { display: flex; align-items: flex-start; justify-content: space-between; padding: 22px 23px 18px; border-bottom: 1px solid var(--border); }.modal-heading h2 { margin-top: 7px; font-size: 17px; }.settings-modal-body { display: grid; }.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 17px 23px; border-bottom: 1px solid var(--border); }.setting-row > div { display: grid; gap: 5px; }.setting-row strong { font-size: 12px; }.setting-row span:not(.key-status) { color: var(--muted-2); font-size: 10px; }.key-status { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font-size: 10px; }.setting-row select { min-height: 31px; color: var(--text); border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface-soft); padding: 0 9px; font-size: 10px; }.number-control.compact { width: 100px; }.modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 16px 23px; }.toast { position: fixed; right: 24px; bottom: 20px; z-index: 15; display: flex; align-items: center; gap: 7px; padding: 9px 12px; color: #b4d1c4; border: 1px solid #27523e; border-radius: 5px; background: rgba(10, 31, 22, .94); box-shadow: 0 8px 22px rgba(0,0,0,.25); font-size: 10px; }.toast svg { color: var(--green); }
 .modal-description { max-width: 390px; margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .setting-row-toggle { align-items: flex-start; }
+/* 基础规则 .setting-row > div { display: grid } 特异性比单个类名高，会把控制区拉成单列网格、
+   让按钮纵向堆叠；这里所有布局规则都带上 .setting-row-update 保持同等特异性并靠书写顺序生效。 */
+.setting-row-update { align-items: center; gap: 14px; }
+/* 标签不参与收缩，否则会被状态文字挤成两行。 */
+.setting-row-update .update-label { flex: 0 0 auto; white-space: nowrap; }
+.setting-row-update strong { display: inline-flex; align-items: center; gap: 6px; }
+.setting-row-update strong svg { color: var(--green); }
+.setting-row-update .update-control { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-width: 0; }
+.setting-row-update .update-control > span:not(.update-error) { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.setting-row-update .update-control > span.update-error { color: var(--red); }
+.setting-row-update .update-version strong { color: var(--green); font-size: 10px; }
+.setting-row-update .update-control > span.update-notes { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 下载完成的路径可能很长，截断展示；完整路径由 title 与“复制路径”提供。 */
+.setting-row-update .update-control > span.update-path { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 下载中是唯一需要换行的状态：文字与进度条各占一行，避免进度条被挤成细条。 */
+.setting-row-update .update-control > .update-progress { flex-basis: 100%; }
+.update-progress { width: 100%; height: 4px; border-radius: 3px; background: #dcebe3; overflow: hidden; }
+.update-progress i { display: block; height: 100%; border-radius: inherit; background: var(--green); transition: width 180ms ease; }
+.update-actions { display: flex; }
+.setting-row-update .update-actions { display: flex; flex: 0 0 auto; flex-wrap: nowrap; justify-content: flex-end; gap: 6px; }
 .setting-row-toggle strong { display: inline-flex; align-items: center; gap: 6px; }
 .setting-row-toggle strong svg { color: var(--green); }
 .setting-switch { position: relative; display: inline-flex; flex: 0 0 auto; width: 44px; height: 24px; margin-top: 2px; cursor: pointer; }
@@ -410,6 +430,12 @@ h1 { font-size: clamp(25px, 2.2vw, 33px); line-height: 1.18; letter-spacing: -.4
 .toggle span { background: #92a99d; }
 .toggle.on { background: #a7d8bb; }
 .modal-backdrop { background: rgba(19, 42, 30, .38); }
+/* 更新行含完整路径等长文本，窄屏改用纵向排列，避免文字被压成竖条。 */
+@media (max-width: 760px) {
+  .setting-row-update { flex-wrap: wrap; }
+  .setting-row-update .update-control { flex-basis: 100%; order: 2; }
+  .setting-row-update .update-actions { order: 3; width: 100%; justify-content: flex-start; }
+}
 .settings-modal { background: #ffffff; box-shadow: 0 25px 80px rgba(34, 74, 53, .22); }
 .toast { color: #37674f; border-color: #a7d5b9; background: rgba(248, 255, 251, .96); box-shadow: 0 8px 22px rgba(35, 84, 58, .16); }
 

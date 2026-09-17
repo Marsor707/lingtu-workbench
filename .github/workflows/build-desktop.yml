@@ -120,6 +120,7 @@ jobs:
           merge-multiple: true
 
       - name: 创建 GitHub Release
+        id: release
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -131,3 +132,23 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 检出源码
+        uses: actions/checkout@v5
+
+      # latest.json 必须在 Release 创建后生成：它的下载地址与大小依赖已上传的安装包资产。
+      - name: 生成更新源清单
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --json body -q .body > release-notes.md
+          node scripts/generate-latest-json.mjs "$RELEASE_TAG" "$RELEASE_REPOSITORY" release-notes.md latest.json
+
+      - name: 上传更新源清单
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: gh release upload "$RELEASE_TAG" latest.json --repo "$RELEASE_REPOSITORY" --clobber

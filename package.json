@@ -7,13 +7,16 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "build:all": "npm run build && npm run backend:build",
-    "build:desktop": "npm run build:all && npm run backend:sidecar",
+    "build:desktop": "npm run version:check && npm run build:all && npm run backend:sidecar",
     "preview": "vite preview",
     "tauri": "cargo tauri",
     "backend:build": "tsc -p tsconfig.server.json",
     "backend:sidecar": "node scripts/build-sidecar.mjs",
     "backend:dev": "npm run backend:build && node --use-env-proxy --watch dist-server/index.js",
-    "backend:test": "npm run backend:build && node --test server/index.test.mjs server/provider.test.mjs server/image.test.mjs"
+    "backend:test": "npm run backend:build && node --test server/index.test.mjs server/provider.test.mjs server/image.test.mjs server/update.test.mjs",
+    "version:check": "node scripts/version.mjs check",
+    "version:set": "node scripts/version.mjs set",
+    "release:manifest": "node scripts/generate-latest-json.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

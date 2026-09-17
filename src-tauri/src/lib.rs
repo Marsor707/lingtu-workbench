@@ -294,6 +294,8 @@ pub fn run() {
         .env("LINGTU_PORT", "8765")
         .env("LINGTU_DB_PATH", database_path.to_string_lossy().to_string())
         .env("LINGTU_STATIC_DIR", static_directory.to_string_lossy().to_string())
+        // 应用版本取自 Cargo.toml，与安装包版本一致，供本地服务比对更新源。
+        .env("LINGTU_APP_VERSION", env!("CARGO_PKG_VERSION"))
         // 让 sidecar 使用 HTTP_PROXY/HTTPS_PROXY/NO_PROXY 环境变量访问 Provider。
         .env("NODE_USE_ENV_PROXY", "1");
 
