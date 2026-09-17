@@ -138,10 +138,11 @@ jobs:
         uses: actions/checkout@v5
 
       # latest.json 必须在 Release 创建后生成：它的下载地址与大小依赖已上传的安装包资产。
+      # softprops/action-gh-release 不输出 tag_name，只能用与上面 tag_name 字段一致的事件表达式。
       - name: 生成更新源清单
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           RELEASE_REPOSITORY: ${{ github.repository }}
         run: |
           gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --json body -q .body > release-notes.md
@@ -150,6 +151,6 @@ jobs:
       - name: 上传更新源清单
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           RELEASE_REPOSITORY: ${{ github.repository }}
         run: gh release upload "$RELEASE_TAG" latest.json --repo "$RELEASE_REPOSITORY" --clobber
