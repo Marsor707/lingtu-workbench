@@ -190,6 +190,8 @@ const SIZE_OPTIONS = [
   { value: '1800 × 1000', label: '9:5' },
 ] as const
 const CUSTOM_SIZE_OPTION_VALUE = '__custom__'
+// 改图提示词下拉用固定哨兵值表示「自由输入」；它不是模板 ID，不写入本地记忆，也不影响其他模式的模板选择。
+const FREE_PROMPT_OPTION_VALUE = '__free__'
 // 生图模型选项与后端白名单（server/provider.ts 的 IMAGE_MODELS）保持一致；后端会拒绝白名单之外的模型。
 const IMAGE_MODEL_OPTIONS = ['gpt-image-2', 'gpt-image-2.5-sunburst', 'gpt-image-2.5-flare'] as const
 const DEFAULT_IMAGE_MODEL = IMAGE_MODEL_OPTIONS[0]
@@ -425,6 +427,10 @@ function App() {
   const [promptsError, setPromptsError] = useState('')
   const [selectedPrompt, setSelectedPrompt] = useState<PromptSelection>(() => readStoredPromptId())
   const [textPrompt, setTextPrompt] = useState('')
+  // 改图与文生图各有独立草稿，避免与正常生图共用的 textPrompt 互相覆盖；仅存在于本次会话，刷新即回到模板态。
+  const [textToImagePrompt, setTextToImagePrompt] = useState('')
+  const [editPrompt, setEditPrompt] = useState('')
+  const [editFreePrompt, setEditFreePrompt] = useState(false)
   const [advancedSettings] = useState<AdvancedSettings>(() => readStoredAdvancedSettings())
   const [layout, setLayout] = useState(advancedSettings.layout)
   const storedCustomSize = canonicalSizeForRatio(advancedSettings.customWidth ?? '', advancedSettings.customHeight ?? '')
@@ -643,6 +649,17 @@ function App() {
     setSelectedPrompt(id)
     storePromptId(id)
     setTextPrompt(item.text)
+  }
+
+  const handleEditPromptSelect = (value: string) => {
+    if (value === FREE_PROMPT_OPTION_VALUE) {
+      setEditFreePrompt(true)
+      // 首次进入自由输入时以当前模板正文作底稿；已有手写草稿则原样保留，不用模板覆盖。
+      setEditPrompt((current) => current || selectedPromptItem?.text || '')
+      return
+    }
+    setEditFreePrompt(false)
+    handlePromptSelect(value)
   }
 
   const handlePromptItemsChange = (nextItems: PromptItem[]) => {
@@ -959,7 +976,12 @@ function App() {
       setSubmitError('请先选择至少一张源图后再开始改图')
       return
     }
-    const prompt = mode === 'one-to-many' ? enabledWindows[0]?.prompt.trim() ?? '' : textPrompt.trim() || selectedPromptItem?.text || ''
+    // 一裂多、改图、文生图各用自己的提示词来源；正常生图保持原有的模板正文与手写内容兼容行为。
+    const prompt = mode === 'one-to-many'
+      ? enabledWindows[0]?.prompt.trim() ?? ''
+      : mode === 'edit'
+        ? (editFreePrompt ? editPrompt.trim() : selectedPromptItem?.text ?? '')
+        : mode === 'text' ? textToImagePrompt.trim() : textPrompt.trim() || selectedPromptItem?.text || ''
     if (!prompt) {
       setSubmitError('请输入提示词后再开始任务')
       return
@@ -1079,7 +1101,7 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={generationPrompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProvider={activeProvider} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={generationPrompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} textToImagePrompt={textToImagePrompt} setTextToImagePrompt={setTextToImagePrompt} editPrompt={editPrompt} setEditPrompt={setEditPrompt} editFreePrompt={editFreePrompt} onEditPromptSelect={handleEditPromptSelect} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProvider={activeProvider} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={async () => { await refreshQueue() }} onCancel={cancelJob} onRetry={retryJob} onRetryFailed={retryFailedJobs} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'title-generation' && <TitleGenerationPage prompts={prompts} llmProviders={llmProviders} onOpenModelSettings={() => navigateTo('models')} onOpenPromptLibrary={() => navigateTo('prompts')} />}
@@ -1125,6 +1147,12 @@ type WorkbenchProps = {
   promptsError: string
   textPrompt: string
   setTextPrompt: (value: string) => void
+  textToImagePrompt: string
+  setTextToImagePrompt: (value: string) => void
+  editPrompt: string
+  setEditPrompt: (value: string) => void
+  editFreePrompt: boolean
+  onEditPromptSelect: (value: string) => void
   setSelectedPrompt: (value: PromptSelection) => void
   promptWindows: PromptWindow[]
   updatePromptWindow: (id: number, patch: Partial<PromptWindow>) => void
@@ -1146,7 +1174,7 @@ type WorkbenchProps = {
 }
 
 function Workbench(props: WorkbenchProps) {
-  const { mode, setMode, activeMode, layout, setLayout, size, setSize, customSizeEnabled, customWidth, customHeight, customRatioError, setCustomWidth, setCustomHeight, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProvider, submitError, onRefresh, onNavigate, onViewResults } = props
+  const { mode, setMode, activeMode, layout, setLayout, size, setSize, customSizeEnabled, customWidth, customHeight, customRatioError, setCustomWidth, setCustomHeight, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, textToImagePrompt, setTextToImagePrompt, editPrompt, setEditPrompt, editFreePrompt, onEditPromptSelect, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProvider, submitError, onRefresh, onNavigate, onViewResults } = props
   const [showAdvanced, setShowAdvanced] = useState(true)
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -1230,9 +1258,19 @@ function Workbench(props: WorkbenchProps) {
         {/* 普通生图只提交提示词和高级参数；源图输入仅用于改图与一裂多。 */}
         {(mode === 'edit' || mode === 'one-to-many') && <div className="field-block"><div className="field-label"><div><label htmlFor="source-input">{mode === 'edit' ? '源图附件' : '裂变源图'}</label><span className="field-required">必填</span></div>{mode === 'edit' && sourceFiles.length > 0 && <span className="field-hint">{sourceFiles.length} 张 · {formatBytes(sourceTotalBytes)}</span>}</div><div className={`dropzone ${sourceFiles.length > 0 ? 'has-file' : ''}`}><input id="source-input" type="file" hidden accept="image/png,image/jpeg,image/webp" multiple disabled={running} onChange={(event) => { handleSourceSelection(event.target.files); event.currentTarget.value = '' }} /><input id="source-folder-input" type="file" hidden accept="image/png,image/jpeg,image/webp" multiple disabled={running} ref={(node) => { node?.setAttribute('webkitdirectory', ''); node?.setAttribute('directory', '') }} onChange={(event) => { handleSourceSelection(event.target.files); event.currentTarget.value = '' }} /><div className="dropzone-icon"><CloudUpload size={19} /></div><div className="dropzone-copy"><strong title={inputName}>{inputName}</strong><span>{mode === 'edit' ? '支持 PNG / JPG / WEBP，单张不超过 8 MB；可多选或选择文件夹' : '拖拽图片至此，或点击选择本地图片'}</span></div>{mode === 'edit' && <label className="button button-small button-dark" htmlFor="source-folder-input"><FolderOpen size={14} />文件夹</label>}<label className="button button-small button-dark" htmlFor="source-input"><Images size={14} />图片</label></div>{mode === 'edit' && sourceFiles.length > 0 && <div className="source-file-list" aria-label="候选源图"><div className="source-file-list-heading"><strong>候选图片</strong><span>按以下顺序进入队列</span></div><div className="source-file-items">{sourceFiles.map((file, index) => <div className="source-file-chip" key={sourceFileKey(file)} title={sourceFilePath(file)}><FileImage size={14} /><span className="source-file-name">{index + 1}. {sourceFilePath(file)}</span><button className="source-file-remove" type="button" title={`移除 ${sourceFilePath(file)}`} aria-label={`移除候选图片 ${sourceFilePath(file)}`} disabled={running} onClick={() => removeSourceFile(file)}><X size={14} /></button></div>)}</div></div>}</div>}
 
-        {mode === 'text' && <div className="field-block"><div className="field-label"><label htmlFor="text-prompt">创作描述</label><span className="field-required">必填</span></div><textarea id="text-prompt" className="prompt-editor" value={textPrompt} onChange={(event) => setTextPrompt(event.target.value)} /></div>}
+        {mode === 'text' && <div className="field-block"><div className="field-label"><label htmlFor="text-prompt">创作描述</label><span className="field-required">必填</span></div><textarea id="text-prompt" className="prompt-editor" placeholder="描述你想要的画面" value={textToImagePrompt} onChange={(event) => setTextToImagePrompt(event.target.value)} /></div>}
 
-        {mode === 'one-to-many' ? <div className="field-block one-to-many-block"><div className="field-label"><div><label>一裂多提示词窗口</label><span className="field-hint">已启用 {enabledWindows.length} 个</span></div><button className="button button-small button-ghost" onClick={addPromptWindow}><Plus size={14} />添加窗口</button></div><div className="prompt-window-list">{promptWindows.map((item, index) => <div className={`prompt-window ${item.enabled ? 'enabled' : ''}`} key={item.id}><div className="window-grip"><GripVertical size={15} /></div><button className={`toggle ${item.enabled ? 'on' : ''}`} onClick={() => updatePromptWindow(item.id, { enabled: !item.enabled })} aria-label={`${item.name} ${item.enabled ? '已启用' : '未启用'}`}><span /></button><div className="window-fields"><input aria-label={`窗口 ${index + 1} 名称`} value={item.name} onChange={(event) => updatePromptWindow(item.id, { name: event.target.value })} /><textarea aria-label={`${item.name}提示词`} placeholder="输入这个方向的提示词" value={item.prompt} onChange={(event) => updatePromptWindow(item.id, { prompt: event.target.value })} /></div><button className="icon-button danger-icon" title="删除窗口" aria-label={`删除窗口 ${item.name}`} onClick={() => updatePromptWindow(item.id, { prompt: '', enabled: false })}><Trash2 size={15} /></button></div>)}</div>{enabledWindows.length < 2 && <div className="inline-warning"><AlertTriangle size={14} />至少启用两个非空窗口后才能开始</div>}</div> : <div className="field-block"><div className="field-label"><label htmlFor="template-select">提示词模板</label><button className="text-link" onClick={() => onNavigate('prompts')} disabled={promptsLoading || prompts.length === 0}>浏览全部 <ArrowUpRight size={13} /></button></div><div className="select-wrap"><select id="template-select" value={selectedPrompt} onChange={(event) => setSelectedPrompt(event.target.value)} disabled={promptsLoading || prompts.length === 0}><option value="">{promptsLoading ? '提示词加载中…' : promptsError ? '提示词加载失败' : '暂无可用提示词'}</option>{prompts.map((item) => <option key={item.id} value={item.id}>{item.category} · {item.title}</option>)}</select><ChevronDown size={16} /></div><div className="prompt-preview"><span className="prompt-type">{mode === 'text' ? '文字' : '图片'} / 模板</span><p>{selectedPromptItem ? `${selectedPromptItem.text.slice(0, 320)}${selectedPromptItem.text.length > 320 ? '…' : ''}` : promptsLoading ? '提示词加载中…' : promptsError ? '提示词暂时无法加载，请检查本地服务。' : '后端暂无可用提示词。'}</p><button className="icon-button subtle" title="复制提示词" aria-label="复制提示词" onClick={() => void copyPrompt()} disabled={!selectedPromptItem}><Copy size={15} /></button></div>{promptsError && <div className="form-error" role="status"><AlertTriangle size={14} />{promptsError}</div>}</div>}
+        {mode === 'one-to-many' && <div className="field-block one-to-many-block"><div className="field-label"><div><label>一裂多提示词窗口</label><span className="field-hint">已启用 {enabledWindows.length} 个</span></div><button className="button button-small button-ghost" onClick={addPromptWindow}><Plus size={14} />添加窗口</button></div><div className="prompt-window-list">{promptWindows.map((item, index) => <div className={`prompt-window ${item.enabled ? 'enabled' : ''}`} key={item.id}><div className="window-grip"><GripVertical size={15} /></div><button className={`toggle ${item.enabled ? 'on' : ''}`} onClick={() => updatePromptWindow(item.id, { enabled: !item.enabled })} aria-label={`${item.name} ${item.enabled ? '已启用' : '未启用'}`}><span /></button><div className="window-fields"><input aria-label={`窗口 ${index + 1} 名称`} value={item.name} onChange={(event) => updatePromptWindow(item.id, { name: event.target.value })} /><textarea aria-label={`${item.name}提示词`} placeholder="输入这个方向的提示词" value={item.prompt} onChange={(event) => updatePromptWindow(item.id, { prompt: event.target.value })} /></div><button className="icon-button danger-icon" title="删除窗口" aria-label={`删除窗口 ${item.name}`} onClick={() => updatePromptWindow(item.id, { prompt: '', enabled: false })}><Trash2 size={15} /></button></div>)}</div>{enabledWindows.length < 2 && <div className="inline-warning"><AlertTriangle size={14} />至少启用两个非空窗口后才能开始</div>}</div>}
+
+        {(mode === 'generate' || mode === 'edit') && <div className="field-block">
+          <div className="field-label"><label htmlFor="template-select">提示词模板</label><button className="text-link" onClick={() => onNavigate('prompts')} disabled={promptsLoading || prompts.length === 0}>浏览全部 <ArrowUpRight size={13} /></button></div>
+          {/* 改图把「自由输入」作为下拉末项，选中即切换到可编辑的手写正文；正常生图沿用原模板选择行为。 */}
+          <div className="select-wrap"><select id="template-select" value={mode === 'edit' && editFreePrompt ? FREE_PROMPT_OPTION_VALUE : selectedPrompt} onChange={(event) => mode === 'edit' ? onEditPromptSelect(event.target.value) : setSelectedPrompt(event.target.value)} disabled={mode === 'edit' ? promptsLoading : promptsLoading || prompts.length === 0}>{mode === 'edit' ? (promptsLoading ? <option value="">提示词加载中…</option> : promptsError && prompts.length === 0 ? <option value="">提示词加载失败</option> : prompts.length === 0 ? <option value="">暂无可用提示词</option> : <option value="">请选择提示词</option>) : <option value="">{promptsLoading ? '提示词加载中…' : promptsError ? '提示词加载失败' : '暂无可用提示词'}</option>}{prompts.map((item) => <option key={item.id} value={item.id}>{item.category} · {item.title}</option>)}{mode === 'edit' && <option value={FREE_PROMPT_OPTION_VALUE}>自由输入</option>}</select><ChevronDown size={16} /></div>
+          {mode === 'edit' && editFreePrompt && <div className="field-help">当前使用手写提示词，不随模板切换改变。</div>}
+        </div>}
+        {(mode === 'generate' || mode === 'edit') && (mode === 'edit' && editFreePrompt
+          ? <textarea id="edit-prompt" className="prompt-editor" placeholder="输入改图提示词" value={editPrompt} onChange={(event) => setEditPrompt(event.target.value)} />
+          : <div className="prompt-preview"><span className="prompt-type">图片 / 模板</span><p>{selectedPromptItem ? `${selectedPromptItem.text.slice(0, 320)}${selectedPromptItem.text.length > 320 ? '…' : ''}` : promptsLoading ? '提示词加载中…' : promptsError ? '提示词暂时无法加载，请检查本地服务。' : '后端暂无可用提示词。'}</p><button className="icon-button subtle" title="复制提示词" aria-label="复制提示词" onClick={() => void copyPrompt()} disabled={!selectedPromptItem}><Copy size={15} /></button>{promptsError && <div className="form-error" role="status"><AlertTriangle size={14} />{promptsError}</div>}</div>)}
 
         <div className="settings-divider"><button className="advanced-trigger" onClick={() => setShowAdvanced((open) => !open)} aria-expanded={showAdvanced}><SlidersHorizontal size={15} />高级参数 <span>默认生产规范</span><ChevronDown size={15} className={showAdvanced ? 'rotate-180' : ''} /></button></div>
         {showAdvanced && <div className="settings-grid">
