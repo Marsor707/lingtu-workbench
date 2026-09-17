@@ -44,7 +44,7 @@ type StoredRequest = { prompt?: string; layout?: string; size?: string; resoluti
 type Runtime = { controller: AbortController; listeners: Set<HttpResponse> }
 type GenerateImage = typeof generateImage
 type EditImage = typeof editImage
-export type AppOptions = { workspaceDir?: string; staticDir?: string; generateImage?: GenerateImage; editImage?: EditImage; defaultProvider?: Partial<ProviderConfig>; currentVersion?: string; updateSourceUrl?: string; downloadDir?: string }
+export type AppOptions = { workspaceDir?: string; staticDir?: string; generateImage?: GenerateImage; editImage?: EditImage; defaultProvider?: Partial<ProviderConfig>; currentVersion?: string; updateSourceUrl?: string; downloadDir?: string; platform?: string }
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 8765
@@ -583,6 +583,8 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   // 应用版本决定检查更新结果，由启动方注入；缺省时从环境变量读，缺省即不比较。
   const currentVersion = options.currentVersion ?? process.env.LINGTU_APP_VERSION ?? ''
   const updateSourceUrl = options.updateSourceUrl ?? process.env.LINGTU_UPDATE_SOURCE_URL
+  // 平台用于解析更新源里的安装包条目；注入而非只读宿主机，让路由层测试不依赖开发机操作系统。
+  const updatePlatform = options.platform ?? process.env.LINGTU_UPDATE_PLATFORM
   const downloadDir = options.downloadDir ?? defaultDownloadDirectory()
   const environmentMaxConcurrency = process.env.LINGTU_MAX_CONCURRENCY
   let maxConcurrency = environmentMaxConcurrency === undefined || environmentMaxConcurrency === ''
@@ -1033,7 +1035,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       // 检查更新只读远端，不改本地状态；失败必须报错，不能退化成"没有新版本"。
       if (!currentVersion) { errorResponse(res, 503, 'update_version_unknown', '当前应用版本未知，无法检查更新'); return }
       try {
-        const result = await checkForUpdate({ currentVersion, sourceUrl: updateSourceUrl, signal: requestAbortSignal(req, res) })
+        const result = await checkForUpdate({ currentVersion, sourceUrl: updateSourceUrl, ...(updatePlatform ? { platform: updatePlatform } : {}), signal: requestAbortSignal(req, res) })
         json(res, 200, result); return
       } catch (error) {
         errorResponse(res, 502, error instanceof UpdateSourceError ? error.code : 'update_check_failed', (error as Error).message); return
@@ -1049,7 +1051,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
       if (!currentVersion) { errorResponse(res, 503, 'update_version_unknown', '当前应用版本未知，无法下载更新'); return }
       let checked
       try {
-        checked = await checkForUpdate({ currentVersion, sourceUrl: updateSourceUrl, signal: requestAbortSignal(req, res) })
+        checked = await checkForUpdate({ currentVersion, sourceUrl: updateSourceUrl, ...(updatePlatform ? { platform: updatePlatform } : {}), signal: requestAbortSignal(req, res) })
       } catch (error) {
         errorResponse(res, 502, error instanceof UpdateSourceError ? error.code : 'update_check_failed', (error as Error).message); return
       }

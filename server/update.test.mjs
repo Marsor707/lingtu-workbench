@@ -187,7 +187,8 @@ test('更新路由：检查到新版本后可下载更新包', async () => {
   })
   await new Promise((resolveListen) => stub.listen(0, '127.0.0.1', () => resolveListen()))
   const store = new JobStore(join(workspace, 'lingtu.db'))
-  const app = createApp(store, { workspaceDir: join(workspace, 'workspace'), currentVersion: '1.0.4', updateSourceUrl: `http://127.0.0.1:${stub.address().port}/latest.json`, downloadDir: downloads })
+  // 显式注入平台：路由层测试不应依赖宿主机操作系统（CI 跑在 Linux 上而发布目标只有 macOS/Windows）。
+  const app = createApp(store, { workspaceDir: join(workspace, 'workspace'), currentVersion: '1.0.4', updateSourceUrl: `http://127.0.0.1:${stub.address().port}/latest.json`, downloadDir: downloads, platform: 'darwin-arm64' })
   await new Promise((resolveListen) => app.listen(0, '127.0.0.1', () => resolveListen()))
   const baseUrl = `http://127.0.0.1:${app.address().port}`
   try {
@@ -218,7 +219,8 @@ test('更新路由：服务端不接受与更新源不符的版本号', async ()
   })
   await new Promise((resolveListen) => stub.listen(0, '127.0.0.1', () => resolveListen()))
   const store = new JobStore(join(workspace, 'lingtu.db'))
-  const app = createApp(store, { workspaceDir: join(workspace, 'workspace'), currentVersion: '1.0.4', updateSourceUrl: `http://127.0.0.1:${stub.address().port}/latest.json`, downloadDir: join(workspace, 'downloads') })
+  // 同上：固定平台，避免在 Linux 上因平台不受支持而返回 502，掩盖真正的 409 校验。
+  const app = createApp(store, { workspaceDir: join(workspace, 'workspace'), currentVersion: '1.0.4', updateSourceUrl: `http://127.0.0.1:${stub.address().port}/latest.json`, downloadDir: join(workspace, 'downloads'), platform: 'darwin-arm64' })
   await new Promise((resolveListen) => app.listen(0, '127.0.0.1', () => resolveListen()))
   try {
     const baseUrl = `http://127.0.0.1:${app.address().port}`
