@@ -262,6 +262,10 @@ h1 { font-size: clamp(25px, 2.2vw, 33px); line-height: 1.18; letter-spacing: -.4
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 20px; background: rgba(1, 8, 5, .7); backdrop-filter: blur(5px); }.settings-modal { width: min(530px, 100%); border: 1px solid var(--border-strong); border-radius: 10px; background: #0c1a15; box-shadow: 0 25px 80px rgba(0,0,0,.45); }.modal-heading { display: flex; align-items: flex-start; justify-content: space-between; padding: 22px 23px 18px; border-bottom: 1px solid var(--border); }.modal-heading h2 { margin-top: 7px; font-size: 17px; }.settings-modal-body { display: grid; }.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 17px 23px; border-bottom: 1px solid var(--border); }.setting-row > div { display: grid; gap: 5px; }.setting-row strong { font-size: 12px; }.setting-row span:not(.key-status) { color: var(--muted-2); font-size: 10px; }.key-status { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font-size: 10px; }.setting-row select { min-height: 31px; color: var(--text); border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface-soft); padding: 0 9px; font-size: 10px; }.number-control.compact { width: 100px; }.modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 16px 23px; }.toast { position: fixed; right: 24px; bottom: 20px; z-index: 15; display: flex; align-items: center; gap: 7px; padding: 9px 12px; color: #b4d1c4; border: 1px solid #27523e; border-radius: 5px; background: rgba(10, 31, 22, .94); box-shadow: 0 8px 22px rgba(0,0,0,.25); font-size: 10px; }.toast svg { color: var(--green); }
 .modal-description { max-width: 390px; margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+/* 弹窗正文是 grid，网格项默认 min-width:auto：更新行里“已下载到 <完整路径>”这类长文本
+   会把整行撑到超过弹窗宽度，导致输入框、按钮等控件横穿弹窗右边界。这里显式允许收缩，
+   长文本再按各自的截断/换行规则处理。 */
+.settings-modal-body > .setting-row { min-width: 0; }
 .setting-row-toggle { align-items: flex-start; }
 /* 基础规则 .setting-row > div { display: grid } 特异性比单个类名高，会把控制区拉成单列网格、
    让按钮纵向堆叠；这里所有布局规则都带上 .setting-row-update 保持同等特异性并靠书写顺序生效。 */
@@ -275,8 +279,14 @@ h1 { font-size: clamp(25px, 2.2vw, 33px); line-height: 1.18; letter-spacing: -.4
 .setting-row-update .update-control > span.update-error { color: var(--red); }
 .setting-row-update .update-version strong { color: var(--green); font-size: 10px; }
 .setting-row-update .update-control > span.update-notes { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* 下载完成的路径可能很长，截断展示；完整路径由 title 与“复制路径”提供。 */
-.setting-row-update .update-control > span.update-path { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 下载完成的路径可能很长，截断展示；完整路径由 title 与“复制路径”提供。
+   对齐：保持基础规则的 inline-flex + align-items: center，图标与文字才会水平居中对齐；
+   如果改成 display: block，图标会退回行内基线对齐，看起来就是“打钩没跟文字上下对齐”。
+   截断：nowrap 下匿名文本盒无法低于 min-content，收缩会全部落到图标上（图标被压成 0 宽
+   直接不可见），所以图标显式不参与收缩，省略号交给可收缩的路径文本 .mono。 */
+.setting-row-update .update-control > span.update-path { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.setting-row-update .update-path > svg { flex: 0 0 auto; }
+.setting-row-update .update-path .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* 下载中是唯一需要换行的状态：文字与进度条各占一行，避免进度条被挤成细条。 */
 .setting-row-update .update-control > .update-progress { flex-basis: 100%; }
 .update-progress { width: 100%; height: 4px; border-radius: 3px; background: #dcebe3; overflow: hidden; }
