@@ -58,6 +58,9 @@ type PromptWindow = {
   enabled: boolean
 }
 
+// 放大编辑抽屉的入口：改图自由输入、文生图创作描述、一裂多的某一个提示词窗口。
+type PromptEditorTarget = { kind: 'edit' } | { kind: 'text' } | { kind: 'window'; id: number }
+
 type PromptSelection = string
 
 type PromptItem = {
@@ -433,6 +436,7 @@ function App() {
   const [textToImagePrompt, setTextToImagePrompt] = useState('')
   const [editPrompt, setEditPrompt] = useState('')
   const [editFreePrompt, setEditFreePrompt] = useState(false)
+  const [editorTarget, setEditorTarget] = useState<PromptEditorTarget | null>(null)
   const [advancedSettings] = useState<AdvancedSettings>(() => readStoredAdvancedSettings())
   const [layout, setLayout] = useState(advancedSettings.layout)
   const storedCustomSize = canonicalSizeForRatio(advancedSettings.customWidth ?? '', advancedSettings.customHeight ?? '')
@@ -448,6 +452,8 @@ function App() {
   const [sourceFiles, setSourceFiles] = useState<File[]>([])
   const [submissionProgress, setSubmissionProgress] = useState<{ current: number; total: number } | null>(null)
   const [promptWindows, setPromptWindows] = useState<PromptWindow[]>([])
+  const [draggingWindowId, setDraggingWindowId] = useState<number | null>(null)
+  const [dragOverWindowId, setDragOverWindowId] = useState<number | null>(null)
   const [queue, setQueue] = useState<QueueItem[]>([])
   const [galleryAssets, setGalleryAssets] = useState<GalleryAsset[]>([])
   const [galleryJobId, setGalleryJobId] = useState<string | null>(null)
@@ -1065,6 +1071,23 @@ function App() {
     setPromptWindows((items) => items.map((item) => item.id === id ? { ...item, ...patch } : item))
   }
 
+  // 重排按「目标位置下标」表达，拖拽落点和键盘 Alt + ↑/↓ 共用同一条路径，避免两套顺序逻辑分叉。
+  const movePromptWindow = (id: number, targetIndex: number) => {
+    setPromptWindows((items) => {
+      const from = items.findIndex((item) => item.id === id)
+      if (from < 0 || targetIndex < 0 || targetIndex >= items.length || from === targetIndex) return items
+      const next = [...items]
+      const [moved] = next.splice(from, 1)
+      next.splice(targetIndex, 0, moved)
+      return next
+    })
+  }
+
+  // React 状态更新不会在同一个事件循环内可见：同步派发的 dragover 读到的还是 null 的 draggingWindowId。
+  // 拖拽是否进行中的判断用 ref 兼底，状态只负责渲染。
+  const draggingWindowRef = useRef<number | null>(null)
+  const endWindowDrag = () => { draggingWindowRef.current = null; setDraggingWindowId(null); setDragOverWindowId(null) }
+
   const navItems: Array<{ id: Page; label: string; icon: typeof LayoutGrid; badge?: string }> = [
     { id: 'workbench', label: '生图工作台', icon: LayoutGrid },
     { id: 'queue', label: '任务队列', icon: ListChecks, badge: `${queue.filter((item) => item.status === 'running').length}` },
@@ -1110,7 +1133,7 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={generationPrompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} textToImagePrompt={textToImagePrompt} setTextToImagePrompt={setTextToImagePrompt} editPrompt={editPrompt} setEditPrompt={setEditPrompt} editFreePrompt={editFreePrompt} onEditPromptSelect={handleEditPromptSelect} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProvider={activeProvider} submitError={submitError} submitNotice={submitNotice} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={generationPrompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} textToImagePrompt={textToImagePrompt} setTextToImagePrompt={setTextToImagePrompt} editPrompt={editPrompt} setEditPrompt={setEditPrompt} editFreePrompt={editFreePrompt} onEditPromptSelect={handleEditPromptSelect} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} draggingWindowId={draggingWindowId} dragOverWindowId={dragOverWindowId} setDraggingWindowId={setDraggingWindowId} setDragOverWindowId={setDragOverWindowId} movePromptWindow={movePromptWindow} endWindowDrag={endWindowDrag} draggingWindowRef={draggingWindowRef} editorTarget={editorTarget} openEditor={setEditorTarget} closeEditor={() => setEditorTarget(null)} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProvider={activeProvider} submitError={submitError} submitNotice={submitNotice} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={async () => { await refreshQueue() }} onCancel={cancelJob} onRetry={retryJob} onRetryFailed={retryFailedJobs} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'title-generation' && <TitleGenerationPage prompts={prompts} llmProviders={llmProviders} onOpenModelSettings={() => navigateTo('models')} onOpenPromptLibrary={() => navigateTo('prompts')} />}
@@ -1167,6 +1190,17 @@ type WorkbenchProps = {
   updatePromptWindow: (id: number, patch: Partial<PromptWindow>) => void
   addPromptWindow: () => void
   enabledWindows: PromptWindow[]
+  draggingWindowId: number | null
+  dragOverWindowId: number | null
+  setDraggingWindowId: (value: number | null) => void
+  setDragOverWindowId: (value: number | null) => void
+  movePromptWindow: (id: number, targetIndex: number) => void
+  endWindowDrag: () => void
+  // 拖拽同步标记：dragover/drop 需要同步读到源窗口 id，不能用 React 状态。
+  draggingWindowRef: { current: number | null }
+  editorTarget: PromptEditorTarget | null
+  openEditor: (target: PromptEditorTarget) => void
+  closeEditor: () => void
   running: boolean
   startJob: () => void | Promise<void>
   queue: QueueItem[]
@@ -1184,7 +1218,7 @@ type WorkbenchProps = {
 }
 
 function Workbench(props: WorkbenchProps) {
-  const { mode, setMode, activeMode, layout, setLayout, size, setSize, customSizeEnabled, customWidth, customHeight, customRatioError, setCustomWidth, setCustomHeight, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, textToImagePrompt, setTextToImagePrompt, editPrompt, setEditPrompt, editFreePrompt, onEditPromptSelect, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProvider, submitError, submitNotice, onRefresh, onNavigate, onViewResults } = props
+  const { mode, setMode, activeMode, layout, setLayout, size, setSize, customSizeEnabled, customWidth, customHeight, customRatioError, setCustomWidth, setCustomHeight, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, textToImagePrompt, setTextToImagePrompt, editPrompt, setEditPrompt, editFreePrompt, onEditPromptSelect, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, draggingWindowId, dragOverWindowId, setDraggingWindowId, setDragOverWindowId, movePromptWindow, endWindowDrag, draggingWindowRef, editorTarget, openEditor, closeEditor, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProvider, submitError, submitNotice, onRefresh, onNavigate, onViewResults } = props
   const [showAdvanced, setShowAdvanced] = useState(true)
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -1193,6 +1227,8 @@ function Workbench(props: WorkbenchProps) {
   const healthScore = serviceOnline && stats ? 100 : 0
   const today = formatToday()
   const previewCount = layout === '单图' ? 1 : layout === '二宫格' ? 2 : layout === '九宫格' ? 9 : 4
+  // 抽屉内的窗口可能在关闭前被移除，取不到时回退到空值，避免渲染报错。
+  const editorPromptWindow = editorTarget?.kind === 'window' ? promptWindows.find((item) => item.id === editorTarget.id) : undefined
   const sourceTotalBytes = sourceFiles.reduce((total, file) => total + file.size, 0)
   const handleSourceSelection = (fileList: FileList | null) => {
     const result = validateSourceFiles(fileList)
@@ -1268,9 +1304,9 @@ function Workbench(props: WorkbenchProps) {
         {/* 普通生图只提交提示词和高级参数；源图输入仅用于改图与一裂多。 */}
         {(mode === 'edit' || mode === 'one-to-many') && <div className="field-block"><div className="field-label"><div><label htmlFor="source-input">{mode === 'edit' ? '源图附件' : '裂变源图'}</label><span className="field-required">必填</span></div>{mode === 'edit' && sourceFiles.length > 0 && <span className="field-hint">{sourceFiles.length} 张 · {formatBytes(sourceTotalBytes)}</span>}</div><div className={`dropzone ${sourceFiles.length > 0 ? 'has-file' : ''}`}><input id="source-input" type="file" hidden accept="image/png,image/jpeg,image/webp" multiple disabled={running} onChange={(event) => { handleSourceSelection(event.target.files); event.currentTarget.value = '' }} /><input id="source-folder-input" type="file" hidden accept="image/png,image/jpeg,image/webp" multiple disabled={running} ref={(node) => { node?.setAttribute('webkitdirectory', ''); node?.setAttribute('directory', '') }} onChange={(event) => { handleSourceSelection(event.target.files); event.currentTarget.value = '' }} /><div className="dropzone-icon"><CloudUpload size={19} /></div><div className="dropzone-copy"><strong title={inputName}>{inputName}</strong><span>{mode === 'edit' ? '支持 PNG / JPG / WEBP，单张不超过 8 MB；可多选或选择文件夹' : '拖拽图片至此，或点击选择本地图片'}</span></div>{mode === 'edit' && <label className="button button-small button-dark" htmlFor="source-folder-input"><FolderOpen size={14} />文件夹</label>}<label className="button button-small button-dark" htmlFor="source-input"><Images size={14} />图片</label></div>{mode === 'edit' && sourceFiles.length > 0 && <div className="source-file-list" aria-label="候选源图"><div className="source-file-list-heading"><strong>候选图片</strong><span>按以下顺序进入队列</span></div><div className="source-file-items">{sourceFiles.map((file, index) => <div className="source-file-chip" key={sourceFileKey(file)} title={sourceFilePath(file)}><FileImage size={14} /><span className="source-file-name">{index + 1}. {sourceFilePath(file)}</span><button className="source-file-remove" type="button" title={`移除 ${sourceFilePath(file)}`} aria-label={`移除候选图片 ${sourceFilePath(file)}`} disabled={running} onClick={() => removeSourceFile(file)}><X size={14} /></button></div>)}</div></div>}</div>}
 
-        {mode === 'text' && <div className="field-block"><div className="field-label"><label htmlFor="text-prompt">创作描述</label><span className="field-required">必填</span></div><textarea id="text-prompt" className="prompt-editor" placeholder="描述你想要的画面" value={textToImagePrompt} onChange={(event) => setTextToImagePrompt(event.target.value)} /></div>}
+        {mode === 'text' && <div className="field-block"><div className="field-label"><label htmlFor="text-prompt">创作描述</label><span className="field-required">必填</span></div><PromptEditor id="text-prompt" value={textToImagePrompt} onChange={setTextToImagePrompt} placeholder="描述你想要的画面" onExpand={() => openEditor({ kind: 'text' })} /></div>}
 
-        {mode === 'one-to-many' && <div className="field-block one-to-many-block"><div className="field-label"><div><label>一裂多提示词窗口</label><span className="field-hint">已启用 {enabledWindows.length} 个</span></div><button className="button button-small button-ghost" onClick={addPromptWindow}><Plus size={14} />添加窗口</button></div><div className="prompt-window-list">{promptWindows.map((item, index) => <div className={`prompt-window ${item.enabled ? 'enabled' : ''}`} key={item.id}><div className="window-grip"><GripVertical size={15} /></div><button className={`toggle ${item.enabled ? 'on' : ''}`} onClick={() => updatePromptWindow(item.id, { enabled: !item.enabled })} aria-label={`${item.name} ${item.enabled ? '已启用' : '未启用'}`}><span /></button><div className="window-fields"><input aria-label={`窗口 ${index + 1} 名称`} value={item.name} onChange={(event) => updatePromptWindow(item.id, { name: event.target.value })} /><textarea aria-label={`${item.name}提示词`} placeholder="输入这个方向的提示词" value={item.prompt} onChange={(event) => updatePromptWindow(item.id, { prompt: event.target.value })} /></div><button className="icon-button danger-icon" title="删除窗口" aria-label={`删除窗口 ${item.name}`} onClick={() => updatePromptWindow(item.id, { prompt: '', enabled: false })}><Trash2 size={15} /></button></div>)}</div>{enabledWindows.length < 2 && <div className="inline-warning"><AlertTriangle size={14} />至少启用两个非空窗口后才能开始</div>}</div>}
+        {mode === 'one-to-many' && <div className="field-block one-to-many-block"><div className="field-label"><div><label>一裂多提示词窗口</label><span className="field-hint">已启用 {enabledWindows.length} 个 · 生成顺序即窗口顺序</span></div><button className="button button-small button-ghost" onClick={addPromptWindow}><Plus size={14} />添加窗口</button></div><div className="prompt-window-list">{promptWindows.map((item, index) => <div className={`prompt-window ${item.enabled ? 'enabled' : ''} ${draggingWindowId === item.id ? 'dragging' : ''} ${dragOverWindowId === item.id && draggingWindowId !== item.id ? 'drag-over' : ''}`} key={item.id} onDragOver={(event) => { const source = draggingWindowRef.current; if (source === null || source === item.id) return; event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDragOverWindowId(item.id) }} onDrop={(event) => { event.preventDefault(); const source = draggingWindowRef.current; if (source !== null) movePromptWindow(source, index); endWindowDrag() }} onKeyDown={(event) => { if (!event.altKey) return; if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return; event.preventDefault(); movePromptWindow(item.id, event.key === 'ArrowUp' ? index - 1 : index + 1) }}><span className="window-order" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span><span className="window-grip" draggable title="拖拽调整顺序" onDragStart={(event) => { draggingWindowRef.current = item.id; setDraggingWindowId(item.id); event.dataTransfer.effectAllowed = 'move' }} onDragEnd={endWindowDrag}><GripVertical size={15} /></span><button className={`toggle ${item.enabled ? 'on' : ''}`} onClick={() => updatePromptWindow(item.id, { enabled: !item.enabled })} aria-label={`${item.name} ${item.enabled ? '已启用' : '未启用'}`}><span /></button><div className="window-fields"><input aria-label={`窗口 ${index + 1} 名称`} value={item.name} onChange={(event) => updatePromptWindow(item.id, { name: event.target.value })} /><PromptEditor ariaLabel={`${item.name}提示词`} value={item.prompt} onChange={(next) => updatePromptWindow(item.id, { prompt: next })} placeholder="输入这个方向的提示词" onExpand={() => openEditor({ kind: 'window', id: item.id })} /></div><div className="window-actions"><button className="icon-button subtle danger-icon" title="删除窗口" aria-label={`删除窗口 ${item.name}`} onClick={() => updatePromptWindow(item.id, { prompt: '', enabled: false })}><Trash2 size={15} /></button></div></div>)}</div>{enabledWindows.length < 2 && <div className="inline-warning"><AlertTriangle size={14} />至少启用两个非空窗口后才能开始</div>}</div>}
 
         {(mode === 'generate' || mode === 'edit') && <div className="field-block">
           <div className="field-label"><label htmlFor="template-select">提示词模板</label><button className="text-link" onClick={() => onNavigate('prompts')} disabled={promptsLoading || prompts.length === 0}>浏览全部 <ArrowUpRight size={13} /></button></div>
@@ -1279,7 +1315,7 @@ function Workbench(props: WorkbenchProps) {
           {mode === 'edit' && editFreePrompt && <div className="field-help">当前使用手写提示词，不随模板切换改变。</div>}
         </div>}
         {(mode === 'generate' || mode === 'edit') && (mode === 'edit' && editFreePrompt
-          ? <textarea id="edit-prompt" className="prompt-editor" placeholder="输入改图提示词" value={editPrompt} onChange={(event) => setEditPrompt(event.target.value)} />
+          ? <PromptEditor id="edit-prompt" value={editPrompt} onChange={setEditPrompt} placeholder="输入改图提示词" onExpand={() => openEditor({ kind: 'edit' })} />
           : <div className="prompt-preview"><span className="prompt-type">图片 / 模板</span><p>{selectedPromptItem ? `${selectedPromptItem.text.slice(0, 320)}${selectedPromptItem.text.length > 320 ? '…' : ''}` : promptsLoading ? '提示词加载中…' : promptsError ? '提示词暂时无法加载，请检查本地服务。' : '后端暂无可用提示词。'}</p><button className="icon-button subtle" title="复制提示词" aria-label="复制提示词" onClick={() => void copyPrompt()} disabled={!selectedPromptItem}><Copy size={15} /></button>{promptsError && <div className="form-error" role="status"><AlertTriangle size={14} />{promptsError}</div>}</div>)}
 
         <div className="settings-divider"><button className="advanced-trigger" onClick={() => setShowAdvanced((open) => !open)} aria-expanded={showAdvanced}><SlidersHorizontal size={15} />高级参数 <span>默认生产规范</span><ChevronDown size={15} className={showAdvanced ? 'rotate-180' : ''} /></button></div>
@@ -1307,6 +1343,15 @@ function Workbench(props: WorkbenchProps) {
 
     <section className="bottom-grid"><div className="activity-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">活动</span><h2>最近任务</h2></div><button className="text-link" onClick={() => onNavigate('queue')}>打开队列 <ArrowUpRight size={13} /></button></div><div className="activity-list">{queue.slice(0, 3).map((item) => <div className={`activity-item ${item.status === 'done' && item.resultCount ? 'has-result' : ''}`} key={item.id}><div className={`activity-icon ${item.status}`}><StatusIcon status={item.status} /></div><div className="activity-copy"><strong>{item.title}</strong><span>{item.id} · {item.meta}</span></div>{item.status === 'done' && item.resultCount ? <div className="activity-state"><button className="activity-result-button" type="button" aria-label={`查看任务 ${item.id} 的 ${item.resultCount} 张结果`} onClick={() => onViewResults(item.id)}><Eye size={14} />查看结果</button></div> : null}</div>)}{queue.length === 0 && <div className="empty-state">暂无任务记录</div>}</div></div><div className="health-panel panel"><div className="panel-heading compact"><div><span className="section-kicker">服务状态</span><h2>本地运行健康度</h2></div><span className={`healthy-pill ${serviceOnline ? '' : 'offline'} `}><span />{serviceOnline ? '正常' : '未连接'}</span></div><div className="health-content"><div className="health-ring" style={{ '--health-score': `${healthScore}%` } as React.CSSProperties}><div><strong>{statsLoading ? '...' : healthScore}</strong><span>健康分</span></div></div><div className="health-list"><HealthRow label="本地任务引擎" value={serviceOnline ? '运行中' : '未连接'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="本地数据" value={serviceOnline ? '已就绪' : '不可用'} tone={serviceOnline ? 'good' : 'idle'} /><HealthRow label="工作区" value={storageText + (stats?.storageTotalGb ? ` / ${stats.storageTotalGb} GB` : '')} tone={stats?.storageUsedGb === undefined ? 'idle' : 'good'} /></div></div></div></section>
   {feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}
+  <PromptEditorSheet
+    open={editorTarget !== null}
+    title={editorTarget?.kind === 'edit' ? '改图提示词' : editorTarget?.kind === 'text' ? '文生图创作描述' : '提示词窗口'}
+    description={editorTarget?.kind === 'edit' ? '当前使用手写提示词，不随模板切换改变。' : editorTarget?.kind === 'text' ? '描述你想要的画面，内容与主面板实时同步。' : '窗口的生成顺序即列表顺序，名称与正文都会同步回主面板。'}
+    value={editorTarget?.kind === 'edit' ? editPrompt : editorTarget?.kind === 'text' ? textToImagePrompt : editorPromptWindow?.prompt ?? ''}
+    onChange={editorTarget?.kind === 'edit' ? setEditPrompt : editorTarget?.kind === 'text' ? setTextToImagePrompt : (next: string) => { if (editorPromptWindow) updatePromptWindow(editorPromptWindow.id, { prompt: next }) }}
+    {...(editorTarget?.kind === 'window' && editorPromptWindow ? { name: editorPromptWindow.name, onNameChange: (next: string) => updatePromptWindow(editorPromptWindow.id, { name: next }) } : {})}
+    onClose={closeEditor}
+  />
   </div>
 }
 
@@ -1538,8 +1583,63 @@ function ApiPromptsPage({ prompts, loading, error, selectedPrompt, setSelectedPr
   return <div className="page-content inner-page"><section className="page-heading heading-row"><div><div className="eyebrow"><span className="eyebrow-line" />内容资产</div><h1>提示词库</h1><p>生图提示词与商品标题提示词分开存放；内置提示词可编辑，自定义提示词支持新增、编辑和删除。</p></div><div className="heading-actions"><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />新增提示词</button></div></section>{showForm && <form className="prompt-form panel" onSubmit={(event) => void savePrompt(event)}><div className="prompt-form-heading"><div><span className="section-kicker">{editing ? '编辑提示词' : '新建提示词'}</span><h2>{editing ? editing.title : '创建可复用模板'}</h2></div><button className="icon-button" type="button" aria-label="取消编辑" title="取消" onClick={resetForm}><X size={17} /></button></div><div className="prompt-form-grid"><div className="setting-field"><label htmlFor="prompt-title">标题 <span className="field-required">必填</span></label><input id="prompt-title" value={title} onChange={(event) => setTitle(event.target.value)} autoFocus /></div><div className="setting-field"><label htmlFor="prompt-category">分类 <span className="field-required">必填</span></label><input id="prompt-category" value={formCategory} onChange={(event) => setFormCategory(event.target.value)} /></div><div className="setting-field"><label htmlFor="prompt-purpose">用途</label><select id="prompt-purpose" value={purpose} onChange={(event) => setPurpose(event.target.value)}><option value="generation">生图</option><option value="title">商品标题</option></select></div>{purpose !== 'title' && <div className="setting-field"><label htmlFor="prompt-layout">布局（可选）</label><select id="prompt-layout" value={layout} onChange={(event) => setLayout(event.target.value)}><option value="">不指定，由高级参数决定</option><option value="single">单图</option><option value="two_up">二宫格</option><option value="four_up">四宫格</option><option value="nine_up">九宫格</option></select></div>}<div className="setting-field prompt-form-text"><label htmlFor="prompt-text">提示词正文 <span className="field-required">必填</span></label><textarea id="prompt-text" value={text} onChange={(event) => setText(event.target.value)} rows={9} /></div></div>{formError && <div className="form-error prompt-form-error" role="alert"><AlertTriangle size={14} />{formError}</div>}<div className="prompt-form-actions"><button className="button button-ghost" type="button" onClick={resetForm} disabled={saving}>取消</button><button className="button button-primary" type="submit" disabled={saving}>{saving ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}{saving ? '保存中' : '保存提示词'}</button></div></form>}<div className="prompt-toolbar"><div className="filter-tabs" role="tablist" aria-label="提示词用途"><button className={purposeFilter === 'generation' ? 'active' : ''} type="button" role="tab" aria-selected={purposeFilter === 'generation'} onClick={() => switchPurpose('generation')}>生图 <span>{prompts.filter((item) => (item.purpose ?? 'generation') === 'generation').length}</span></button><button className={purposeFilter === 'title' ? 'active' : ''} type="button" role="tab" aria-selected={purposeFilter === 'title'} onClick={() => switchPurpose('title')}>商品标题 <span>{prompts.filter((item) => item.purpose === 'title').length}</span></button></div><div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索模板名称、分类或内容" aria-label="搜索提示词" /></div></div>{error && <div className="form-error" role="status"><AlertTriangle size={14} />{error}</div>}{loading ? <div className="empty-state">提示词加载中…</div> : filtered.length === 0 ? <div className="empty-state panel">暂无可用提示词，点击“新增提示词”创建。</div> : <div className="prompt-layout"><aside className="category-panel panel"><span className="section-kicker">分类</span>{categories.map((item) => <button className={`category-item ${category === item ? 'active' : ''}`} key={item} type="button" onClick={() => setCategory(item)}>{item}<span>{item === '全部提示词' ? scopedPrompts.length : scopedPrompts.filter((prompt) => prompt.category === item).length}</span></button>)}</aside><div className="prompt-cards">{filtered.map((item) => { const selectable = (item.purpose ?? 'generation') !== 'title'; const isSelected = selectable && selectedPrompt === item.id; return <article className={`prompt-card panel ${isSelected ? 'selected' : ''}`} key={item.id} onClick={() => { if (selectable) setSelectedPrompt(item.id) }}><div className="prompt-card-top"><span className="category-chip">{item.category}</span><span className={`prompt-origin ${item.builtin ? 'builtin' : 'custom'}`}>{item.builtin ? '内置' : '自定义'}</span></div><h3>{item.title}</h3><p>{item.text.slice(0, 180)}{item.text.length > 180 ? '…' : ''}</p><div className="prompt-card-footer"><span>{item.purpose === 'title' ? '用途：商品标题' : item.layout ? `布局：${item.layout}` : '布局由高级参数决定'}</span><div className="prompt-card-actions"><button className="icon-button subtle" type="button" title="编辑提示词" aria-label={`编辑提示词：${item.title}`} onClick={(event) => { event.stopPropagation(); openEdit(item) }}><Pencil size={14} /></button>{!item.builtin && <button className="icon-button subtle danger-icon" type="button" title="删除提示词" aria-label={`删除提示词：${item.title}`} disabled={deletingId === item.id} onClick={(event) => { event.stopPropagation(); void deletePrompt(item) }}><Trash2 size={14} /></button>}{isSelected && <span className="selected-label"><Check size={13} />已选中</span>}</div></div></article>})}</div></div>}{feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}</div>
 }
 
+// 提示词编辑器：自动增高（超过上限后内部滚动）、字数反馈与放大入口。
+// 软阈值定位为「异常长」而非「正常长度」：仓库内现有生图提示词为 2454–7445 字符，
+// 阈值取 8000，保证进入改图自由输入时不会用模板正文触发告警。
+const PROMPT_SOFT_LIMIT = 8000
+
+function PromptEditor({ id, ariaLabel, value, onChange, placeholder, rows = 4, onExpand }: { id?: string; ariaLabel?: string; value: string; onChange: (value: string) => void; placeholder?: string; rows?: number; onExpand?: () => void }) {
+  const ref = useRef<HTMLTextAreaElement | null>(null)
+  const composingRef = useRef(false)
+
+  // 先把高度归零再按内容高度撑开，超过 CSS 的 max-height 后由 max-height 接管，转为内部滚动。
+  useEffect(() => {
+    const node = ref.current
+    if (!node) return
+    node.style.height = 'auto'
+    node.style.height = `${node.scrollHeight}px`
+  }, [value])
+
+  const tooLong = value.length > PROMPT_SOFT_LIMIT
+  return <div className="prompt-editor-shell">
+    <textarea
+      ref={ref}
+      id={id}
+      className="prompt-editor"
+      rows={rows}
+      value={value}
+      placeholder={placeholder}
+      aria-label={ariaLabel}
+      aria-describedby={tooLong ? `${id ?? 'prompt-editor'}-count` : undefined}
+      onCompositionStart={() => { composingRef.current = true }}
+      onCompositionEnd={() => { composingRef.current = false }}
+      onKeyDown={(event) => {
+        // 组合期按 Esc 是收起候选字，不能让输入框失焦；部分输入法不上报 isComposing，只给 keyCode 229。
+        if (event.key !== 'Escape' || composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) return
+        event.currentTarget.blur()
+      }}
+      onChange={(event) => onChange(event.target.value)}
+    />
+    <div className="prompt-editor-foot">
+      <span id={`${id ?? 'prompt-editor'}-count`} className={`prompt-char-count ${tooLong ? 'warn' : ''}`} role={tooLong ? 'alert' : undefined}>{value.length} 字符{tooLong ? `，已超出建议的 ${PROMPT_SOFT_LIMIT} 字符` : ''}</span>
+      {onExpand && <button className="prompt-expand" type="button" onClick={onExpand} title="放大编辑" aria-label="放大编辑"><Maximize2 size={13} />放大编辑</button>}
+    </div>
+  </div>
+}
+
+// 放大编辑抽屉：复用底层的遮罩、入场动画与焦点契约，仅把面板加宽并在底部用「完成」收尾。
+function PromptEditorSheet({ open, title, description, value, onChange, name, onNameChange, onClose }: { open: boolean; title: string; description: string; value: string; onChange: (value: string) => void; name?: string; onNameChange?: (value: string) => void; onClose: () => void }) {
+  return <ProviderSheet open={open} wide eyebrow="提示词编辑" title={title} description={description} onClose={onClose} footer={<button className="button button-primary" type="button" onClick={onClose}><Check size={16} />完成</button>}>
+    {name !== undefined && onNameChange && <div className="setting-field"><label htmlFor="editor-sheet-name">窗口名称</label><input id="editor-sheet-name" value={name} onChange={(event) => onNameChange(event.target.value)} /></div>}
+    <PromptEditor id="editor-sheet-prompt" ariaLabel="提示词正文" value={value} onChange={onChange} placeholder="输入提示词" rows={16} />
+  </ProviderSheet>
+}
+
 // 供应商配置统一使用右侧抽屉：遮罩、右滑面板、标题区、字段区和底部操作。
-function ProviderSheet({ open, eyebrow, title, description, onClose, footer, children }: { open: boolean; eyebrow: string; title: string; description: string; onClose: () => void; footer: ReactNode; children: ReactNode }) {
+// 抽屉容器只负责遮罩、入场动画与焦点契约（Esc 关闭、Tab 陷阱、焦点归位），内容全部由调用方通过 children 提供。
+const SHEET_WIDE_CLASS = 'sheet-panel-wide'
+
+function ProviderSheet({ open, eyebrow, title, description, onClose, footer, children, wide = false }: { open: boolean; eyebrow: string; title: string; description: string; onClose: () => void; footer: ReactNode; children: ReactNode; wide?: boolean }) {
   const titleId = useId()
   const panelRef = useRef<HTMLDivElement | null>(null)
   const triggerRef = useRef<HTMLElement | null>(null)
@@ -1552,7 +1652,24 @@ function ProviderSheet({ open, eyebrow, title, description, onClose, footer, chi
       const firstField = panelRef.current?.querySelector<HTMLElement>('input, select, textarea')
       ;(firstField ?? panelRef.current)?.focus({ preventScroll: true })
     }, 0)
-    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
+    // Esc 在中文输入法组合期是「收起候选字」，此时不能当成关闭抽屉；两个信号都要看，部分输入法只上报 keyCode 229。
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); onClose(); return }
+      if (event.key !== 'Tab') return
+      // Tab 焦点陷阱：不把焦点留在抽屉里，键盘用户会跑到遮罩背后的主界面上。
+      const panel = panelRef.current
+      if (!panel) return
+      const focusables = Array.from(panel.querySelectorAll<HTMLElement>('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+      if (focusables.length === 0) return
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      const active = document.activeElement
+      if (event.shiftKey) {
+        if (active === first || !panel.contains(active)) { event.preventDefault(); last.focus() }
+        return
+      }
+      if (active === last || !panel.contains(active)) { event.preventDefault(); first.focus() }
+    }
     window.addEventListener('keydown', handleKeyDown)
     return () => {
       window.clearTimeout(timer)
@@ -1564,7 +1681,7 @@ function ProviderSheet({ open, eyebrow, title, description, onClose, footer, chi
 
   return (
     <div className={`sheet-overlay ${open ? 'open' : ''}`} onMouseDown={(event) => { if (event.target !== event.currentTarget) return; event.preventDefault(); onClose() }}>
-      <div className="sheet-panel" ref={panelRef} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
+      <div className={`sheet-panel ${wide ? SHEET_WIDE_CLASS : ''}`} ref={panelRef} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
         <button className="sheet-close" type="button" onClick={onClose} title="关闭表单" aria-label="关闭表单"><X size={18} /></button>
         <div className="sheet-header"><span className="sheet-eyebrow">{eyebrow}</span><h2 id={titleId}>{title}</h2><p className="sheet-description">{description}</p></div>
         <div className="sheet-body">{children}</div>

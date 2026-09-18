@@ -135,6 +135,7 @@
 | `.sheet-overlay` | `position: fixed; inset: 0`；`z-index: 40`；底 `rgba(1,8,5,.45)`；`backdrop-filter: blur(2px)`；`display: flex; justify-content: flex-end` |
 | 关闭态 | `opacity: 0; visibility: hidden`，并延迟 280ms 切换 `visibility`，保证出场动画可见且隐藏时不可聚焦 |
 | `.sheet-panel` | `width: min(640px, 100vw)`；`height: 100%`；右侧贴边、无圆角；`border-left: 1px solid var(--border)`；`box-shadow: -10px 0 34px rgba(23,53,42,.16)` |
+| `.sheet-panel-wide` | `.sheet-panel` 的宽度覆盖：`width: min(880px, 100vw)`；专用于提示词放大编辑抽屉（`PromptEditorSheet`），其余规格完全一致 |
 | 入场 | `transform: translateX(100%) → 0`，`320ms cubic-bezier(.16,1,.3,1)` |
 | `.sheet-header` | `padding: 20px 56px 18px 24px`（右侧留出关闭按钮）；`border-bottom` |
 | `.sheet-body` | `flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 22px 24px` |
@@ -144,13 +145,40 @@
 
 行为契约（由 `ProviderSheet` 组件提供，勿在页面里另写一份）：Esc 关闭；点击遮罩关闭（**必须 `preventDefault()`**，否则浏览器 mousedown 默认行为会在 `focus()` 之后把焦点丢回 `body`）；打开时焦点进入第一个字段；关闭后焦点归还触发按钮；`role="dialog"` + `aria-modal="true"` + `aria-labelledby`（id 用 `useId()`，因为同页可有多个抽屉）。
 
-已知未实现（刻意）：Tab 焦点陷阱、`body` 滚动锁定。
+已实现（2026-09-18 补齐）：Tab 焦点陷阱（`Tab`/`Shift+Tab` 在面板内循环，`[tabindex="-1"]` 被排除）、`body` 滚动锁定仍未实现。
+
+### 提示词编辑器（`.prompt-editor-shell`）
+
+主面板的提示词输入统一用 `PromptEditor` 组件，不再直接用裸 `<textarea>`。
+
+| 元素 | 规格 |
+|------|------|
+| `.prompt-editor`（shell 内） | `min-height: 112px`、`max-height: 320px`；`resize: none`；高度由 JS 按 `scrollHeight` 驱动，到达上限后转内部滚动 |
+| `.prompt-editor`（一裂多窗口内） | `min-height: 88px`、`max-height: 160px` |
+| 光标态 | 悬停描边 `#6fa988`；聚焦 `border-color: var(--green)` + `0 0 0 3px rgba(11,143,91,.12)` + 底 `#fbfffc`；过渡 `160ms ease` |
+| `.prompt-char-count` | `9px var(--mono)`，色 `--muted`；超软阈值转 `--orange` 并加 `role="alert"` |
+| `.prompt-expand` | 10px 文字按钮 + `Maximize2` 图标，色 `--green`，仅传了 `onExpand` 时出现 |
+
+**字数软阈值 `PROMPT_SOFT_LIMIT = 8000`**：仓库内现有生图提示词为 2454–7445 字符（79 条），阈值取 8000 以保证改图自由输入不会因模板正文而误报；只提示不限制提交。数值来自实测分布，调整前请重新统计 `prompts` 表长度。
+
+行为契约（由 `PromptEditor` 提供）：`Enter` 只换行，**不提交任务**（无提交快捷键）；`Esc` 仅失焦；`Esc` 在 IME 组合期被忽略（同时检查 `isComposing` 与 `keyCode === 229`，部分输入法只上报后者）。
 
 ### 其他
 
 - `.panel`：圆角 9px，白到浅绿的 145deg 渐变底，`box-shadow: 0 12px 30px rgba(26,77,54,.08)`
 - `.provider-row`：`grid-template-columns: 78px 1fr 180px 180px`，`min-height: 104px`；启用态加 `inset 3px 0 var(--green)` 左侧色条；`≤760px` 单列且操作按钮触控尺寸提到 44px
 - `.toast`：固定右下（`right: 24px; bottom: 20px`），`z-index: 15`，10px 字号，2.4s 自动消失
+
+### 一裂多提示词窗口（`.prompt-window`）
+
+| 元素 | 规格 |
+|------|------|
+| `.window-order` | `600 10px var(--mono)`，色 `--green`，显示 `01/02/…`，`aria-hidden` |
+| `.window-grip` | `--muted-2`，`cursor: grab`（拖拽中 `grabbing`）；它是真实的拖拽手柄，不是装饰 |
+| 拖拽态 | `.dragging` 降透明度 `.55`；`.drag-over` 绿色描边 + `inset 0 2px var(--green)` 落点提示 |
+| `.window-actions` | 单列 `grid`，仅放删除按钮；`≤760px` 触控尺寸补到 44px |
+
+排序语义见 `docs/adr/0012-prompt-window-order-drives-generation-order.md`：窗口顺序即后端生成顺序，会影响结果编号与画廊顺序。排序入口为拖拽与 `Alt + ↑/↓` 两套，共用同一个移动函数。
 - `.empty-state.panel`：虚线描边，居中，`min-height: 190px`
 
 ---
