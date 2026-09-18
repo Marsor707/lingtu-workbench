@@ -23,7 +23,9 @@ export function installerName(version, arch, extension) {
 }
 
 /** 递归收集 bundle 下的安装包；无法识别的名字直接报错，避免悄悄漏掉一个资产。 */
-function collect(dir) {
+// 只扫描 bundle 目录内部：target 下的构建中间产物（如 build-script-build.exe）同样是 .exe 后缀，
+// 它们不是安装包，混进来会被误判成「无法解析的资产」而中断整个发布。
+function collect(dir, insideBundle = false) {
   let entries
   try {
     entries = readdirSync(dir, { withFileTypes: true })
@@ -34,9 +36,10 @@ function collect(dir) {
   for (const entry of entries) {
     const path = join(dir, entry.name)
     if (entry.isDirectory()) {
-      found.push(...collect(path))
+      found.push(...collect(path, insideBundle || entry.name === 'bundle'))
       continue
     }
+    if (!insideBundle) continue
     if (!SUFFIXES.some((suffix) => entry.name.endsWith(suffix))) continue
     const match = entry.name.match(INSTALLER)
     if (!match) throw new Error(`无法从安装包名解析版本与架构：${path}`)

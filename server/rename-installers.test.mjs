@@ -68,6 +68,21 @@ test('没有任何安装包时明确失败，避免 CI 误判成功', () => {
   }
 })
 
+// 回归：Windows 构建在 target 下留下 build-script-build.exe 等中间产物，
+// 它们不是安装包，不能被当成「无法解析的资产」而中断发布。
+test('bundle 目录之外的 exe 中间产物被忽略', () => {
+  const root = makeBundle({
+    'release/build/anyhow-6b31ff0b050b0730/build-script-build.exe': 'build-script',
+    'x86_64-pc-windows-msvc/release/bundle/nsis/灵图工作台_1.0.6_x64-setup.exe': 'exe',
+  })
+  try {
+    const results = renameInstallers(root)
+    assert.deepEqual(results.map((item) => item.to), ['lingtu-workbench_1.0.6_x64-setup.exe'])
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 // 这是本脚本存在的唯一理由：GitHub 上传 Release 资产时会剥掉非 ASCII 字符。
 // 用真实案例钉住结论，将来换文件名规则时能立刻发现。
 test('纯 ASCII 名经 GitHub 剥名后不变', () => {
