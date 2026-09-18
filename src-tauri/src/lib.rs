@@ -294,6 +294,10 @@ pub fn run() {
         .env("LINGTU_PORT", "8765")
         .env("LINGTU_DB_PATH", database_path.to_string_lossy().to_string())
         .env("LINGTU_STATIC_DIR", static_directory.to_string_lossy().to_string())
+        // 启动器被强杀（安装器覆盖安装、任务管理器结束进程）时不会走 RunEvent::Exit，
+        // sidecar 会变成孤儿并锁住安装目录里的 lingtu-server.exe。把自身 PID 交给 sidecar，
+        // 让它自己发现父进程消失后退出；普通启动路径仍由 stop_sidecar 主动回收。
+        .env("LINGTU_PARENT_PID", std::process::id().to_string())
         // 应用版本取自 Cargo.toml，与安装包版本一致，供本地服务比对更新源。
         .env("LINGTU_APP_VERSION", env!("CARGO_PKG_VERSION"))
         // 让 sidecar 使用 HTTP_PROXY/HTTPS_PROXY/NO_PROXY 环境变量访问 Provider。

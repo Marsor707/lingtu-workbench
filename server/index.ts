@@ -14,7 +14,7 @@ import { TITLE_PROMPT_PURPOSE, builtinTitlePrompt, generateTitles } from './titl
 import { LlmChatError } from './llm-chat.js'
 import { builtinPrompts } from './prompts.js'
 
-declare const process: { env: Record<string, string | undefined>; argv: string[]; exitCode?: number }
+declare const process: { env: Record<string, string | undefined>; argv: string[]; exitCode?: number; pid: number; kill(pid: number, signal?: number | string): boolean; exit(code?: number): void; on(event: string, listener: (...args: any[]) => void): void; stdin?: { on(event: string, listener: (...args: any[]) => void): void; resume(): void } }
 type HttpRequest = { method?: string; url?: string; headers: Record<string, string | string[] | undefined>; on(event: string, listener: (...args: any[]) => void): void }
 type HttpResponse = { statusCode: number; setHeader(name: string, value: string): void; writeHead(statusCode: number, headers?: Record<string, string>): void; write(chunk: string | Uint8Array): void; end(chunk?: string | Uint8Array): void; on?(event: string, listener: (...args: any[]) => void): void }
 type NativeServer = { listen(port: number, host: string, callback: () => void): void; close(callback: (error?: Error) => void): void; address(): { port: number } | string | null; once?(event: string, listener: (...args: any[]) => void): void }
@@ -48,6 +48,8 @@ export type AppOptions = { workspaceDir?: string; staticDir?: string; generateIm
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 8765
+// 父进程存活性兜底轮询间隔；主通道是 stdin EOF，轮询只防管道失效。
+const PARENT_POLL_INTERVAL_MS = 1000
 const MAX_BODY_BYTES = 12 * 1024 * 1024
 const MAX_SOURCE_IMAGE_BYTES = 8 * 1024 * 1024
 const MAX_SOURCE_IMAGE_BASE64_LENGTH = Math.ceil(MAX_SOURCE_IMAGE_BYTES / 3) * 4
@@ -538,6 +540,54 @@ export class JobStore {
   }
 }
 export class RequestValidationError extends Error { constructor(public readonly code: string, message: string) { super(message) } }
+/**
+ * 启动器被强杀时不会走任何清理路径，sidecar 会变成孤儿，继续占用安装目录里的
+ * lingtu-server.exe，导致覆盖安装报 "Error opening file for writing"。
+ *
+ * 用 stdin 管道兜底：Rust 侧 sidecar 的 stdin 写端随启动器进程存在，启动器一死
+ * 内核立刻关闭写端，这里收到 EOF 即退出——比轮询父进程 PID 更及时（无 1 秒滞后）。
+ * 只有桌面启动器显式注入 LINGTU_PARENT_PID 时才启用，单独跑服务不受影响。
+ */
+export function isProcessAlive(pid: number | undefined): boolean {
+  if (pid === undefined || !Number.isInteger(pid) || pid <= 0) return false
+  try {
+    // 信号 0 只做存在性与权限探测，不真正发送信号。
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM 说明进程存在但不属于当前用户，仍视为存活。
+    return (error as { code?: string }).code === 'EPERM'
+  }
+}
+
+/** 父进程消失时回调退出；只触发一次，避免重复退出。返回值可停止监听。 */
+export function watchParentProcess(parentPid: number | undefined, onExit: () => void = () => process.exit(0)): () => void {
+  if (!isProcessAlive(parentPid)) {
+    if (parentPid === undefined) return () => {}
+    onExit()
+    return () => {}
+  }
+
+  let stopped = false
+  const exitOnce = (): void => {
+    if (stopped) return
+    stopped = true
+    clearInterval(timer)
+    onExit()
+  }
+  const timer = setInterval(() => { if (!isProcessAlive(parentPid)) exitOnce() }, PARENT_POLL_INTERVAL_MS)
+  // 定时器不应该拖住进程退出。
+  timer.unref?.()
+
+  // 主通道：stdin EOF 与父进程消失同步发生，覆盖安装器强杀这种不给收尾时机的场景。
+  process.stdin?.on('end', exitOnce)
+  process.stdin?.on('close', exitOnce)
+  process.stdin?.on('error', exitOnce)
+  process.stdin?.resume()
+
+  return () => { stopped = true; clearInterval(timer) }
+}
+
 function portFromEnvironment(): number { const value = process.env.LINGTU_PORT; if (value === undefined || value === '') return DEFAULT_PORT; const port = Number(value); if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('LINGTU_PORT must be an integer between 0 and 65535'); return port }
 function maxConcurrencyValue(value: unknown, fallback = DEFAULT_MAX_CONCURRENCY): number {
   if (value === undefined || value === '') return fallback
@@ -1098,4 +1148,4 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   }) as unknown as NativeServer
 }
 export function startServer(port = portFromEnvironment(), host = DEFAULT_HOST, store = new JobStore(), options: AppOptions = {}): Promise<NativeServer> { const server = createApp(store, options); return new Promise((resolveServer, reject) => { server.listen(port, host, () => resolveServer(server)); server.once?.('error', reject) }) }
-if (isSea() || (process.argv[1] && basename(process.argv[1]) === 'index.js')) { const dbPath = process.env.LINGTU_DB_PATH ?? 'workspace/lingtu.db'; startServer(portFromEnvironment(), DEFAULT_HOST, new JobStore(dbPath)).then((server) => { const address = server.address(); const port = typeof address === 'object' && address ? address.port : portFromEnvironment(); console.log(JSON.stringify({ ready: true, port, host: DEFAULT_HOST })) }).catch((error) => { console.error(error); process.exitCode = 1 }) }
+if (isSea() || (process.argv[1] && basename(process.argv[1]) === 'index.js')) { const dbPath = process.env.LINGTU_DB_PATH ?? 'workspace/lingtu.db'; const parentPid = Number(process.env.LINGTU_PARENT_PID); watchParentProcess(Number.isInteger(parentPid) && parentPid > 0 ? parentPid : undefined); startServer(portFromEnvironment(), DEFAULT_HOST, new JobStore(dbPath)).then((server) => { const address = server.address(); const port = typeof address === 'object' && address ? address.port : portFromEnvironment(); console.log(JSON.stringify({ ready: true, port, host: DEFAULT_HOST })) }).catch((error) => { console.error(error); process.exitCode = 1 }) }
