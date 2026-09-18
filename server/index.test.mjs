@@ -153,6 +153,100 @@ test('提示词支持新增、编辑持久化、重启读取和自定义删除',
   }
 })
 
+test('重复次数由前端展开为多个任务，后端不会把 repeat 再乘进请求次数', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-repeat-workspace-'))
+  const calls = []
+  const mockImage = async ({ prompt }) => {
+    calls.push(prompt)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    return { kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' }
+  }
+  const repeatStore = new JobStore(join(directory, 'jobs.db'))
+  const repeatServer = await startServer(0, '127.0.0.1', repeatStore, { workspaceDir: directory, generateImage: mockImage })
+  const repeatBase = `http://127.0.0.1:${repeatServer.address().port}`
+  try {
+    // 模拟前端展开：同一个提交批次里按重复次数提交 3 个独立任务，每个任务只带 repeat=1。
+    const created = await Promise.all(Array.from({ length: 3 }, async (_, index) => {
+      const response = await fetch(`${repeatBase}/api/jobs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: 'text_to_image', prompt: '重复展开测试', repeat: 1, batchId: 'batch_repeat_expand', idempotencyKey: `lingtu-repeat-${index}` }),
+      })
+      assert.equal(response.status, 201)
+      return response.json()
+    }))
+    assert.equal(new Set(created.map((job) => job.id)).size, 3)
+    await Promise.all(created.map(async (job) => {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const detail = await (await fetch(`${repeatBase}/api/jobs/${job.id}`)).json()
+        if (['completed', 'failed'].includes(detail.status)) {
+          assert.equal(detail.status, 'completed')
+          assert.equal(detail.results.length, 1)
+          return
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+      assert.fail('任务未在预期时间内结束')
+    }))
+    // 3 个任务各生成一张：重复次数展开后不会在单个任务内部再次放大请求次数。
+    assert.equal(calls.length, 3)
+    assert.equal(readdirSync(join(directory, 'jobs', 'batch_repeat_expand')).length, 3)
+    // repeat 仍然保留在 API 契约里，旧客户端传入大于 1 的值时依旧生效。
+    const legacy = repeatStore.create({ mode: 'generate', prompt: '旧客户端重复', repeat: 2 }).job
+    assert.equal(legacy.repeat, 2)
+  } finally {
+    await new Promise((resolve, reject) => repeatServer.close((error) => error ? reject(error) : resolve()))
+    repeatStore.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('展开出的任务受 maxConcurrency 节流：队列排满但真实并发不超额', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-throttle-workspace-'))
+  let active = 0
+  let maxActive = 0
+  const mockImage = async () => {
+    active += 1
+    maxActive = Math.max(maxActive, active)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    active -= 1
+    return { kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' }
+  }
+  const throttleStore = new JobStore(join(directory, 'jobs.db'))
+  const throttleServer = await startServer(0, '127.0.0.1', throttleStore, { workspaceDir: directory, generateImage: mockImage })
+  const throttleBase = `http://127.0.0.1:${throttleServer.address().port}`
+  try {
+    await fetch(`${throttleBase}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ maxConcurrency: 2 }) })
+    // 重复次数展开意味着可以一次提交很多任务；它们应该排队等待，而不是同时砸向 Provider。
+    const created = await Promise.all(Array.from({ length: 6 }, async (_, index) => {
+      const response = await fetch(`${throttleBase}/api/jobs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: 'text_to_image', prompt: `节流测试 ${index}`, repeat: 1, idempotencyKey: `lingtu-throttle-${index}` }),
+      })
+      assert.equal(response.status, 201)
+      return response.json()
+    }))
+    const snapshot = await (await fetch(`${throttleBase}/api/jobs`)).json()
+    assert.equal(snapshot.total, 6)
+    // 刚提交完时队列里应有未领取的任务，且没有任何任务是失败态。
+    assert.ok(snapshot.items.some((job) => job.status === 'queued' || job.status === 'running'))
+    await Promise.all(created.map(async (job) => {
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        const detail = await (await fetch(`${throttleBase}/api/jobs/${job.id}`)).json()
+        if (['completed', 'failed'].includes(detail.status)) { assert.equal(detail.status, 'completed'); return }
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+      assert.fail('任务未在预期时间内结束')
+    }))
+    assert.equal(maxActive, 2)
+  } finally {
+    await new Promise((resolve, reject) => throttleServer.close((error) => error ? reject(error) : resolve()))
+    throttleStore.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
 test('高级参数追加段覆盖模板输出布局并保留目标长宽比', () => {
   const result = buildEffectivePrompt('保持原有主题和风格。', '四宫格', '1024 × 1024', '1K')
   assert.match(result, /灵图高级输出参数（最高优先级）/)

@@ -198,6 +198,8 @@ const DEFAULT_IMAGE_MODEL = IMAGE_MODEL_OPTIONS[0]
 const ADVANCED_SETTINGS_STORAGE_KEY = 'lingtu-advanced-settings'
 type AdvancedSettings = { layout: string; size: string; resolution: string; quality: string; repeat: number; customSizeEnabled?: boolean; customWidth?: string; customHeight?: string }
 const DEFAULT_ADVANCED_SETTINGS: AdvancedSettings = { layout: '四宫格', size: '3840 × 2160', resolution: '1K', quality: '高', repeat: 1 }
+// 重复次数决定一次提交展开出多少个独立任务；上限沿用后端 repeat 契约（1~100），实际并行度由「最大并发」单独控制。
+const MAX_REPEAT_COUNT = 100
 
 type CustomRatioValidation = { size?: string; ratio?: string; error?: string }
 
@@ -230,7 +232,7 @@ function readStoredAdvancedSettings(): AdvancedSettings {
     const size = SIZE_OPTIONS.some((option) => option.value === parsed.size) ? parsed.size! : DEFAULT_ADVANCED_SETTINGS.size
     const resolution = parsed.resolution === '1K' || parsed.resolution === '2K' || parsed.resolution === '4K' ? parsed.resolution : DEFAULT_ADVANCED_SETTINGS.resolution
     const quality = parsed.quality === '高' || parsed.quality === '中' || parsed.quality === '自动' ? parsed.quality : DEFAULT_ADVANCED_SETTINGS.quality
-    const repeat = typeof parsed.repeat === 'number' && Number.isFinite(parsed.repeat) ? Math.min(20, Math.max(1, Math.round(parsed.repeat))) : DEFAULT_ADVANCED_SETTINGS.repeat
+    const repeat = typeof parsed.repeat === 'number' && Number.isFinite(parsed.repeat) ? Math.min(MAX_REPEAT_COUNT, Math.max(1, Math.round(parsed.repeat))) : DEFAULT_ADVANCED_SETTINGS.repeat
     const customSizeEnabled = parsed.customSizeEnabled === true
     const customWidth = typeof parsed.customWidth === 'string' ? parsed.customWidth : ''
     const customHeight = typeof parsed.customHeight === 'string' ? parsed.customHeight : ''
@@ -454,6 +456,8 @@ function App() {
   const [statsError, setStatsError] = useState('')
   const [serviceOnline, setServiceOnline] = useState(false)
   const [submitError, setSubmitError] = useState('')
+  // 提交完成后的正向提示（重复/改图多图会拆成多个任务），与报错提示互斥展示。
+  const [submitNotice, setSubmitNotice] = useState('')
   const eventSourcesRef = useRef<Map<string, EventSource>>(new Map())
 
   useEffect(() => {
@@ -733,7 +737,7 @@ function App() {
       id: job.id,
       title,
       // 队列仅展示可公开的任务摘要，provider.apiKey 永不写入队列状态。
-      meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 个任务项 · ${formatLayoutLabel(job.layout ?? layout)}${job.resolution ? ` · ${job.resolution}` : ''}${job.error?.message ? ` · ${job.error.message}` : ''}`,
+      meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 次生成 · ${formatLayoutLabel(job.layout ?? layout)}${job.resolution ? ` · ${job.resolution}` : ''}${job.error?.message ? ` · ${job.error.message}` : ''}`,
       status,
       progress,
       time,
@@ -785,7 +789,7 @@ function App() {
         return {
           id: job.id,
           title: `${modes.find((item) => item.id === (job.mode === 'text_to_image' ? 'text' : job.mode))?.label ?? '生图'} · 任务`,
-          meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 个任务项 · ${formatLayoutLabel(job.layout ?? layout)}${job.resolution ? ` · ${job.resolution}` : ''}${job.error?.message ? ` · ${job.error.message}` : ''}`,
+          meta: `${job.mode === 'one_to_many' ? enabledWindows.length : 1} 次生成 · ${formatLayoutLabel(job.layout ?? layout)}${job.resolution ? ` · ${job.resolution}` : ''}${job.error?.message ? ` · ${job.error.message}` : ''}`,
           status,
           progress,
           time: job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : job.status === 'cancelled' ? '已取消' : '进行中',
@@ -964,6 +968,7 @@ function App() {
   const startJob = async () => {
     if (running) return
     setSubmitError('')
+    setSubmitNotice('')
     if (customSizeEnabled && !customRatioValidation.size) {
       setSubmitError(customRatioValidation.error || '请完成自定义长宽比例后再开始任务')
       window.requestAnimationFrame(() => {
@@ -987,10 +992,12 @@ function App() {
       return
     }
     setRunning(true)
-    setSubmissionProgress(mode === 'edit' ? { current: 0, total: sourceFiles.length } : null)
+    // 重复次数在提交时展开：每一次生成都是独立任务，交给后端调度器按并发上限执行。
+    const submitUnits: Array<File | undefined> = (mode === 'edit' ? sourceFiles : [undefined]).flatMap((file) => Array.from({ length: repeat }, () => file))
+    setSubmissionProgress(submitUnits.length > 1 ? { current: 0, total: submitUnits.length } : null)
     try {
       const submitSize = customSizeEnabled && customRatioValidation.size ? customRatioValidation.size : size
-      const filesToSubmit: Array<File | undefined> = mode === 'edit' ? sourceFiles : [undefined]
+      const filesToSubmit: Array<File | undefined> = submitUnits
       // 一次「开始任务」属于同一个提交批次，批次内所有任务共享一个结果文件夹。
       const batchId = `batch_${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
       let submittedCount = 0
@@ -1013,7 +1020,8 @@ function App() {
               size: submitSize,
               resolution,
               quality,
-              repeat,
+              // 重复已在提交前展开为多个任务，单个任务只生成一次。
+              repeat: 1,
               pixelUpscale,
               sourceImage,
               batchId,
@@ -1034,12 +1042,13 @@ function App() {
           if (!firstError) firstError = error instanceof Error ? error.message : '任务提交失败，请检查本地服务状态'
         } finally {
           submittedCount += 1
-          if (mode === 'edit') setSubmissionProgress({ current: submittedCount, total: filesToSubmit.length })
+          if (submitUnits.length > 1) setSubmissionProgress({ current: submittedCount, total: filesToSubmit.length })
         }
       }
       // Promise.all 只负责并行发起提交，不等待 Provider 完成，执行生命周期完全交给后端。
       await Promise.all(filesToSubmit.map((file, index) => submitOne(file, index)))
-      if (failedCount > 0) setSubmitError(`${firstError}；本批次有 ${failedCount} 张图片失败，请查看任务队列`)
+      if (failedCount > 0) setSubmitError(`${firstError}；本批次有 ${failedCount} 个任务失败，请查看任务队列`)
+      else if (submitUnits.length > 1) setSubmitNotice(`已提交 ${submitUnits.length} 个任务，正在按「最大并发」分批执行`)
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : '任务提交失败，请检查本地服务状态')
     } finally {
@@ -1101,7 +1110,7 @@ function App() {
           </div>
         </header>
 
-        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={generationPrompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} textToImagePrompt={textToImagePrompt} setTextToImagePrompt={setTextToImagePrompt} editPrompt={editPrompt} setEditPrompt={setEditPrompt} editFreePrompt={editFreePrompt} onEditPromptSelect={handleEditPromptSelect} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProvider={activeProvider} submitError={submitError} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
+        {page === 'workbench' && <Workbench mode={mode} setMode={setMode} activeMode={activeMode} layout={layout} setLayout={setLayout} size={size} setSize={handleSizeChange} customSizeEnabled={customSizeEnabled} customWidth={customWidth} customHeight={customHeight} customRatioError={customRatioValidation.error} setCustomWidth={updateCustomWidth} setCustomHeight={updateCustomHeight} resolution={resolution} setResolution={setResolution} quality={quality} setQuality={setQuality} repeat={repeat} setRepeat={setRepeat} inputName={inputName} setInputName={setInputName} sourceFiles={sourceFiles} setSourceFiles={setSourceFiles} submissionProgress={submissionProgress} selectedPrompt={selectedPrompt} selectedPromptItem={selectedPromptItem} prompts={generationPrompts} promptsLoading={promptsLoading} promptsError={promptsError} textPrompt={textPrompt} setTextPrompt={setTextPrompt} textToImagePrompt={textToImagePrompt} setTextToImagePrompt={setTextToImagePrompt} editPrompt={editPrompt} setEditPrompt={setEditPrompt} editFreePrompt={editFreePrompt} onEditPromptSelect={handleEditPromptSelect} setSelectedPrompt={handlePromptSelect} promptWindows={promptWindows} updatePromptWindow={updatePromptWindow} addPromptWindow={addPromptWindow} enabledWindows={enabledWindows} running={running} startJob={startJob} queue={queue} galleryAssets={galleryAssets} stats={stats} statsLoading={statsLoading} statsError={statsError} serviceOnline={serviceOnline} activeProvider={activeProvider} submitError={submitError} submitNotice={submitNotice} onRefresh={refreshWorkbench} onNavigate={navigateTo} onViewResults={openJobResults} />}
         {page === 'queue' && <QueuePage queue={queue} setQueue={setQueue} onRefresh={async () => { await refreshQueue() }} onCancel={cancelJob} onRetry={retryJob} onRetryFailed={retryFailedJobs} onCreate={() => { navigateTo('workbench'); window.scrollTo({ top: 0, behavior: 'smooth' }) }} onViewResults={openJobResults} />}
         {page === 'gallery' && <GalleryPage assets={galleryAssets} focusJobId={galleryJobId} onClearFocus={() => setGalleryJobId(null)} />}
         {page === 'title-generation' && <TitleGenerationPage prompts={prompts} llmProviders={llmProviders} onOpenModelSettings={() => navigateTo('models')} onOpenPromptLibrary={() => navigateTo('prompts')} />}
@@ -1168,13 +1177,14 @@ type WorkbenchProps = {
   serviceOnline: boolean
   activeProvider?: ModelProvider
   submitError: string
+  submitNotice: string
   onRefresh: () => Promise<void>
   onNavigate: (page: Page) => void
   onViewResults: (jobId: string) => void
 }
 
 function Workbench(props: WorkbenchProps) {
-  const { mode, setMode, activeMode, layout, setLayout, size, setSize, customSizeEnabled, customWidth, customHeight, customRatioError, setCustomWidth, setCustomHeight, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, textToImagePrompt, setTextToImagePrompt, editPrompt, setEditPrompt, editFreePrompt, onEditPromptSelect, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProvider, submitError, onRefresh, onNavigate, onViewResults } = props
+  const { mode, setMode, activeMode, layout, setLayout, size, setSize, customSizeEnabled, customWidth, customHeight, customRatioError, setCustomWidth, setCustomHeight, resolution, setResolution, quality, setQuality, repeat, setRepeat, inputName, setInputName, sourceFiles, setSourceFiles, submissionProgress, selectedPrompt, selectedPromptItem, prompts, promptsLoading, promptsError, textPrompt, setTextPrompt, textToImagePrompt, setTextToImagePrompt, editPrompt, setEditPrompt, editFreePrompt, onEditPromptSelect, setSelectedPrompt, promptWindows, updatePromptWindow, addPromptWindow, enabledWindows, running, startJob, queue, galleryAssets, stats, statsLoading, statsError, serviceOnline, activeProvider, submitError, submitNotice, onRefresh, onNavigate, onViewResults } = props
   const [showAdvanced, setShowAdvanced] = useState(true)
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -1278,7 +1288,7 @@ function Workbench(props: WorkbenchProps) {
           <div className="compact-field"><label htmlFor="size-select">长宽比例</label><div className="select-wrap"><select id="size-select" value={customSizeEnabled ? CUSTOM_SIZE_OPTION_VALUE : size} onChange={(event) => setSize(event.target.value)} aria-expanded={customSizeEnabled} aria-controls="custom-ratio-fields">{SIZE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}<option value={CUSTOM_SIZE_OPTION_VALUE}>自定义</option></select><ChevronDown size={15} /></div></div>
           <div className="compact-field"><label htmlFor="resolution-select">分辨率</label><div className="select-wrap"><select id="resolution-select" value={resolution} onChange={(event) => setResolution(event.target.value)}><option>1K</option><option>2K</option><option>4K</option></select><ChevronDown size={15} /></div></div>
           <div className="compact-field"><label htmlFor="quality-select">质量</label><div className="select-wrap"><select id="quality-select" value={quality} onChange={(event) => setQuality(event.target.value)}><option>高</option><option>中</option><option>自动</option></select><ChevronDown size={15} /></div></div>
-          <div className="compact-field"><label htmlFor="repeat-input">重复次数</label><div className="number-control"><input id="repeat-input" type="number" min="1" max="20" value={repeat} onChange={(event) => setRepeat(Math.min(20, Math.max(1, Number(event.target.value) || 1)))} /><span>次</span></div></div>
+          <div className="compact-field"><label htmlFor="repeat-input">重复次数</label><div className="number-control"><input id="repeat-input" type="number" min="1" max={MAX_REPEAT_COUNT} title={`每次重复提交一个独立任务，本次将提交 ${repeat} 个；同时执行数由设置里的「最大并发」决定`} value={repeat} onChange={(event) => setRepeat(Math.min(MAX_REPEAT_COUNT, Math.max(1, Number(event.target.value) || 1)))} /><span>次</span></div></div>
           {customSizeEnabled && <div className="compact-field custom-ratio-field" id="custom-ratio-fields">
             <span className="custom-ratio-title">自定义比例</span>
             <div className="custom-ratio-controls">
@@ -1289,7 +1299,7 @@ function Workbench(props: WorkbenchProps) {
             <span className={`custom-ratio-hint ${customRatioError ? 'error' : ''}`} id="custom-ratio-feedback" role={customRatioError ? 'alert' : undefined}>{customRatioError || `当前比例 ${canonicalSizeForRatio(customWidth, customHeight).ratio || formatSizeRatio(size)}，将按模型能力返回最接近尺寸`}</span>
           </div>}
         </div>}
-        <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>{activeProvider ? `当前供应商：${activeProvider.name} · 模型：${activeProvider.model}` : '尚未配置模型供应商'} <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}{submissionProgress && <span className="submit-progress" role="status">已提交 {submissionProgress.current} / {submissionProgress.total} 张，后端并发处理中</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />{mode === 'edit' ? '批量提交中' : '创建任务中'}</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
+        <div className="composer-footer"><div className="footer-note"><span className="secure-icon"><ShieldCheck size={14} /></span>{activeProvider ? `当前供应商：${activeProvider.name} · 模型：${activeProvider.model}` : '尚未配置模型供应商'} <span className="mono">· 仅保存在本机</span>{submitError && <span className="form-error" role="alert"><AlertTriangle size={14} />{submitError}</span>}{submitNotice && <span className="submit-progress" role="status"><CheckCircle2 size={14} />{submitNotice}</span>}{submissionProgress && <span className="submit-progress" role="status">已提交 {submissionProgress.current} / {submissionProgress.total} 个任务，后端并发处理中</span>}</div><button className="button button-primary start-button" onClick={startJob} disabled={running || (mode === 'one-to-many' && enabledWindows.length < 2)}>{running ? <><LoaderCircle size={16} className="spin" />{mode === 'edit' ? '批量提交中' : '创建任务中'}</> : <><Play size={16} fill="currentColor" />开始{activeMode.label}<ArrowUpRight size={16} /></>}</button></div>
       </div>
 
       <div className="preview-column"><div className="preview-panel panel"><div className="panel-heading"><div><span className="section-kicker">02 / 预览</span><h2>版式预览</h2></div><div aria-hidden="true" /></div><div className={`layout-preview ${layout === '单图' ? 'layout-single' : layout === '二宫格' ? 'layout-two' : layout === '九宫格' ? 'layout-nine' : ''}`} style={{ aspectRatio: customSizeEnabled && customRatioError === undefined ? `${customWidth} / ${customHeight}` : formatSizeAspectRatio(size) }}>{Array.from({ length: previewCount }, (_, index) => <div className={`preview-cell cell-${String.fromCharCode(97 + index)}`} key={String.fromCharCode(65 + index)}><span>{previewCount === 1 ? '单图' : String.fromCharCode(65 + index)}</span><small>{previewCount === 1 ? '完整画布' : index === 0 ? '主视觉区域' : index === 1 ? '卖点信息区域' : '细节变体'}</small></div>)}</div><div className="preview-caption"><div><strong>{layout}</strong><span>安全区已锁定 · 不跨格 · 不拉伸</span></div><span className="ratio">{customSizeEnabled && !customRatioError ? canonicalSizeForRatio(customWidth, customHeight).ratio : formatSizeRatio(size)}</span></div></div><div className="quick-panel panel"><div className="quick-heading"><span>最近使用</span><button className="text-link" onClick={() => onNavigate('gallery')}>查看全部 <ArrowUpRight size={13} /></button></div><div className="recent-row">{galleryAssets.slice(0, 4).map((image) => <button key={image.title} className="recent-thumb" title={`打开 ${image.title}`} aria-label={`打开 ${image.title}`} onClick={() => openRecentAsset(image)}><img src={image.src} alt={image.title} /><span className={`mini-status ${image.tone}`} /></button>)}{galleryAssets.length === 0 && <span className="empty-inline">暂无生成结果</span>}</div></div></div>
@@ -1957,7 +1967,7 @@ function SettingsModal({ maxConcurrency, pixelUpscale, imageNamingEnabled, hasRu
             <span className="field-help">由本地服务自动管理</span>
           </div>
           <div className="setting-row">
-            <div><strong>最大并发</strong><span>建议根据供应商配额逐步增加</span></div>
+            <div><strong>最大并发</strong><span>同时执行的任务数；改图多图与重复次数都按此并行</span></div>
             <div className="number-control compact"><input type="number" min="1" max="20" value={draftMaxConcurrency} onChange={(event) => { setError(''); setDraftMaxConcurrency(Math.min(20, Math.max(1, Number(event.target.value) || 1))) }} aria-label="最大并发数" /><span>线程</span></div>
           </div>
           <div className="setting-row setting-row-toggle">
