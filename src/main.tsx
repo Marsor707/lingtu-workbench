@@ -1643,6 +1643,11 @@ function ProviderSheet({ open, eyebrow, title, description, onClose, footer, chi
   const titleId = useId()
   const panelRef = useRef<HTMLDivElement | null>(null)
   const triggerRef = useRef<HTMLElement | null>(null)
+  // onClose 多为内联箭头函数，每次渲染都是新引用。若把它写进依赖，抽屉内每次按键引起的重渲染
+  // 都会重跑一次 effect，其清理函数会把焦点送回触发按钮，输入法组合被反复打断（中文无法上屏）。
+  // 用 ref 承接最新回调，effect 只在开合时执行。
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
 
   // 抽屉打开时 Esc 关闭、焦点移入第一个字段，关闭后焦点回到触发按钮。
   useEffect(() => {
@@ -1654,7 +1659,7 @@ function ProviderSheet({ open, eyebrow, title, description, onClose, footer, chi
     }, 0)
     // Esc 在中文输入法组合期是「收起候选字」，此时不能当成关闭抽屉；两个信号都要看，部分输入法只上报 keyCode 229。
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); onClose(); return }
+      if (event.key === 'Escape' && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); onCloseRef.current(); return }
       if (event.key !== 'Tab') return
       // Tab 焦点陷阱：不把焦点留在抽屉里，键盘用户会跑到遮罩背后的主界面上。
       const panel = panelRef.current
@@ -1677,7 +1682,7 @@ function ProviderSheet({ open, eyebrow, title, description, onClose, footer, chi
       triggerRef.current?.focus()
       triggerRef.current = null
     }
-  }, [open, onClose])
+  }, [open])
 
   return (
     <div className={`sheet-overlay ${open ? 'open' : ''}`} onMouseDown={(event) => { if (event.target !== event.currentTarget) return; event.preventDefault(); onClose() }}>
