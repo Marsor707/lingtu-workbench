@@ -176,7 +176,7 @@ type UpdatePhase =
   | { kind: 'checking' }
   | { kind: 'checked'; result: UpdateCheck; skipped: boolean }
   | { kind: 'downloading'; result: UpdateCheck; downloaded: number; total: number; percent: number }
-  | { kind: 'downloaded'; result: UpdateCheck; path: string }
+  | { kind: 'downloaded'; result: UpdateCheck; path: string; revealError?: string }
   | { kind: 'failed'; message: string }
 
 const SELECTED_PROMPT_STORAGE_KEY = 'lingtu-selected-prompt'
@@ -1924,6 +1924,17 @@ function useAppUpdate() {
     }
   }, [])
 
+  const reveal = useCallback(async (path: string) => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/api/update/reveal`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) })
+      if (!response.ok) throw new Error(await readErrorMessage(response, '打开下载目录失败'))
+      setPhase((current) => current.kind === 'downloaded' && current.path === path ? { ...current, revealError: undefined } : current)
+    } catch (revealFailure) {
+      const message = revealFailure instanceof Error ? revealFailure.message : '打开下载目录失败'
+      setPhase((current) => current.kind === 'downloaded' && current.path === path ? { ...current, revealError: message } : current)
+    }
+  }, [])
+
   const download = useCallback(async (result: UpdateCheck) => {
     if (!result.asset) return false
     const controller = new AbortController()
@@ -1967,6 +1978,8 @@ function useAppUpdate() {
       if (failure) throw new Error(failure)
       if (!path) throw new Error('下载完成但未拿到安装包路径')
       setPhase({ kind: 'downloaded', result, path })
+      // 下载完直接替用户打开下载目录并选中安装包；失败不改变“已下载”这个事实。
+      void reveal(path)
       return true
     } catch (downloadError) {
       // 用户主动取消属于正常路径，回到可重新下载的状态而不是报错。
@@ -1984,16 +1997,17 @@ function useAppUpdate() {
     setPhase({ kind: 'checked', result, skipped: true })
   }, [])
 
-  return { phase, check, download, cancelDownload, skip }
+  return { phase, check, download, cancelDownload, skip, reveal }
 }
 
-function UpdateRow({ hasRunningTasks, phase, check, download, cancelDownload, skip }: {
+function UpdateRow({ hasRunningTasks, phase, check, download, cancelDownload, skip, reveal }: {
   hasRunningTasks: boolean
   phase: UpdatePhase
   check: () => Promise<void>
   download: (result: UpdateCheck) => Promise<boolean>
   cancelDownload: () => void
   skip: (version: string, result: UpdateCheck) => void
+  reveal: (path: string) => Promise<void>
 }) {
   const [copied, setCopied] = useState(false)
 
@@ -2008,7 +2022,7 @@ function UpdateRow({ hasRunningTasks, phase, check, download, cancelDownload, sk
   const actions = (() => {
     if (phase.kind === 'checking') return <button className="button button-ghost button-small" disabled><LoaderCircle size={14} className="spin" />检查中…</button>
     if (phase.kind === 'downloading') return <button className="button button-ghost button-small" onClick={cancelDownload}><X size={14} />取消</button>
-    if (phase.kind === 'downloaded') return <button className="button button-primary button-small" onClick={() => void copyPath(phase.path)}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? '已复制' : '复制路径'}</button>
+    if (phase.kind === 'downloaded') return <><button className="button button-primary button-small" onClick={() => void reveal(phase.path)}><FolderOpen size={14} />打开文件夹</button><button className="button button-ghost button-small" onClick={() => void copyPath(phase.path)}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? '已复制' : '复制路径'}</button></>
     if (phase.kind === 'failed') return <button className="button button-ghost button-small" onClick={() => void check()}><RefreshCw size={14} />重试</button>
     if (phase.kind === 'checked' && phase.result.state === 'update') {
       return <>
@@ -2023,7 +2037,10 @@ function UpdateRow({ hasRunningTasks, phase, check, download, cancelDownload, sk
     if (phase.kind === 'idle') return <span>当前版本 {APP_VERSION || '未知'}</span>
     if (phase.kind === 'checking') return <span>正在从更新源获取最新版本…</span>
     if (phase.kind === 'failed') return <span className="update-error" role="alert"><AlertTriangle size={13} />{phase.message}</span>
-    if (phase.kind === 'downloaded') return <span className="update-path" title={phase.path}><CheckCircle2 size={13} />已下载到 <span className="mono">{phase.path}</span></span>
+    if (phase.kind === 'downloaded') return <>
+      <span className="update-path" title={phase.path}><CheckCircle2 size={13} />已下载到 <span className="mono">{phase.path}</span></span>
+      {phase.revealError && <span className="update-error" role="alert"><AlertTriangle size={13} />{phase.revealError}，可手动打开下载目录安装</span>}
+    </>
     if (phase.kind === 'downloading') {
       const { downloaded, total, percent } = phase
       return <>
@@ -2107,7 +2124,7 @@ function SettingsModal({ maxConcurrency, pixelUpscale, imageNamingEnabled, hasRu
             <div><strong><Sparkles size={15} />启用 LLM 图片命名</strong><span>生图完成后用已启用的视觉模型生成文件名；未配置或失败时保留原有命名。</span></div>
             <label className="setting-switch"><input type="checkbox" aria-label="启用 LLM 图片命名" checked={draftImageNamingEnabled} onChange={(event) => { setError(''); setDraftImageNamingEnabled(event.target.checked) }} /><span aria-hidden="true" /></label>
           </div>
-          <UpdateRow hasRunningTasks={hasRunningTasks} phase={update.phase} check={update.check} download={update.download} cancelDownload={update.cancelDownload} skip={update.skip} />
+          <UpdateRow hasRunningTasks={hasRunningTasks} phase={update.phase} check={update.check} download={update.download} cancelDownload={update.cancelDownload} skip={update.skip} reveal={update.reveal} />
           {error && <div className="form-error settings-modal-error" role="alert"><AlertTriangle size={14} />{error}</div>}
         </div>
         <div className="modal-footer">

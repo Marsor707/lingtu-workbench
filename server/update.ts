@@ -1,6 +1,7 @@
+import { spawn } from 'node:child_process'
 import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 
@@ -126,6 +127,35 @@ export function defaultDownloadDirectory(): string {
  * 流式下载更新包到下载目录。先写 .part 临时文件，校验字节数后再改名，
  * 避免中途失败在下载目录里留下一个看起来可安装的半成品。
  */
+export type RevealSpawn = (command: string, args: string[]) => void
+
+/** 各平台在文件管理器中定位文件的命令；Windows 的 /select 必须与路径拼成同一个参数。 */
+export function revealCommand(path: string, platform: string = process.platform): { command: string; args: string[] } | undefined {
+  if (platform === 'darwin') return { command: 'open', args: ['-R', path] }
+  if (platform === 'win32') return { command: 'explorer.exe', args: [`/select,${path}`] }
+  if (platform === 'linux') return { command: 'xdg-open', args: [dirname(path)] }
+  return undefined
+}
+
+/**
+ * 在系统文件管理器中定位安装包。更新包已经落盘，这一步只是替用户省掉手动开目录，
+ * 因此失败只向上报错，不回头改下载结果。
+ */
+export function revealInFileManager(path: string, options: { platform?: string; spawn?: RevealSpawn } = {}): void {
+  const platform = options.platform ?? process.platform
+  const target = revealCommand(path, platform)
+  if (!target) throw new UpdateSourceError(`当前平台不支持打开下载目录：${platform}`, 'update_reveal_unsupported')
+  const spawnReveal = options.spawn ?? ((command: string, args: string[]) => {
+    const child = spawn(command, args, { detached: true, stdio: 'ignore' })
+    // 命令缺失只会异步抛 error；忽略它，避免未处理的错误事件杀掉常驻的本地服务。
+    child.on('error', () => {})
+    child.unref()
+  })
+  try { spawnReveal(target.command, target.args) } catch (error) {
+    throw new UpdateSourceError(`打开下载目录失败：${(error as Error).message}`, 'update_reveal_failed')
+  }
+}
+
 export async function downloadUpdateAsset(options: { asset: UpdateAsset; directory?: string; fetch?: UpdateFetch; onProgress?: (progress: DownloadProgress) => void; signal?: AbortSignal }): Promise<DownloadResult> {
   const directory = options.directory ?? defaultDownloadDirectory()
   const fetchImpl = (options.fetch ?? globalThis.fetch) as unknown as UpdateFetch

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from 'node:http'
 import { JobStore, createApp } from '../dist-server/index.js'
-import { checkForUpdate, compareVersions, currentPlatform, downloadUpdateAsset, parseUpdateSource, resolveUpdate, safeAssetName } from '../dist-server/update.js'
+import { checkForUpdate, compareVersions, currentPlatform, downloadUpdateAsset, parseUpdateSource, resolveUpdate, revealCommand, revealInFileManager, safeAssetName } from '../dist-server/update.js'
 
 const source = {
   version: '1.0.5',
@@ -166,6 +166,21 @@ test('失败不留半成品时也不会覆盖已下载的同名旧包', async ()
   }
 })
 
+test('各平台定位安装包的命令彼此不同', () => {
+  assert.deepEqual(revealCommand('/tmp/pkg.dmg', 'darwin'), { command: 'open', args: ['-R', '/tmp/pkg.dmg'] })
+  // Windows 的 /select 必须与路径拼成同一个参数，拆开会让 explorer 忽略筛选条件。
+  assert.deepEqual(revealCommand('C:\\Users\\a\\pkg.exe', 'win32'), { command: 'explorer.exe', args: ['/select,C:\\Users\\a\\pkg.exe'] })
+  assert.deepEqual(revealCommand('/tmp/pkg.AppImage', 'linux'), { command: 'xdg-open', args: ['/tmp'] })
+  assert.equal(revealCommand('/tmp/pkg.dmg', 'aix'), undefined)
+})
+
+test('打开下载目录走注入的启动函数，不支持的平台直接报错', () => {
+  const calls = []
+  revealInFileManager('/tmp/pkg.dmg', { platform: 'darwin', spawn: (command, args) => calls.push([command, args]) })
+  assert.deepEqual(calls, [['open', ['-R', '/tmp/pkg.dmg']]])
+  assert.throws(() => revealInFileManager('/tmp/pkg.dmg', { platform: 'aix' }), /当前平台不支持打开下载目录/)
+})
+
 // 以下测试走真实 HTTP：本地 stub 充当更新源，验证两个路由的完整链路。
 test('更新路由：检查到新版本后可下载更新包', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'lingtu-update-route-'))
@@ -206,6 +221,43 @@ test('更新路由：检查到新版本后可下载更新包', async () => {
   } finally {
     await new Promise((resolveClose) => app.close(() => resolveClose()))
     await new Promise((resolveClose) => stub.close(() => resolveClose()))
+    store.close?.()
+    rmSync(workspace, { recursive: true, force: true })
+  }
+})
+
+test('更新路由：只在下载目录内定位已下载的更新包', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'lingtu-update-reveal-'))
+  const downloads = join(workspace, 'downloads')
+  mkdirSync(downloads, { recursive: true })
+  const assetPath = join(downloads, 'pkg.dmg')
+  writeFileSync(assetPath, 'installer-binary')
+  // 目录外的同名文件用于验证路径校验，避免路由变成任意路径的文件管理器入口。
+  const outsidePath = join(workspace, 'outside.dmg')
+  writeFileSync(outsidePath, 'other')
+  const revealed = []
+  const store = new JobStore(join(workspace, 'lingtu.db'))
+  const app = createApp(store, { workspaceDir: join(workspace, 'workspace'), downloadDir: downloads, revealFile: (target) => revealed.push(target) })
+  await new Promise((resolveListen) => app.listen(0, '127.0.0.1', () => resolveListen()))
+  const baseUrl = `http://127.0.0.1:${app.address().port}`
+  const reveal = (path) => fetch(`${baseUrl}/api/update/reveal`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) })
+  try {
+    const ok = await reveal(assetPath)
+    assert.equal(ok.status, 200)
+    assert.equal((await ok.json()).path, assetPath)
+
+    const denied = await reveal(outsidePath)
+    assert.equal(denied.status, 400)
+    assert.equal((await denied.json()).error.code, 'update_path_invalid')
+
+    const missing = await reveal(join(downloads, 'gone.dmg'))
+    assert.equal(missing.status, 404)
+    assert.equal((await missing.json()).error.code, 'update_file_missing')
+
+    // 只有真正存在于下载目录里的文件会触发打开动作。
+    assert.deepEqual(revealed, [assetPath])
+  } finally {
+    await new Promise((resolveClose) => app.close(() => resolveClose()))
     store.close?.()
     rmSync(workspace, { recursive: true, force: true })
   }

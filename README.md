@@ -155,11 +155,12 @@ git commit -am "升级版本至 1.0.5" && git tag v1.0.5 && git push origin main
 
 ## 应用更新
 
-当前版本会在设置弹窗的「应用更新」一栏展示，用户点「检查更新」比对更新源；有新版本时下载安装包到系统下载目录，再手动双击安装。
+当前版本会在设置弹窗的「应用更新」一栏展示，用户点「检查更新」比对更新源；有新版本时下载安装包到系统下载目录，下载完成后自动在系统文件管理器中定位该安装包，再由用户手动双击安装。
 
 - 更新源固定为 `releases/latest/download/latest.json`，字段契约：`version`、`min_supported_version`、`notes`、`platforms.{darwin-arm64,windows-x64}.{url,size,name}`。
 - **不做就地更新**，因此不需要签名密钥；`latest.json` 只告知版本与安装包位置。原因与代价见 ADR 0009。
-- 更新逻辑跑在 Node 本地服务里（`GET /api/update/check`、`POST /api/update/download`），复用 sidecar 的系统代理环境；原因见 ADR 0010。
+- 更新逻辑跑在 Node 本地服务里（`GET /api/update/check`、`POST /api/update/download`、`POST /api/update/reveal`），复用 sidecar 的系统代理环境；原因见 ADR 0010。
+- `POST /api/update/reveal` 只接受下载目录内的、确实存在的文件（`open -R` / `explorer /select`），避免接口变成任意路径的文件管理器入口。
 - 下载地址由服务端重新解析，不接受前端传入的 URL；文件名只取 basename，防止写出下载目录。
 - 安装包资产名是纯 ASCII（`lingtu-workbench_<版本>_<架构>-setup.exe` / `.dmg`），原因见「GitHub Actions 跨平台打包」；客户端不对文件名做任何假设，而是直接用 `latest.json` 里的 `name`。
 

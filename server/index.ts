@@ -1,10 +1,10 @@
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { isSea } from 'node:sea'
-import { checkForUpdate, downloadUpdateAsset, defaultDownloadDirectory, UpdateSourceError } from './update.js'
+import { checkForUpdate, downloadUpdateAsset, defaultDownloadDirectory, revealInFileManager, UpdateSourceError } from './update.js'
 import { DEFAULT_IMAGE_MODEL, IMAGE_MODELS, editImage, generateImage, isImageModel, materializeImageResult, ProviderError } from './provider.js'
 import type { GenerationResult } from './provider.js'
 import { pixelUpscale as pixelUpscaleImage } from './image.js'
@@ -44,7 +44,7 @@ type StoredRequest = { prompt?: string; layout?: string; size?: string; resoluti
 type Runtime = { controller: AbortController; listeners: Set<HttpResponse> }
 type GenerateImage = typeof generateImage
 type EditImage = typeof editImage
-export type AppOptions = { workspaceDir?: string; staticDir?: string; generateImage?: GenerateImage; editImage?: EditImage; defaultProvider?: Partial<ProviderConfig>; currentVersion?: string; updateSourceUrl?: string; downloadDir?: string; platform?: string }
+export type AppOptions = { workspaceDir?: string; staticDir?: string; generateImage?: GenerateImage; editImage?: EditImage; defaultProvider?: Partial<ProviderConfig>; currentVersion?: string; updateSourceUrl?: string; downloadDir?: string; platform?: string; revealFile?: (path: string) => void }
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 8765
@@ -115,6 +115,11 @@ function logErrorFields(error: unknown): Record<string, unknown> {
   if (error instanceof ImageNamingError) return { errorCode: error.code, ...(error.status === undefined ? {} : { httpStatus: error.status }), errorMessage: error.message }
   if (error instanceof Error) return { errorName: error.name, errorMessage: safeLogText(error.message) }
   return { errorName: typeof error }
+}
+// 更新包路径校验：只允许打开下载目录内的文件，否则这个接口等同于任意路径打开文件管理器。
+function isInsideDirectory(directory: string, target: string): boolean {
+  const rel = relative(resolve(directory), resolve(target))
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
 }
 function appendExecutionLog(workspaceDir: string, event: string, fields: Record<string, unknown> = {}): void {
   try {
@@ -1140,6 +1145,21 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         appendExecutionLog(workspaceDir, 'update_download_failed', { version: checked.latestVersion, errorMessage: (error as Error).message })
         res.write(dataEvent('failed', { code: error instanceof UpdateSourceError ? error.code : 'update_download_failed', message: (error as Error).message }))
         res.end(); return
+      }
+    }
+    if (req.method === 'POST' && path === '/api/update/reveal') {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      const item = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
+      const target = typeof item.path === 'string' ? item.path.trim() : ''
+      // 不信任前端传来的路径：只接受下载目录内的文件存在时才打开。
+      if (!target || !isInsideDirectory(downloadDir, target)) { errorResponse(res, 400, 'update_path_invalid', '只能打开下载目录里的更新包'); return }
+      if (!existsSync(target)) { errorResponse(res, 404, 'update_file_missing', '更新包已不在下载目录，可能被移动或删除'); return }
+      try {
+        (options.revealFile ?? revealInFileManager)(target)
+        json(res, 200, { ok: true, path: target }); return
+      } catch (error) {
+        errorResponse(res, 500, error instanceof UpdateSourceError ? error.code : 'update_reveal_failed', (error as Error).message); return
       }
     }
     // API 路由处理完后再托管静态文件，避免把未知 API 请求误返回前端首页。
