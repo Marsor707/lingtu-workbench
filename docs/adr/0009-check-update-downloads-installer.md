@@ -14,7 +14,7 @@
 
 - **只做"检查 + 下载"，不做就地更新**：客户端比对版本后把安装包下载到本机下载目录，由用户手动双击安装。由此**不需要签名密钥，也不需要引入 updater 插件**。
 - **检查更新的唯一事实来源是自建的 `latest.json`**，随 Release 发布，客户端固定请求 `releases/latest/download/latest.json`。不直接读 GitHub API，也不依赖 Tauri 对安装包的命名规则——资产名由 `scripts/rename-installers.mjs` 改成纯 ASCII 的 `lingtu-workbench_<版本>_<架构>.dmg` / `-setup.exe`，原因见下方「发布资产改名」，属于实现细节，不能固化进已发行的客户端。
-- **该能力由本地 Node 服务承载，而不是 Tauri**：检查与下载都是 Node 侧出站请求，复用既有 sidecar 的代理环境（`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`，由 Rust 注入），前端只跟 `127.0.0.1:8765` 打交道。这绕开了"页面调不到 Tauri IPC"的限制。
+- **该能力由本地 Node 服务承载，而不是 Tauri**：检查与下载都是 Node 侧出站请求，复用既有 sidecar 的代理环境（`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`，由 Rust 注入）（代理的注入方式已由 ADR 0014 改为应用内配置，本决策结论不变。），前端只跟 `127.0.0.1:8765` 打交道。这绕开了"页面调不到 Tauri IPC"的限制。
 - **下载走 Node 的 `fetch` 流式写盘 + SSE 进度**，SSE 复用既有 `dataEvent` 形状；下载状态放在前端 App 层，关掉设置弹窗不中断下载。
 - **`latest.json` 额外带 `min_supported_version`**：低于它的客户端提示手动重装，而不是引导下载一个装不上的包。当前填首个带本能力的版本号。
 - **下载落盘到系统下载目录**，不进工作区（更新包不是工作产物）。文件名只取 basename，防止更新源用路径穿越写到别处。

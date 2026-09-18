@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { networkInit } from './network.js'
 
 // 更新源是随 Release 一起发布的 latest.json；客户端只依赖它的字段契约，
 // 不依赖 GitHub API 结构，也不依赖 Tauri 对安装包文件名的生成规则。
@@ -100,9 +101,9 @@ export function resolveUpdate(source: UpdateSource, currentVersion: string, plat
 }
 
 export type UpdateResponse = { ok: boolean; status: number; json(): Promise<unknown>; body: AsyncIterable<Uint8Array> | null }
-export type UpdateFetch = (url: string, init?: { signal?: AbortSignal }) => Promise<UpdateResponse>
+export type UpdateFetch = (url: string, init?: RequestInit) => Promise<UpdateResponse>
 
-export type CheckUpdateOptions = { sourceUrl?: string; currentVersion: string; platform?: string; fetch?: UpdateFetch; signal?: AbortSignal }
+export type CheckUpdateOptions = { sourceUrl?: string; currentVersion: string; platform?: string; fetch?: UpdateFetch; signal?: AbortSignal; proxyUrl?: string }
 
 /** 拉取更新源并给出检查结果。网络或解析失败一律抛错，由调用方转成用户可见的失败原因。 */
 export async function checkForUpdate(options: CheckUpdateOptions): Promise<UpdateCheckResult> {
@@ -110,7 +111,7 @@ export async function checkForUpdate(options: CheckUpdateOptions): Promise<Updat
   const platform = options.platform ?? currentPlatform()
   if (!platform) throw new UpdateSourceError(`当前平台不支持自动更新：${process.platform}/${process.arch}`, 'update_platform_unsupported')
   const fetchImpl = (options.fetch ?? globalThis.fetch) as unknown as UpdateFetch
-  const response = await fetchImpl(sourceUrl, options.signal ? { signal: options.signal } : undefined)
+  const response = await fetchImpl(sourceUrl, networkInit(options.signal, options.proxyUrl))
   if (!response.ok) throw new UpdateSourceError(`更新源请求失败（HTTP ${response.status}）`, 'update_source_unreachable')
   return resolveUpdate(parseUpdateSource(await response.json()), options.currentVersion, platform)
 }
@@ -156,10 +157,10 @@ export function revealInFileManager(path: string, options: { platform?: string; 
   }
 }
 
-export async function downloadUpdateAsset(options: { asset: UpdateAsset; directory?: string; fetch?: UpdateFetch; onProgress?: (progress: DownloadProgress) => void; signal?: AbortSignal }): Promise<DownloadResult> {
+export async function downloadUpdateAsset(options: { asset: UpdateAsset; directory?: string; fetch?: UpdateFetch; onProgress?: (progress: DownloadProgress) => void; signal?: AbortSignal; proxyUrl?: string }): Promise<DownloadResult> {
   const directory = options.directory ?? defaultDownloadDirectory()
   const fetchImpl = (options.fetch ?? globalThis.fetch) as unknown as UpdateFetch
-  const response = await fetchImpl(options.asset.url, options.signal ? { signal: options.signal } : undefined)
+  const response = await fetchImpl(options.asset.url, networkInit(options.signal, options.proxyUrl))
   if (!response.ok) throw new UpdateSourceError(`下载更新包失败（HTTP ${response.status}）`, 'update_download_failed')
   const total = options.asset.size ?? 0
   const body = response.body

@@ -1,3 +1,5 @@
+import { networkInit } from './network.js'
+
 export type GenerationRequest = {
   baseUrl: string
   apiKey: string
@@ -6,6 +8,8 @@ export type GenerationRequest = {
   size?: string
   quality?: string
   signal?: AbortSignal
+  // 该供应商的出口代理；缺省表示直连。由调用方根据供应商与全局设置解析后传入。
+  proxyUrl?: string
   // 请求体已交给 fetch 时回调；与响应返回分开计时，才能判断长耗时发生在发送阶段还是服务端生成阶段。
   onRequestSent?: () => void
 }
@@ -19,6 +23,7 @@ export type EditImageRequest = {
   size?: string
   quality?: string
   signal?: AbortSignal
+  proxyUrl?: string
   onRequestSent?: () => void
 }
 
@@ -103,7 +108,7 @@ async function parseImageResponse(response: Response, timeoutSignal?: AbortSigna
   throw new ProviderError('provider_invalid_response', 'Provider 响应缺少图片内容')
 }
 
-export async function materializeImageResult(result: GenerationResult, signal?: AbortSignal): Promise<Uint8Array> {
+export async function materializeImageResult(result: GenerationResult, signal?: AbortSignal, proxyUrl?: string): Promise<Uint8Array> {
   if (result.kind === 'base64') {
     const bytes = Uint8Array.from(Buffer.from(result.value, 'base64'))
     if (bytes.byteLength === 0) throw new ProviderError('provider_invalid_response', 'Provider 返回的 base64 图片为空')
@@ -126,7 +131,7 @@ export async function materializeImageResult(result: GenerationResult, signal?: 
   for (let attempt = 0; attempt < MAX_RESULT_DOWNLOAD_ATTEMPTS; attempt += 1) {
     if (signal?.aborted) throw new DOMException('Provider 图片下载已取消', 'AbortError')
     try {
-      const response = await fetch(parsed, { signal: requestSignal.signal })
+      const response = await fetch(parsed, networkInit(requestSignal.signal, proxyUrl))
       if (!response.ok) {
         throw new ProviderError('provider_result_download_failed', `Provider 图片结果下载失败（HTTP ${response.status}）`, response.status)
       }
@@ -172,7 +177,7 @@ export async function generateImage(request: GenerationRequest): Promise<Generat
         ...(request.quality ? { quality: request.quality } : {}),
         n: 1,
       }),
-      signal: requestSignal.signal,
+      ...networkInit(requestSignal.signal, request.proxyUrl),
     })
   } catch (error) {
     throw networkError(requestSignal.timeoutSignal, request.signal, undefined, error)
@@ -207,7 +212,7 @@ export async function editImage(request: EditImageRequest): Promise<GenerationRe
         Authorization: `Bearer ${request.apiKey}`,
       },
       body: form,
-      signal: requestSignal.signal,
+      ...networkInit(requestSignal.signal, request.proxyUrl),
     })
   } catch (error) {
     throw networkError(requestSignal.timeoutSignal, request.signal, undefined, error)

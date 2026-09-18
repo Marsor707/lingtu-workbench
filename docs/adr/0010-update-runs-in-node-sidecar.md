@@ -10,7 +10,7 @@
 
 但本项目的界面运行在**系统默认浏览器**中，不是 Tauri WebView。应用启动后由 Rust 拉起 Node sidecar 并打开浏览器标签页，`src/` 下没有任何 `@tauri-apps/*` 引用，页面的 `window.__TAURI_INTERNALS__` 永远不存在。即使 Rust 暴露 `#[tauri::command]`，页面也没有调用通路。
 
-同时，sidecar 早已是一个完整的 Node 运行时：它持有数据库、负责所有 Provider 出站请求，并且 Rust 会为它注入系统代理环境变量（`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`，macOS 与 Windows 各有探测逻辑）。
+同时，sidecar 早已是一个完整的 Node 运行时：它持有数据库、负责所有 Provider 出站请求，并且 Rust 会为它注入系统代理环境变量（`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`，macOS 与 Windows 各有探测逻辑）（代理的注入方式已由 ADR 0014 改为应用内配置，本决策结论不变。）。
 
 另一个约束是 Node 的 SEA（单文件可执行）形态：官方文档明确 SEA 注入脚本**只能加载内建模块**，`require`/`import` 不到文件系统里的模块。因此 sidecar 里能用的只有 `node:*` 内建能力，没有第三方库。
 

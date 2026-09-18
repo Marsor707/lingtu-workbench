@@ -6,12 +6,12 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createServer as createHttpServer } from 'node:http'
 import { PNG } from 'pngjs'
-import { buildEffectivePrompt, JobStore, startServer } from '../dist-server/index.js'
+import { buildEffectivePrompt, JobStore, resolveProxyUrl, resolveSystemProxy, startServer } from '../dist-server/index.js'
 
 const server = await startServer(0)
 const address = server.address()
 const baseUrl = `http://127.0.0.1:${address.port}`
-const environmentKeys = ['LINGTU_PROVIDER_BASE_URL', 'LINGTU_API_KEY']
+const environmentKeys = ['LINGTU_PROVIDER_BASE_URL', 'LINGTU_API_KEY', 'LINGTU_SYSTEM_PROXY', 'HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy']
 const ambientEnvironment = Object.fromEntries(environmentKeys.map((name) => [name, process.env[name]]))
 for (const name of environmentKeys) delete process.env[name]
 
@@ -281,7 +281,7 @@ test('旧版单 Provider 配置首次启动自动迁移为默认启用供应商'
     const providers = store.listProviders()
     assert.equal(providers.length, 1)
     assert.deepEqual(providers[0], {
-      id: 'legacy-default', name: '默认供应商', baseUrl: 'https://legacy.example/v1', model: 'gpt-image-2', configured: true, enabled: true, successCount: 0, failureCount: 0,
+      id: 'legacy-default', name: '默认供应商', baseUrl: 'https://legacy.example/v1', model: 'gpt-image-2', proxy: '', configured: true, enabled: true, successCount: 0, failureCount: 0,
       createdAt: '2026-09-01T00:00:00.000Z', updatedAt: providers[0].updatedAt,
     })
     assert.equal(JSON.stringify(providers).includes('legacy-secret'), false)
@@ -967,15 +967,15 @@ test('任务队列按 maxConcurrency 限制 Provider 并发', async () => {
       body: JSON.stringify({ maxConcurrency: 2 }),
     })
     assert.equal(settingsResponse.status, 200)
-    assert.deepEqual(await settingsResponse.json(), { maxConcurrency: 2, pixelUpscale: 'off', imageNamingEnabled: false })
-    assert.deepEqual(await (await fetch(`${base}/api/settings`)).json(), { maxConcurrency: 2, pixelUpscale: 'off', imageNamingEnabled: false })
+    assert.deepEqual(await settingsResponse.json(), { maxConcurrency: 2, pixelUpscale: 'off', imageNamingEnabled: false, systemProxy: '', detectedProxy: '' })
+    assert.deepEqual(await (await fetch(`${base}/api/settings`)).json(), { maxConcurrency: 2, pixelUpscale: 'off', imageNamingEnabled: false, systemProxy: '', detectedProxy: '' })
 
     const upscaleResponse = await fetch(`${base}/api/settings`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ pixelUpscale: '4K' }),
     })
-    assert.deepEqual(await upscaleResponse.json(), { maxConcurrency: 2, pixelUpscale: '4K', imageNamingEnabled: false })
+    assert.deepEqual(await upscaleResponse.json(), { maxConcurrency: 2, pixelUpscale: '4K', imageNamingEnabled: false, systemProxy: '', detectedProxy: '' })
     assert.equal(store.getPixelUpscaleLevel(), '4K')
     const snapshotted = store.create({ mode: 'generate', prompt: '快照测试' }).job
     assert.equal(snapshotted.pixelUpscale, '4K')
@@ -1276,6 +1276,94 @@ test('同时启用 4K 放大和 LLM 命名时使用原图命名并将放大图�
   } finally {
     await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
     await new Promise((resolve, reject) => llmServer.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('全局代理：空串跟随系统检测值，direct 直连，其余为自定义地址', () => {
+  assert.equal(resolveSystemProxy('', 'http://127.0.0.1:7890'), 'http://127.0.0.1:7890')
+  assert.equal(resolveSystemProxy(undefined, 'http://127.0.0.1:7890'), 'http://127.0.0.1:7890')
+  // 选「直连」必须压过检测值，否则设置了直连也照样走代理。
+  assert.equal(resolveSystemProxy('direct', 'http://127.0.0.1:7890'), undefined)
+  assert.equal(resolveSystemProxy('http://127.0.0.1:1080', 'http://127.0.0.1:7890'), 'http://127.0.0.1:1080')
+  // 没有检测到系统代理时，「跟随系统」等价于直连。
+  assert.equal(resolveSystemProxy('', undefined), undefined)
+})
+
+test('供应商级代理叠加全局设置：直连优先，其次自定义，最后跟随全局', () => {
+  assert.equal(resolveProxyUrl('direct', 'http://127.0.0.1:7890'), undefined)
+  assert.equal(resolveProxyUrl('http://127.0.0.1:1080', 'http://127.0.0.1:7890'), 'http://127.0.0.1:1080')
+  assert.equal(resolveProxyUrl('', 'http://127.0.0.1:7890'), 'http://127.0.0.1:7890')
+  assert.equal(resolveProxyUrl('', undefined), undefined)
+  assert.equal(resolveProxyUrl(undefined, undefined), undefined)
+})
+
+test('工作区设置持久化全局代理模式', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-proxy-settings-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const server = await startServer(0, '127.0.0.1', store, { workspaceDir: directory })
+  const base = `http://127.0.0.1:${server.address().port}`
+  const save = async (systemProxy) => {
+    const response = await fetch(`${base}/api/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ systemProxy }) })
+    return { status: response.status, body: await response.json() }
+  }
+  try {
+    const saved = await save('http://127.0.0.1:7890')
+    assert.equal(saved.status, 200)
+    assert.equal(saved.body.systemProxy, 'http://127.0.0.1:7890')
+    // 重新读取时必须拿到持久值，而不是启动时检测到的默认值。
+    assert.equal((await (await fetch(`${base}/api/settings`)).json()).systemProxy, 'http://127.0.0.1:7890')
+    // 携带账号密码的地址会让凭据经由接口回显，必须直接拒绝。
+    assert.equal((await save('http://user:pass@127.0.0.1:7890')).body.error?.code, 'invalid_proxy')
+    assert.equal((await save('socks5://127.0.0.1:1080')).body.error?.code, 'invalid_proxy')
+    assert.equal((await (await fetch(`${base}/api/settings`)).json()).systemProxy, 'http://127.0.0.1:7890')
+    // 'direct' 与空串都是合法值，且必须原样回读，否则重启后模式会漂移。
+    const direct = await save('direct')
+    assert.equal(direct.status, 200)
+    assert.equal(direct.body.systemProxy, 'direct')
+    const followed = await save('')
+    assert.equal(followed.status, 200)
+    assert.equal(followed.body.systemProxy, '')
+    assert.equal((await (await fetch(`${base}/api/settings`)).json()).systemProxy, '')
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('模型供应商保存代理配置并在列表回显，非法代理被拒绝', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-provider-proxy-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const server = await startServer(0, '127.0.0.1', store, { workspaceDir: directory })
+  const base = `http://127.0.0.1:${server.address().port}`
+  try {
+    const created = await (await fetch(`${base}/api/providers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: '直连供应商', baseUrl: 'https://example.com/v1', apiKey: 'secret', proxy: 'direct' }),
+    })).json()
+    assert.equal(created.proxy, 'direct')
+
+    const edit = async (proxy) => {
+      const response = await fetch(`${base}/api/providers/${created.id}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: '直连供应商', baseUrl: 'https://example.com/v1', proxy }),
+      })
+      return { status: response.status, body: await response.json() }
+    }
+    const updated = await edit('http://127.0.0.1:7890')
+    assert.equal(updated.status, 200)
+    assert.equal(updated.body.proxy, 'http://127.0.0.1:7890')
+    // 未传代理表示保留原值，空串表示回到「跟随全局设置」。
+    assert.equal((await edit(undefined)).body.proxy, 'http://127.0.0.1:7890')
+    assert.equal((await edit('')).body.proxy, '')
+    assert.equal((await edit('http://user:pass@127.0.0.1:7890')).body.error?.code, 'invalid_proxy')
+    assert.equal((await (await fetch(`${base}/api/providers`)).json()).items[0].proxy, '')
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     store.close()
     rmSync(directory, { recursive: true, force: true })
   }

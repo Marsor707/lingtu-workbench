@@ -12,7 +12,7 @@
     "tauri": "cargo tauri",
     "backend:build": "tsc -p tsconfig.server.json",
     "backend:sidecar": "node scripts/build-sidecar.mjs",
-    "backend:dev": "npm run backend:build && node --use-env-proxy --watch dist-server/index.js",
+    "backend:dev": "npm run backend:build && node --watch dist-server/index.js",
     "backend:test": "npm run backend:build && node --test server/index.test.mjs server/provider.test.mjs server/image.test.mjs server/update.test.mjs server/rename-installers.test.mjs server/llm-chat.test.mjs server/parent-watch.test.mjs server/version.test.mjs",
     "version:check": "node scripts/version.mjs check",
     "version:set": "node scripts/version.mjs set",
@@ -27,6 +27,7 @@
     "react": "latest",
     "react-dom": "latest",
     "typescript": "latest",
+    "undici": "^7.29.1",
     "vite": "latest",
     "write-excel-file": "^4.1.1"
   },

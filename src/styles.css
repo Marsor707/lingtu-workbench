@@ -260,15 +260,32 @@ h1 { font-size: clamp(25px, 2.2vw, 33px); line-height: 1.18; letter-spacing: -.4
 .window-order { flex: 0 0 auto; padding-top: 2px; color: var(--green); font: 600 10px var(--mono); }
 .window-grip { color: var(--muted-2); padding-top: 8px; cursor: grab; }.prompt-window.dragging .window-grip { cursor: grabbing; }.toggle { width: 25px; height: 15px; padding: 2px; border: 0; border-radius: 9px; background: #294137; cursor: pointer; margin-top: 8px; }.toggle span { display: block; width: 11px; height: 11px; border-radius: 50%; background: #829a90; transition: transform 180ms ease, background 180ms ease; }.toggle.on { background: #2f7655; }.toggle.on span { background: var(--green); transform: translateX(10px); }.window-fields { display: grid; gap: 7px; flex: 1; min-width: 0; }.window-fields input { width: 100%; min-height: 26px; color: var(--text); border: 0; border-bottom: 1px solid var(--border); background: transparent; outline: none; font-size: 11px; }.window-fields .prompt-editor-shell .prompt-editor { min-height: 88px; max-height: 160px; }.window-actions { display: grid; gap: 2px; align-items: start; }.danger-icon:hover { color: var(--red); border-color: #713d3d; }
 
-.modal-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 20px; background: rgba(1, 8, 5, .7); backdrop-filter: blur(5px); }.settings-modal { width: min(530px, 100%); border: 1px solid var(--border-strong); border-radius: 10px; background: #0c1a15; box-shadow: 0 25px 80px rgba(0,0,0,.45); }.modal-heading { display: flex; align-items: flex-start; justify-content: space-between; padding: 22px 23px 18px; border-bottom: 1px solid var(--border); }.modal-heading h2 { margin-top: 7px; font-size: 17px; }.settings-modal-body { display: grid; }.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 17px 23px; border-bottom: 1px solid var(--border); }.setting-row > div { display: grid; gap: 5px; }.setting-row strong { font-size: 12px; }.setting-row span:not(.key-status) { color: var(--muted-2); font-size: 10px; }.key-status { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font-size: 10px; }.setting-row select { min-height: 31px; color: var(--text); border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface-soft); padding: 0 9px; font-size: 10px; }.number-control.compact { width: 100px; }.modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 16px 23px; }.toast { position: fixed; right: 24px; bottom: 20px; z-index: 15; display: flex; align-items: center; gap: 7px; padding: 9px 12px; color: #b4d1c4; border: 1px solid #27523e; border-radius: 5px; background: rgba(10, 31, 22, .94); box-shadow: 0 8px 22px rgba(0,0,0,.25); font-size: 10px; }.toast svg { color: var(--green); }
+.modal-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 20px; background: rgba(1, 8, 5, .7); backdrop-filter: blur(5px); }.settings-modal { width: min(530px, 100%); border: 1px solid var(--border-strong); border-radius: 10px; background: #0c1a15; box-shadow: 0 25px 80px rgba(0,0,0,.45); }.modal-heading { display: flex; align-items: flex-start; justify-content: space-between; padding: 22px 23px 18px; border-bottom: 1px solid var(--border); }.modal-heading h2 { margin-top: 7px; font-size: 17px; }.settings-modal-body { display: grid; }.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 17px 23px; border-bottom: 1px solid var(--border); }.setting-row > div:first-child { display: grid; gap: 5px; }.setting-row strong { font-size: 12px; }.setting-row span:not(.key-status) { color: var(--muted-2); font-size: 10px; }.key-status { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font-size: 10px; }.setting-row select { min-height: 31px; color: var(--text); border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface-soft); padding: 0 9px; font-size: 10px; }.number-control.compact { width: 100px; }.modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 16px 23px; }.toast { position: fixed; right: 24px; bottom: 20px; z-index: 15; display: flex; align-items: center; gap: 7px; padding: 9px 12px; color: #b4d1c4; border: 1px solid #27523e; border-radius: 5px; background: rgba(10, 31, 22, .94); box-shadow: 0 8px 22px rgba(0,0,0,.25); font-size: 10px; }.toast svg { color: var(--green); }
 .modal-description { max-width: 390px; margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 /* 弹窗正文是 grid，网格项默认 min-width:auto：更新行里“已下载到 <完整路径>”这类长文本
    会把整行撑到超过弹窗宽度，导致输入框、按钮等控件横穿弹窗右边界。这里显式允许收缩，
    长文本再按各自的截断/换行规则处理。 */
 .settings-modal-body > .setting-row { min-width: 0; }
 .setting-row-toggle { align-items: flex-start; }
-/* 基础规则 .setting-row > div { display: grid } 特异性比单个类名高，会把控制区拉成单列网格、
-   让按钮纵向堆叠；这里所有布局规则都带上 .setting-row-update 保持同等特异性并靠书写顺序生效。 */
+/* 网络代理行自成一个两列网格：左栏说明、右栏模式选择，地址框按需横跨整行。
+   用 grid 而不是 flex 是为了让地址框能跨列铺满；只占左栏宽度会在右侧留一条死区。
+   行本身不画底线，由脚注收尾，两者视觉上属于同一块。 */
+.setting-row.setting-row-proxy { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 0 20px; border-bottom: 0; padding-bottom: 7px; }
+/* 标题带图标时统一「图标 + 6px + 文字」并用主题绿；这条规则原本只挂在 toggle/update 行上，
+   代理行漏了会退化成图标顶字、且沿用正文黑色。 */
+.setting-row-proxy strong { display: inline-flex; align-items: center; gap: 6px; }
+.setting-row-proxy strong svg { color: var(--green); }
+/* 「自定义」时才出现的地址框：跨越两列铺满内容宽度。 */
+.setting-row-proxy .proxy-url-input { grid-column: 1 / -1; width: 100%; min-height: 34px; margin-top: 9px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--surface-soft); padding: 0 10px; color: var(--text); font-size: 10px; outline: none; transition: border-color 160ms ease, box-shadow 160ms ease; }
+.setting-row-proxy .proxy-url-input::placeholder { color: var(--muted); }
+.setting-row-proxy .proxy-url-input:hover { border-color: #6fa988; }
+.setting-row-proxy .proxy-url-input:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(11, 143, 91, .12); }
+.setting-footnote { display: flex; gap: 6px; margin: 0; padding: 0 23px 15px; color: var(--muted-2); border-bottom: 1px solid var(--border); font-size: 10px; line-height: 1.5; }
+.setting-footnote svg { flex: 0 0 auto; margin-top: 1px; }
+/* 基础规则 .setting-row > div:first-child 只作用于左侧文本栏。一旦放宽成 .setting-row > div，
+   它会连控制区容器一起命中（.number-control / .segmented-control），既压掉控件自身的 display，
+   又给分段控件注入 gap——滑块宽度按 calc((100% - 6px)/N) 推导，多出间隙就会与目标分段错位。
+   下面所有布局规则都带上 .setting-row-update 保持同等特异性并靠书写顺序生效，避免按钮被拉成单列网格。 */
 .setting-row-update { align-items: center; gap: 14px; }
 /* 标签不参与收缩，否则会被状态文字挤成两行。 */
 .setting-row-update .update-label { flex: 0 0 auto; white-space: nowrap; }

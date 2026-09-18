@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { after } from 'node:test'
 import { createServer } from 'node:http'
+import { connect } from 'node:net'
 import { DEFAULT_PROVIDER_TIMEOUT_MS, editImage, generateImage, materializeImageResult, ProviderError } from '../dist-server/provider.js'
 
 const requests = []
@@ -106,6 +107,38 @@ test('Provider 请求体交给 fetch 前回调一次，本地校验失败时不�
     (error) => error instanceof ProviderError && error.code === 'provider_not_configured',
   )
   assert.equal(sent, 1)
+})
+
+test('Provider 按 proxyUrl 把请求交给代理，未配置代理时直连', async () => {
+  const connects = []
+  const target = createServer((req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ data: [{ b64_json: 'ZmFrZS1pbWFnZQ==' }] })) })
+  await new Promise((resolve) => target.listen(0, '127.0.0.1', resolve))
+  // 本地 CONNECT 代理：只统计隧道建立次数，再把流量原样转发给目标。
+  const proxy = createServer()
+  proxy.on('connect', (req, socket, head) => {
+    connects.push(req.url)
+    const [host, port] = req.url.split(':')
+    const upstream = connect(Number(port), host, () => {
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      upstream.write(head)
+      upstream.pipe(socket).pipe(upstream)
+    })
+    upstream.on('error', () => socket.destroy())
+  })
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve))
+  const baseUrl = `http://127.0.0.1:${target.address().port}`
+  try {
+    const viaProxy = await generateImage({ baseUrl, apiKey: 'test-secret', prompt: '代理测试', proxyUrl: `http://127.0.0.1:${proxy.address().port}` })
+    assert.deepEqual(viaProxy, { kind: 'base64', value: 'ZmFrZS1pbWFnZQ==' })
+    assert.equal(connects.length, 1)
+    // 未配置代理时必须直连。这条断言同时是 undici 版本漂移的哨兵：
+    // Node 内置 fetch 只接受与其内部版本一致的 Dispatcher，不匹配时这里会先红。
+    await generateImage({ baseUrl, apiKey: 'test-secret', prompt: '直连测试' })
+    assert.equal(connects.length, 1)
+  } finally {
+    await new Promise((resolve, reject) => proxy.close((error) => error ? reject(error) : resolve()))
+    await new Promise((resolve, reject) => target.close((error) => error ? reject(error) : resolve()))
+  }
 })
 
 test('Provider 返回图片 URL 时下载为可落盘的图片字节', async () => {

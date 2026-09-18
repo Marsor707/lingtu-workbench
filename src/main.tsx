@@ -20,9 +20,11 @@ import {
   FileSpreadsheet,
   FolderOpen,
   GalleryHorizontalEnd,
+  Globe,
   GripVertical,
   ImagePlus,
   Images,
+  Info,
   LayoutGrid,
   ListChecks,
   LoaderCircle,
@@ -74,11 +76,54 @@ type PromptItem = {
   sourceName?: string
 }
 
+// 代理取值编码：空串=跟随（全局行是「跟随系统」，供应商行是「跟随全局」），'direct'=直连，其余=自定义地址。
+type ProxyMode = 'follow' | 'direct' | 'custom'
+const PROXY_MODE_OPTIONS: Array<{ value: ProxyMode; label: string }> = [
+  { value: 'follow', label: '跟随全局设置' },
+  { value: 'direct', label: '直连（不使用代理）' },
+  { value: 'custom', label: '自定义代理地址' },
+]
+// 全局行用分段控件，标签要短，顺序按「介入程度」递增。
+const GLOBAL_PROXY_SEGMENTS: Array<{ value: ProxyMode; label: string }> = [
+  { value: 'direct', label: '直连' },
+  { value: 'follow', label: '跟随系统' },
+  { value: 'custom', label: '自定义' },
+]
+function proxyModeOf(proxy: string): { mode: ProxyMode; url: string } {
+  if (proxy === 'direct') return { mode: 'direct', url: '' }
+  if (proxy.trim()) return { mode: 'custom', url: proxy }
+  return { mode: 'follow', url: '' }
+}
+function globalProxySummary(mode: ProxyMode, detectedProxy: string): string {
+  if (mode === 'direct') return '所有请求直连，不使用代理'
+  if (mode === 'custom') return '使用下面填写的代理地址'
+  return detectedProxy ? `使用检测到的系统代理 ${detectedProxy}` : '未检测到系统代理，等同直连'
+}
+function proxyDraftValue(mode: ProxyMode, url: string): string {
+  if (mode === 'direct') return 'direct'
+  return mode === 'custom' ? url.trim() : ''
+}
+function proxySummary(proxy: string): string {
+  if (proxy === 'direct') return '直连'
+  return proxy.trim() ? '自定义' : '跟随全局'
+}
+function proxyUrlError(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) return '请填写代理地址。'
+  try {
+    const url = new URL(trimmed)
+    if (!['http:', 'https:'].includes(url.protocol)) return '代理地址必须以 http:// 或 https:// 开头。'
+    if (url.username || url.password) return '代理地址不支持携带账号密码。'
+  } catch { return '代理地址格式无效。' }
+  return ''
+}
+
 type ModelProvider = {
   id: string
   name: string
   baseUrl: string
   model: string
+  proxy: string
   configured: boolean
   enabled: boolean
   successCount: number
@@ -92,6 +137,7 @@ type LlmProvider = {
   name: string
   baseUrl: string
   model: string
+  proxy: string
   configured: boolean
   enabled: boolean
   successCount: number
@@ -423,6 +469,9 @@ function App() {
   const [maxConcurrency, setMaxConcurrency] = useState(() => readStoredMaxConcurrency())
   const [pixelUpscale, setPixelUpscale] = useState<PixelUpscaleLevel>('off')
   const [imageNamingEnabled, setImageNamingEnabled] = useState(false)
+  const [systemProxy, setSystemProxy] = useState('')
+  // 启动时检测到的系统代理，只用于设置页提示与默认值说明，真实出口始终是 systemProxy。
+  const [detectedProxy, setDetectedProxy] = useState('')
   const [modelProviders, setModelProviders] = useState<ModelProvider[]>([])
   const [providerRunningCount, setProviderRunningCount] = useState(0)
   const [llmProviders, setLlmProviders] = useState<LlmProvider[]>([])
@@ -477,13 +526,15 @@ function App() {
   useEffect(() => {
     const controller = new AbortController()
     fetch(`${LOCAL_API_BASE}/api/settings`, { signal: controller.signal })
-      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number; pixelUpscale?: string; imageNamingEnabled?: boolean }> : Promise.reject(new Error('settings unavailable')))
+      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number; pixelUpscale?: string; imageNamingEnabled?: boolean; systemProxy?: string; detectedProxy?: string }> : Promise.reject(new Error('settings unavailable')))
       .then((body) => {
         if (typeof body.maxConcurrency === 'number' && Number.isInteger(body.maxConcurrency)) {
           setMaxConcurrency(Math.min(20, Math.max(1, body.maxConcurrency)))
         }
         if (body.pixelUpscale === 'off' || body.pixelUpscale === '2K' || body.pixelUpscale === '4K') setPixelUpscale(body.pixelUpscale)
         if (typeof body.imageNamingEnabled === 'boolean') setImageNamingEnabled(body.imageNamingEnabled)
+        if (typeof body.systemProxy === 'string') setSystemProxy(body.systemProxy)
+        if (typeof body.detectedProxy === 'string') setDetectedProxy(body.detectedProxy)
       })
       .catch(() => undefined)
     return () => controller.abort()
@@ -494,11 +545,13 @@ function App() {
     if (!showSettings) return
     const controller = new AbortController()
     fetch(`${LOCAL_API_BASE}/api/settings`, { signal: controller.signal })
-      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number; pixelUpscale?: string; imageNamingEnabled?: boolean }> : Promise.reject(new Error('settings unavailable')))
+      .then((response) => response.ok ? response.json() as Promise<{ maxConcurrency?: number; pixelUpscale?: string; imageNamingEnabled?: boolean; systemProxy?: string; detectedProxy?: string }> : Promise.reject(new Error('settings unavailable')))
       .then((body) => {
         if (typeof body.maxConcurrency === 'number' && Number.isInteger(body.maxConcurrency)) setMaxConcurrency(Math.min(20, Math.max(1, body.maxConcurrency)))
         if (body.pixelUpscale === 'off' || body.pixelUpscale === '2K' || body.pixelUpscale === '4K') setPixelUpscale(body.pixelUpscale)
         if (typeof body.imageNamingEnabled === 'boolean') setImageNamingEnabled(body.imageNamingEnabled)
+        if (typeof body.systemProxy === 'string') setSystemProxy(body.systemProxy)
+        if (typeof body.detectedProxy === 'string') setDetectedProxy(body.detectedProxy)
       })
       .catch(() => undefined)
     return () => controller.abort()
@@ -683,17 +736,18 @@ function App() {
     setTextPrompt(nextSelected?.text ?? '')
   }
 
-  const saveWorkspaceConfig = async (nextMaxConcurrency: number, nextPixelUpscale: PixelUpscaleLevel, nextImageNamingEnabled: boolean) => {
+  const saveWorkspaceConfig = async (nextMaxConcurrency: number, nextPixelUpscale: PixelUpscaleLevel, nextImageNamingEnabled: boolean, nextSystemProxy: string) => {
     const settingsResponse = await fetch(`${LOCAL_API_BASE}/api/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ maxConcurrency: nextMaxConcurrency, pixelUpscale: nextPixelUpscale, imageNamingEnabled: nextImageNamingEnabled }),
+      body: JSON.stringify({ maxConcurrency: nextMaxConcurrency, pixelUpscale: nextPixelUpscale, imageNamingEnabled: nextImageNamingEnabled, systemProxy: nextSystemProxy }),
     })
-    const settingsBody = await settingsResponse.json() as ApiErrorBody & { maxConcurrency?: number; pixelUpscale?: string; imageNamingEnabled?: boolean }
+    const settingsBody = await settingsResponse.json() as ApiErrorBody & { maxConcurrency?: number; pixelUpscale?: string; imageNamingEnabled?: boolean; systemProxy?: string }
     if (!settingsResponse.ok || typeof settingsBody.maxConcurrency !== 'number') throw new Error(settingsBody.error?.message || '并发设置保存失败')
     setMaxConcurrency(settingsBody.maxConcurrency)
     if (settingsBody.pixelUpscale === 'off' || settingsBody.pixelUpscale === '2K' || settingsBody.pixelUpscale === '4K') setPixelUpscale(settingsBody.pixelUpscale)
     if (typeof settingsBody.imageNamingEnabled === 'boolean') setImageNamingEnabled(settingsBody.imageNamingEnabled)
+    if (typeof settingsBody.systemProxy === 'string') setSystemProxy(settingsBody.systemProxy)
   }
 
   const refreshProviders = async () => {
@@ -1142,7 +1196,7 @@ function App() {
       </main>
 
       {/* key 确保每次打开都重挂载弹窗：草稿 state 从最新服务端值重新初始化，避免显示陈旧快照。 */}
-      {showSettings && <SettingsModal key={pixelUpscale + String(maxConcurrency) + String(imageNamingEnabled)} maxConcurrency={maxConcurrency} pixelUpscale={pixelUpscale} imageNamingEnabled={imageNamingEnabled} hasRunningTasks={queue.some((item) => item.status === 'running' || item.status === 'queued')} update={update} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsModal key={pixelUpscale + String(maxConcurrency) + String(imageNamingEnabled) + systemProxy} maxConcurrency={maxConcurrency} pixelUpscale={pixelUpscale} imageNamingEnabled={imageNamingEnabled} systemProxy={systemProxy} detectedProxy={detectedProxy} hasRunningTasks={queue.some((item) => item.status === 'running' || item.status === 'queued')} update={update} onSave={saveWorkspaceConfig} onClose={() => setShowSettings(false)} />}
     </div>
   )
 }
@@ -1702,6 +1756,8 @@ function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCo
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
   const [model, setModel] = useState<string>(DEFAULT_IMAGE_MODEL)
+  const [proxyMode, setProxyMode] = useState<ProxyMode>('follow')
+  const [proxyUrl, setProxyUrl] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [showKey, setShowKey] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -1724,16 +1780,17 @@ function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCo
   }, [feedback])
 
   const resetForm = useCallback(() => {
-    setEditingId(null); setShowForm(false); setName(''); setBaseUrl(''); setModel(DEFAULT_IMAGE_MODEL); setApiKey(''); setShowKey(false); setFormError('')
+    setEditingId(null); setShowForm(false); setName(''); setBaseUrl(''); setModel(DEFAULT_IMAGE_MODEL); setApiKey(''); setShowKey(false); setProxyMode('follow'); setProxyUrl(''); setFormError('')
   }, [])
 
   // 抽屉的 Esc、焦点进出由 ProviderSheet 统一处理。
   const openCreate = () => {
-    setEditingId(null); setName(''); setBaseUrl(''); setModel(DEFAULT_IMAGE_MODEL); setApiKey(''); setShowKey(false); setFormError(''); setShowForm(true)
+    setEditingId(null); setName(''); setBaseUrl(''); setModel(DEFAULT_IMAGE_MODEL); setApiKey(''); setShowKey(false); setProxyMode('follow'); setProxyUrl(''); setFormError(''); setShowForm(true)
   }
 
   const openEdit = (provider: ModelProvider) => {
-    setEditingId(provider.id); setName(provider.name); setBaseUrl(provider.baseUrl); setModel(provider.model); setApiKey(''); setShowKey(false); setFormError(''); setShowForm(true)
+    const proxy = proxyModeOf(provider.proxy)
+    setEditingId(provider.id); setName(provider.name); setBaseUrl(provider.baseUrl); setModel(provider.model); setApiKey(''); setShowKey(false); setProxyMode(proxy.mode); setProxyUrl(proxy.url); setFormError(''); setShowForm(true)
   }
 
   const parseError = async (response: Response, fallback: string): Promise<string> => {
@@ -1748,6 +1805,7 @@ function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCo
       if (!['http:', 'https:'].includes(url.protocol)) throw new Error('unsupported protocol')
     } catch { setFormError('Base URL 需填写完整的 http:// 或 https:// 地址。'); return false }
     if (!editingId && !apiKey.trim()) { setFormError('新增供应商时必须填写 API Key。'); return false }
+    if (proxyMode === 'custom') { const proxyError = proxyUrlError(proxyUrl); if (proxyError) { setFormError(proxyError); return false } }
     return true
   }
 
@@ -1758,7 +1816,7 @@ function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCo
       const response = await fetch(`${LOCAL_API_BASE}/api/providers${editingId ? `/${encodeURIComponent(editingId)}` : ''}`, {
         method: editingId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name.trim(), baseUrl: baseUrl.trim(), model, ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) }),
+        body: JSON.stringify({ name: name.trim(), baseUrl: baseUrl.trim(), model, proxy: proxyDraftValue(proxyMode, proxyUrl), ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) }),
       })
       if (!response.ok) throw new Error(await parseError(response, editingId ? '供应商保存失败' : '供应商创建失败'))
       await onRefresh(); setFeedback(editingId ? '供应商配置已更新' : '供应商已添加'); resetForm()
@@ -1806,11 +1864,11 @@ function ModelSettingsPage({ providers, runningCount, llmProviders, llmRunningCo
     {runningCount > 0 && <div className="provider-lock-banner locked" role="status"><div><ShieldCheck size={17} /><span>当前有 {runningCount} 个任务执行中，暂不能切换模型供应商</span></div><small>任务结束前不能切换或删除供应商，配置编辑不受影响。</small></div>}
     {error && <div className="form-error provider-page-error" role="alert"><AlertTriangle size={15} />{error}</div>}
     <ProviderSheet open={showForm} eyebrow={editingId ? '编辑配置' : '新增配置'} title={editingId ? '更新模型供应商' : '添加模型供应商'} description="配置接口地址、密钥和该供应商使用的生图模型；仅保存在本机。" onClose={resetForm} footer={<><button className="button button-ghost" type="button" onClick={resetForm}>取消</button><button className="button button-primary" type="button" onClick={() => void saveProvider()} disabled={saving}><Check size={16} />{saving ? '保存中…' : editingId ? '保存修改' : '添加供应商'}</button></>}>
-      <div className="provider-form-grid"><div className="setting-field"><label htmlFor="provider-name">供应商名称</label><input id="provider-name" value={name} onChange={(event) => { setName(event.target.value); setFormError('') }} placeholder="例如：主力模型" /></div><div className="setting-field provider-url-field"><label htmlFor="provider-base-url">服务地址</label><input id="provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setFormError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="provider-api-key">API 秘钥</label><div className="secret-input"><input id="provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setFormError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">秘钥仅保存在本地服务，不会出现在任务、日志或接口响应中。</span></div><div className="setting-field"><label htmlFor="provider-model">生图模型</label><div className="select-wrap"><select id="provider-model" value={model} onChange={(event) => { setModel(event.target.value); setFormError('') }}>{IMAGE_MODEL_OPTIONS.map((option) => <option key={option} value={option}>{option}</option>)}</select><ChevronDown size={15} /></div><span className="field-help">该供应商实际调用的生图模型；修改只影响之后创建的新任务。</span></div>
+      <div className="provider-form-grid"><div className="setting-field"><label htmlFor="provider-name">供应商名称</label><input id="provider-name" value={name} onChange={(event) => { setName(event.target.value); setFormError('') }} placeholder="例如：主力模型" /></div><div className="setting-field provider-url-field"><label htmlFor="provider-base-url">服务地址</label><input id="provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setFormError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="provider-api-key">API 秘钥</label><div className="secret-input"><input id="provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setFormError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">秘钥仅保存在本地服务，不会出现在任务、日志或接口响应中。</span></div><div className="setting-field"><label htmlFor="provider-model">生图模型</label><div className="select-wrap"><select id="provider-model" value={model} onChange={(event) => { setModel(event.target.value); setFormError('') }}>{IMAGE_MODEL_OPTIONS.map((option) => <option key={option} value={option}>{option}</option>)}</select><ChevronDown size={15} /></div><span className="field-help">该供应商实际调用的生图模型；修改只影响之后创建的新任务。</span></div><div className="setting-field provider-proxy-field"><label htmlFor="provider-proxy">网络代理</label><div className="select-wrap"><select id="provider-proxy" value={proxyMode} onChange={(event) => { setProxyMode(event.target.value as ProxyMode); setFormError('') }}>{PROXY_MODE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><ChevronDown size={15} /></div>{proxyMode === 'custom' && <input className="proxy-url-input" id="provider-proxy-url" value={proxyUrl} onChange={(event) => { setProxyUrl(event.target.value); setFormError('') }} placeholder="http://127.0.0.1:7890" inputMode="url" />}<span className="field-help">该供应商请求的出口；选「直连」可避开代理的长连接空闲超时。</span></div>
       </div>
       {formError && <div className="form-error provider-form-error" role="alert"><AlertTriangle size={15} />{formError}</div>}
     </ProviderSheet>
-    {providers.length === 0 ? <div className="empty-state panel provider-empty"><Settings2 size={24} /><strong>尚未配置模型供应商</strong><span>添加名称、Base URL、API Key 和生图模型后即可创建生图任务。</span><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加第一个供应商</button></div> : <div className="provider-list">{providers.map((provider) => <article className={`provider-row ${provider.enabled ? 'enabled' : ''}`} key={provider.id}><div className="provider-status-mark"><span /><small>{provider.enabled ? '已启用' : '未启用'}</small></div><div className="provider-identity"><div><h2>{provider.name}</h2>{provider.enabled && <span className="provider-active-badge"><CheckCircle2 size={13} />当前使用</span>}</div><span className="mono" title={provider.baseUrl}>{provider.baseUrl}</span><small>生图模型 <span className="mono">{provider.model}</span> · API Key {provider.configured ? '已配置' : '未配置'} · 更新于 {new Date(provider.updatedAt).toLocaleString('zh-CN', { hour12: false })}</small></div><div className="provider-stats" aria-label={`${provider.name}任务统计`}><div><span>成功</span><strong>{provider.successCount}</strong></div><div><span>失败</span><strong>{provider.failureCount}</strong></div></div><div className="provider-actions"><button className="icon-button subtle" type="button" onClick={() => openEdit(provider)} title={`编辑 ${provider.name}`} aria-label={`编辑 ${provider.name}`}><Settings2 size={16} /></button><button className="button button-small button-ghost provider-enable-button" type="button" disabled={provider.enabled || runningCount > 0 || busyId !== null} onClick={() => void enableProvider(provider)} title={runningCount > 0 ? '有任务执行中，暂不能切换' : provider.enabled ? '当前已启用' : `启用 ${provider.name}`}>{provider.enabled ? <><Check size={14} />已启用</> : <><Play size={14} />启用</>}</button><button className="icon-button danger-icon" type="button" disabled={provider.enabled || runningCount > 0 || providers.length <= 1 || busyId !== null} onClick={() => void deleteProvider(provider)} title={provider.enabled ? '当前启用供应商不能删除' : providers.length <= 1 ? '至少保留一个供应商' : `删除 ${provider.name}`} aria-label={`删除 ${provider.name}`}><Trash2 size={16} /></button></div></article>)}</div>}
+    {providers.length === 0 ? <div className="empty-state panel provider-empty"><Settings2 size={24} /><strong>尚未配置模型供应商</strong><span>添加名称、Base URL、API Key 和生图模型后即可创建生图任务。</span><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加第一个供应商</button></div> : <div className="provider-list">{providers.map((provider) => <article className={`provider-row ${provider.enabled ? 'enabled' : ''}`} key={provider.id}><div className="provider-status-mark"><span /><small>{provider.enabled ? '已启用' : '未启用'}</small></div><div className="provider-identity"><div><h2>{provider.name}</h2>{provider.enabled && <span className="provider-active-badge"><CheckCircle2 size={13} />当前使用</span>}</div><span className="mono" title={provider.baseUrl}>{provider.baseUrl}</span><small>生图模型 <span className="mono">{provider.model}</span> · API Key {provider.configured ? '已配置' : '未配置'} · 代理 {proxySummary(provider.proxy)} · 更新于 {new Date(provider.updatedAt).toLocaleString('zh-CN', { hour12: false })}</small></div><div className="provider-stats" aria-label={`${provider.name}任务统计`}><div><span>成功</span><strong>{provider.successCount}</strong></div><div><span>失败</span><strong>{provider.failureCount}</strong></div></div><div className="provider-actions"><button className="icon-button subtle" type="button" onClick={() => openEdit(provider)} title={`编辑 ${provider.name}`} aria-label={`编辑 ${provider.name}`}><Settings2 size={16} /></button><button className="button button-small button-ghost provider-enable-button" type="button" disabled={provider.enabled || runningCount > 0 || busyId !== null} onClick={() => void enableProvider(provider)} title={runningCount > 0 ? '有任务执行中，暂不能切换' : provider.enabled ? '当前已启用' : `启用 ${provider.name}`}>{provider.enabled ? <><Check size={14} />已启用</> : <><Play size={14} />启用</>}</button><button className="icon-button danger-icon" type="button" disabled={provider.enabled || runningCount > 0 || providers.length <= 1 || busyId !== null} onClick={() => void deleteProvider(provider)} title={provider.enabled ? '当前启用供应商不能删除' : providers.length <= 1 ? '至少保留一个供应商' : `删除 ${provider.name}`} aria-label={`删除 ${provider.name}`}><Trash2 size={16} /></button></div></article>)}</div>}
     {feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}
     <LlmSettingsSection providers={llmProviders} runningCount={llmRunningCount} onRefresh={onRefreshLlm} />
   </div>
@@ -1824,6 +1882,8 @@ function LlmSettingsSection({ providers, runningCount, onRefresh }: { providers:
   const [model, setModel] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [showKey, setShowKey] = useState(false)
+  const [proxyMode, setProxyMode] = useState<ProxyMode>('follow')
+  const [proxyUrl, setProxyUrl] = useState('')
   const [busy, setBusy] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
   // 页面错误（切换/删除/刷新失败）和表单错误（校验、保存失败）分开，否则抽屉打开时错误会被遮罩挡住。
@@ -1832,20 +1892,21 @@ function LlmSettingsSection({ providers, runningCount, onRefresh }: { providers:
   const [feedback, setFeedback] = useState('')
   const [refreshing, setRefreshing] = useState(false)
 
-  const resetForm = useCallback(() => { setEditingId(null); setShowForm(false); setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setShowKey(false); setFormError('') }, [])
-  const openCreate = () => { setEditingId(null); setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setShowKey(false); setFormError(''); setShowForm(true) }
-  const openEdit = (provider: LlmProvider) => { setEditingId(provider.id); setName(provider.name); setBaseUrl(provider.baseUrl); setModel(provider.model); setApiKey(''); setShowKey(false); setFormError(''); setShowForm(true) }
+  const resetForm = useCallback(() => { setEditingId(null); setShowForm(false); setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setShowKey(false); setProxyMode('follow'); setProxyUrl(''); setFormError('') }, [])
+  const openCreate = () => { setEditingId(null); setName(''); setBaseUrl(''); setModel(''); setApiKey(''); setShowKey(false); setProxyMode('follow'); setProxyUrl(''); setFormError(''); setShowForm(true) }
+  const openEdit = (provider: LlmProvider) => { const proxy = proxyModeOf(provider.proxy); setEditingId(provider.id); setName(provider.name); setBaseUrl(provider.baseUrl); setModel(provider.model); setApiKey(''); setShowKey(false); setProxyMode(proxy.mode); setProxyUrl(proxy.url); setFormError(''); setShowForm(true) }
   const parseError = async (response: Response, fallback: string) => { try { return (await response.json() as ApiErrorBody).error?.message || fallback } catch { return fallback } }
   const validate = () => {
     if (!name.trim() || !baseUrl.trim() || !model.trim() || (!editingId && !apiKey.trim())) { setFormError('名称、服务地址、模型名称和 API 秘钥均不能为空。'); return false }
     try { const url = new URL(baseUrl.trim()); if (!['http:', 'https:'].includes(url.protocol)) throw new Error() } catch { setError('服务地址需填写完整的 http:// 或 https:// 地址。'); return false }
+    if (proxyMode === 'custom') { const proxyError = proxyUrlError(proxyUrl); if (proxyError) { setFormError(proxyError); return false } }
     return true
   }
   const save = async () => {
     if (busy || !validate()) return
     setBusy(true); setFormError('')
     try {
-      const response = await fetch(`${LOCAL_API_BASE}/api/llm-providers${editingId ? `/${encodeURIComponent(editingId)}` : ''}`, { method: editingId ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim(), baseUrl: baseUrl.trim(), model: model.trim(), ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) }) })
+      const response = await fetch(`${LOCAL_API_BASE}/api/llm-providers${editingId ? `/${encodeURIComponent(editingId)}` : ''}`, { method: editingId ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim(), baseUrl: baseUrl.trim(), model: model.trim(), proxy: proxyDraftValue(proxyMode, proxyUrl), ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}) }) })
       if (!response.ok) throw new Error(await parseError(response, 'LLM 供应商保存失败'))
       await onRefresh(); setFeedback(editingId ? 'LLM 供应商配置已更新' : 'LLM 供应商已添加'); resetForm()
     } catch (saveError) { setFormError(saveError instanceof Error ? saveError.message : 'LLM 供应商保存失败') } finally { setBusy(false) }
@@ -1874,10 +1935,10 @@ function LlmSettingsSection({ providers, runningCount, onRefresh }: { providers:
     {runningCount > 0 && <div className="provider-lock-banner locked" role="status"><div><ShieldCheck size={17} /><span>当前有 {runningCount} 个任务执行中，暂不能切换 LLM 供应商</span></div><small>配置编辑不受影响，切换仅影响新任务。</small></div>}
     {error && <div className="form-error provider-page-error" role="alert"><AlertTriangle size={15} />{error}</div>}
     <ProviderSheet open={showForm} eyebrow={editingId ? '编辑配置' : '新增配置'} title={editingId ? '更新 LLM 供应商' : '添加 LLM 供应商'} description="为生图结果生成文件名，需要支持视觉输入的 OpenAI 兼容模型；仅保存在本机。" onClose={resetForm} footer={<><button className="button button-ghost" type="button" onClick={resetForm}>取消</button><button className="button button-primary" type="button" onClick={() => void save()} disabled={busy}><Check size={16} />{busy ? '保存中…' : editingId ? '保存修改' : '添加供应商'}</button></>}>
-      <div className="provider-form-grid"><div className="setting-field"><label htmlFor="llm-provider-name">供应商名称</label><input id="llm-provider-name" value={name} onChange={(event) => { setName(event.target.value); setFormError('') }} placeholder="例如：视觉命名模型" /></div><div className="setting-field"><label htmlFor="llm-provider-base-url">服务地址</label><input id="llm-provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setFormError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="llm-provider-model">模型名称</label><input id="llm-provider-model" value={model} onChange={(event) => { setModel(event.target.value); setFormError('') }} placeholder="例如：gpt-4o" /></div><div className="setting-field"><label htmlFor="llm-provider-api-key">API 秘钥</label><div className="secret-input"><input id="llm-provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setFormError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">仅保存到本地服务，不会出现在任务、日志或接口响应中。</span></div></div>
+      <div className="provider-form-grid"><div className="setting-field"><label htmlFor="llm-provider-name">供应商名称</label><input id="llm-provider-name" value={name} onChange={(event) => { setName(event.target.value); setFormError('') }} placeholder="例如：视觉命名模型" /></div><div className="setting-field"><label htmlFor="llm-provider-base-url">服务地址</label><input id="llm-provider-base-url" value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setFormError('') }} placeholder="https://api.example.com/v1" inputMode="url" /></div><div className="setting-field"><label htmlFor="llm-provider-model">模型名称</label><input id="llm-provider-model" value={model} onChange={(event) => { setModel(event.target.value); setFormError('') }} placeholder="例如：gpt-4o" /></div><div className="setting-field"><label htmlFor="llm-provider-api-key">API 秘钥</label><div className="secret-input"><input id="llm-provider-api-key" type={showKey ? 'text' : 'password'} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setFormError('') }} placeholder={editingId ? '留空表示保留当前密钥' : '输入 API 秘钥'} autoComplete="off" /><button className="icon-button subtle" type="button" onClick={() => setShowKey((visible) => !visible)} title={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'} aria-label={showKey ? '隐藏 API 秘钥' : '显示 API 秘钥'}>{showKey ? <EyeOff size={15} /> : <Eye size={15} />}</button></div><span className="field-help">仅保存到本地服务，不会出现在任务、日志或接口响应中。</span></div><div className="setting-field provider-proxy-field"><label htmlFor="llm-provider-proxy">网络代理</label><div className="select-wrap"><select id="llm-provider-proxy" value={proxyMode} onChange={(event) => { setProxyMode(event.target.value as ProxyMode); setFormError('') }}>{PROXY_MODE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><ChevronDown size={15} /></div>{proxyMode === 'custom' && <input className="proxy-url-input" id="llm-provider-proxy-url" value={proxyUrl} onChange={(event) => { setProxyUrl(event.target.value); setFormError('') }} placeholder="http://127.0.0.1:7890" inputMode="url" />}<span className="field-help">该供应商请求的出口；选「直连」可避开代理的长连接空闲超时。</span></div></div>
       {formError && <div className="form-error provider-form-error" role="alert"><AlertTriangle size={15} />{formError}</div>}
     </ProviderSheet>
-    {providers.length === 0 ? <div className="empty-state panel provider-empty"><Sparkles size={24} /><strong>尚未配置 LLM 图片命名模型</strong><span>添加供应商并启用工作区设置中的“LLM 图片命名”。</span><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加第一个 LLM 供应商</button></div> : <div className="provider-list llm-provider-list">{providers.map((provider) => <article className={`provider-row ${provider.enabled ? 'enabled' : ''}`} key={provider.id}><div className="provider-status-mark"><span /><small>{provider.enabled ? '已启用' : '未启用'}</small></div><div className="provider-identity"><div><h3>{provider.name}</h3>{provider.enabled && <span className="provider-active-badge"><CheckCircle2 size={13} />当前使用</span>}</div><span className="mono" title={provider.baseUrl}>{provider.baseUrl}</span><small>模型 {provider.model} · API 秘钥 {provider.configured ? '已配置' : '未配置'}</small></div><div className="provider-stats" aria-label={`${provider.name}命名统计`}><div><span>成功</span><strong>{provider.successCount}</strong></div><div><span>失败</span><strong>{provider.failureCount}</strong></div></div><div className="provider-actions"><button className="icon-button subtle" type="button" onClick={() => openEdit(provider)} title={`编辑 ${provider.name}`} aria-label={`编辑 ${provider.name}`}><Settings2 size={16} /></button><button className="button button-small button-ghost provider-enable-button" type="button" disabled={provider.enabled || runningCount > 0 || busyId !== null} onClick={() => void enable(provider)} title={runningCount > 0 ? '有任务执行中，暂不能切换' : provider.enabled ? '当前已启用' : `启用 ${provider.name}`}>{provider.enabled ? <><Check size={14} />已启用</> : <><Play size={14} />启用</>}</button><button className="icon-button danger-icon" type="button" disabled={provider.enabled || runningCount > 0 || providers.length <= 1 || busyId !== null} onClick={() => void remove(provider)} title={provider.enabled ? '当前启用供应商不能删除' : '删除供应商'} aria-label={`删除 ${provider.name}`}><Trash2 size={16} /></button></div></article>)}</div>}
+    {providers.length === 0 ? <div className="empty-state panel provider-empty"><Sparkles size={24} /><strong>尚未配置 LLM 图片命名模型</strong><span>添加供应商并启用工作区设置中的“LLM 图片命名”。</span><button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />添加第一个 LLM 供应商</button></div> : <div className="provider-list llm-provider-list">{providers.map((provider) => <article className={`provider-row ${provider.enabled ? 'enabled' : ''}`} key={provider.id}><div className="provider-status-mark"><span /><small>{provider.enabled ? '已启用' : '未启用'}</small></div><div className="provider-identity"><div><h3>{provider.name}</h3>{provider.enabled && <span className="provider-active-badge"><CheckCircle2 size={13} />当前使用</span>}</div><span className="mono" title={provider.baseUrl}>{provider.baseUrl}</span><small>模型 {provider.model} · API 秘钥 {provider.configured ? '已配置' : '未配置'} · 代理 {proxySummary(provider.proxy)}</small></div><div className="provider-stats" aria-label={`${provider.name}命名统计`}><div><span>成功</span><strong>{provider.successCount}</strong></div><div><span>失败</span><strong>{provider.failureCount}</strong></div></div><div className="provider-actions"><button className="icon-button subtle" type="button" onClick={() => openEdit(provider)} title={`编辑 ${provider.name}`} aria-label={`编辑 ${provider.name}`}><Settings2 size={16} /></button><button className="button button-small button-ghost provider-enable-button" type="button" disabled={provider.enabled || runningCount > 0 || busyId !== null} onClick={() => void enable(provider)} title={runningCount > 0 ? '有任务执行中，暂不能切换' : provider.enabled ? '当前已启用' : `启用 ${provider.name}`}>{provider.enabled ? <><Check size={14} />已启用</> : <><Play size={14} />启用</>}</button><button className="icon-button danger-icon" type="button" disabled={provider.enabled || runningCount > 0 || providers.length <= 1 || busyId !== null} onClick={() => void remove(provider)} title={provider.enabled ? '当前启用供应商不能删除' : '删除供应商'} aria-label={`删除 ${provider.name}`}><Trash2 size={16} /></button></div></article>)}</div>}
     {feedback && <div className="toast" role="status"><CheckCircle2 size={14} />{feedback}</div>}
   </section>
 }
@@ -2068,18 +2129,26 @@ function UpdateRow({ hasRunningTasks, phase, check, download, cancelDownload, sk
   )
 }
 
-function SettingsModal({ maxConcurrency, pixelUpscale, imageNamingEnabled, hasRunningTasks, update, onSave, onClose }: { maxConcurrency: number; pixelUpscale: PixelUpscaleLevel; imageNamingEnabled: boolean; hasRunningTasks: boolean; update: AppUpdate; onSave: (maxConcurrency: number, pixelUpscale: PixelUpscaleLevel, imageNamingEnabled: boolean) => Promise<void>; onClose: () => void }) {
+function SettingsModal({ maxConcurrency, pixelUpscale, imageNamingEnabled, systemProxy, detectedProxy, hasRunningTasks, update, onSave, onClose }: { maxConcurrency: number; pixelUpscale: PixelUpscaleLevel; imageNamingEnabled: boolean; systemProxy: string; detectedProxy: string; hasRunningTasks: boolean; update: AppUpdate; onSave: (maxConcurrency: number, pixelUpscale: PixelUpscaleLevel, imageNamingEnabled: boolean, systemProxy: string) => Promise<void>; onClose: () => void }) {
   const [draftMaxConcurrency, setDraftMaxConcurrency] = useState(maxConcurrency)
   const [draftPixelUpscale, setDraftPixelUpscale] = useState<PixelUpscaleLevel>(pixelUpscale)
   const [draftImageNamingEnabled, setDraftImageNamingEnabled] = useState(imageNamingEnabled)
+  const initialProxy = proxyModeOf(systemProxy)
+  const [draftProxyMode, setDraftProxyMode] = useState<ProxyMode>(initialProxy.mode)
+  const [draftProxyUrl, setDraftProxyUrl] = useState(initialProxy.url)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
 
   const handleSave = async () => {
     if (saving) return
+    // 只有「自定义」才需要校验地址；直连与跟随系统都没有可填错的内容。
+    if (draftProxyMode === 'custom') {
+      const proxyError = proxyUrlError(draftProxyUrl)
+      if (proxyError) { setError(proxyError); return }
+    }
     setSaving(true)
     try {
-      await onSave(draftMaxConcurrency, draftPixelUpscale, draftImageNamingEnabled)
+      await onSave(draftMaxConcurrency, draftPixelUpscale, draftImageNamingEnabled, proxyDraftValue(draftProxyMode, draftProxyUrl))
       // 保存成功后直接关闭弹窗，弹窗关闭即为成功反馈；失败时保留弹窗展示错误。
       onClose()
     } catch (saveError) {
@@ -2124,6 +2193,33 @@ function SettingsModal({ maxConcurrency, pixelUpscale, imageNamingEnabled, hasRu
             <div><strong><Sparkles size={15} />启用 LLM 图片命名</strong><span>生图完成后用已启用的视觉模型生成文件名；未配置或失败时保留原有命名。</span></div>
             <label className="setting-switch"><input type="checkbox" aria-label="启用 LLM 图片命名" checked={draftImageNamingEnabled} onChange={(event) => { setError(''); setDraftImageNamingEnabled(event.target.checked) }} /><span aria-hidden="true" /></label>
           </div>
+          <div className="setting-row setting-row-proxy">
+            <div>
+              <strong><Globe size={15} />网络代理</strong>
+              <span>{globalProxySummary(draftProxyMode, detectedProxy)}</span>
+            </div>
+            <div className="segmented-control" role="radiogroup" aria-label="网络代理" data-active={GLOBAL_PROXY_SEGMENTS.findIndex((segment) => segment.value === draftProxyMode)}>
+              {GLOBAL_PROXY_SEGMENTS.map((segment) => (
+                <label key={segment.value} className={`segmented-option ${draftProxyMode === segment.value ? 'active' : ''}`}>
+                  <input type="radio" name="network-proxy-mode" value={segment.value} checked={draftProxyMode === segment.value} onChange={() => { setError(''); setDraftProxyMode(segment.value) }} />
+                  <span>{segment.label}</span>
+                </label>
+              ))}
+            </div>
+            {/* 地址框横跨整行：只占左栏宽度会在右侧留下一条死区 */}
+            {draftProxyMode === 'custom' && (
+              <input
+                className="proxy-url-input"
+                value={draftProxyUrl}
+                onChange={(event) => { setError(''); setDraftProxyUrl(event.target.value) }}
+                onBlur={() => { if (draftProxyUrl.trim()) setError(proxyUrlError(draftProxyUrl)) }}
+                placeholder="http://127.0.0.1:7890"
+                aria-label="代理地址"
+                inputMode="url"
+              />
+            )}
+          </div>
+          <p className="setting-footnote"><Info size={13} />代理软件开启 TUN / 增强模式时，这里的设置不会生效，需要在代理软件里为该域名配置直连规则。</p>
           <UpdateRow hasRunningTasks={hasRunningTasks} phase={update.phase} check={update.check} download={update.download} cancelDownload={update.cancelDownload} skip={update.skip} reveal={update.reveal} />
           {error && <div className="form-error settings-modal-error" role="alert"><AlertTriangle size={14} />{error}</div>}
         </div>

@@ -23,7 +23,7 @@
 
 ## 本地开发
 
-需要 Node.js 24+ 和 npm。后端使用 Node 的环境代理支持读取 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`；Windows/macOS 桌面版在对应环境变量未设置时还会读取当前用户的系统代理，因此 Clash Verge 等工具开启“系统代理”后无需手工配置环境变量。代理在应用启动时读取，修改 Clash 代理端口后需重启灵图工作台。
+需要 Node.js 24+ 和 npm。出网代理由应用内的「网络代理」设置决定，不再读取进程环境变量。工作区设置里的全局代理是生图、LLM 和更新检查的默认出口，三选一：`跟随系统`（用启动时检测到的系统代理）、`直连`、`自定义`；每个供应商再单独选择「跟随全局设置 / 直连 / 自定义」覆盖全局。修改后立即生效，不需要重启，也不需要重启代理软件。
 
 Provider 建议由后端进程读取灵图项目环境变量，不需要用户在页面中修改端点：
 
@@ -32,11 +32,11 @@ export LINGTU_PROVIDER_BASE_URL="https://example.com/v1"
 export LINGTU_API_KEY="..."
 ```
 
-`LINGTU_PROVIDER_BASE_URL` / `LINGTU_API_KEY` 会覆盖 SQLite 和前端请求体中的 Provider 配置。API Key 不会返回给前端。启动 Node 服务时会启用环境代理，桌面版 sidecar 也会继承同一代理开关。
+`LINGTU_PROVIDER_BASE_URL` / `LINGTU_API_KEY` 会覆盖 SQLite 和前端请求体中的 Provider 配置。API Key 不会返回给前端。开发环境（`npm run backend:dev`）没有系统代理检测通道，会回落到 `HTTPS_PROXY` / `HTTP_PROXY` 作为全局代理的默认值。
 
 后端执行日志写入 `workspace/logs/execution.log`（JSON Lines，时间为东八区 `+08:00`），记录任务阶段、Provider 响应类型、结果下载、耗时和安全错误信息；不会记录 API Key、提示词、源图 Base64 或完整结果 URL。
 
-Provider 单次请求和结果 URL 下载的默认超时均为 3 分钟；外部 Provider 或网络代理若设置了更短的超时，仍可能在此之前断开连接。
+Provider 单次请求和结果 URL 下载的默认超时均为 3 分钟；外部 Provider 或网络代理若设置了更短的超时，仍可能在此之前断开连接。生图请求发出后要静默等待数十秒，代理链路里的长连接空闲超时会在这段时间掐断连接（表现为远端主动断开，而 Provider 侧已经受理并计费），此时把该供应商改为「直连」即可。代理软件开启 TUN / 增强模式时，应用内的代理设置不生效，需要在代理软件里为该域名配置直连规则。
 
 首次安装依赖：
 

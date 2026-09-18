@@ -27,7 +27,6 @@ const HEALTH_PATH: &str = "/health";
 struct ProxyEnvironment {
   http_proxy: Option<String>,
   https_proxy: Option<String>,
-  no_proxy: String,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
@@ -44,30 +43,22 @@ fn normalize_proxy_url(value: &str) -> Option<String> {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
-fn build_proxy_environment(
-  http_proxy: Option<String>,
-  https_proxy: Option<String>,
-  proxy_override: impl IntoIterator<Item = String>,
-) -> Option<ProxyEnvironment> {
+fn build_proxy_environment(http_proxy: Option<String>, https_proxy: Option<String>) -> Option<ProxyEnvironment> {
   if http_proxy.is_none() && https_proxy.is_none() {
     return None;
   }
+  Some(ProxyEnvironment { http_proxy, https_proxy })
+}
 
-  // 本地服务必须始终绕过代理；Windows/macOS 的系统配置再统一转换为 Node 使用的逗号格式。
-  let mut bypass = vec!["localhost".to_owned(), "127.0.0.1".to_owned(), "::1".to_owned()];
-  for item in proxy_override {
-    let item = item.trim();
-    if item.is_empty() || item.eq_ignore_ascii_case("<local>") || bypass.iter().any(|existing| existing.eq_ignore_ascii_case(item)) {
-      continue;
-    }
-    bypass.push(item.to_owned());
-  }
-
-  Some(ProxyEnvironment { http_proxy, https_proxy, no_proxy: bypass.join(",") })
+/// 检测到的系统代理地址，作为应用内「网络代理」设置的默认值。
+/// 出口最终由 sidecar 内的应用配置决定，这里不再注入 HTTP_PROXY 等进程环境变量。
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn detected_proxy_url() -> Option<String> {
+  system_proxy().and_then(|proxy| proxy.https_proxy.or(proxy.http_proxy))
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn parse_proxy_server(proxy_server: &str, proxy_override: Option<&str>) -> Option<ProxyEnvironment> {
+fn parse_proxy_server(proxy_server: &str) -> Option<ProxyEnvironment> {
   let mut http_proxy = None;
   let mut https_proxy = None;
 
@@ -88,7 +79,7 @@ fn parse_proxy_server(proxy_server: &str, proxy_override: Option<&str>) -> Optio
     https_proxy = Some(proxy);
   }
 
-  build_proxy_environment(http_proxy, https_proxy, proxy_override.unwrap_or_default().split(';').map(str::to_owned))
+  build_proxy_environment(http_proxy, https_proxy)
 }
 
 #[cfg(target_os = "windows")]
@@ -102,8 +93,7 @@ fn windows_system_proxy() -> Option<ProxyEnvironment> {
     return None;
   }
   let server = settings.get_value::<String, _>("ProxyServer").ok()?;
-  let bypass = settings.get_value::<String, _>("ProxyOverride").ok();
-  parse_proxy_server(&server, bypass.as_deref())
+  parse_proxy_server(&server)
 }
 
 #[cfg(target_os = "macos")]
@@ -129,27 +119,7 @@ fn macos_system_proxy() -> Option<ProxyEnvironment> {
     normalize_proxy_url(&format!("{host}:{port}"))
   };
 
-  let mut bypass = Vec::new();
-  let mut in_exceptions = false;
-  for line in text.lines().map(str::trim) {
-    if line.starts_with("ExceptionsList") && line.contains("<array>") {
-      in_exceptions = true;
-      continue;
-    }
-    if in_exceptions && line == "}" {
-      in_exceptions = false;
-      continue;
-    }
-    if in_exceptions {
-      if let Some((index, value)) = line.split_once(':') {
-        if index.trim().chars().all(|char| char.is_ascii_digit()) {
-          bypass.push(value.trim().to_owned());
-        }
-      }
-    }
-  }
-
-  build_proxy_environment(proxy("HTTPEnable", "HTTPProxy", "HTTPPort"), proxy("HTTPSEnable", "HTTPSProxy", "HTTPSPort"), bypass)
+  build_proxy_environment(proxy("HTTPEnable", "HTTPProxy", "HTTPPort"), proxy("HTTPSEnable", "HTTPSProxy", "HTTPSPort"))
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -158,10 +128,6 @@ fn system_proxy() -> Option<ProxyEnvironment> {
   { windows_system_proxy() }
   #[cfg(target_os = "macos")]
   { macos_system_proxy() }
-}
-
-fn environment_is_set(name: &str) -> bool {
-  std::env::var_os(name).is_some() || std::env::var_os(name.to_ascii_lowercase()).is_some()
 }
 
 struct SidecarState {
@@ -300,30 +266,12 @@ pub fn run() {
         .env("LINGTU_PARENT_PID", std::process::id().to_string())
         // 应用版本取自 Cargo.toml，与安装包版本一致，供本地服务比对更新源。
         .env("LINGTU_APP_VERSION", env!("CARGO_PKG_VERSION"))
-        // 让 sidecar 使用 HTTP_PROXY/HTTPS_PROXY/NO_PROXY 环境变量访问 Provider。
-        .env("NODE_USE_ENV_PROXY", "1");
+        // 出口代理由应用内的「网络代理」设置决定，不再走进程环境变量；
+        // 这里只把检测到的系统代理作为该设置的默认值，用户可在界面上修改或清空。
+        .env("LINGTU_SYSTEM_PROXY", detected_proxy_url().unwrap_or_default());
 
-      #[cfg(any(target_os = "windows", target_os = "macos"))]
-      let sidecar = {
-        let mut sidecar = sidecar;
-        if let Some(proxy) = system_proxy() {
-          // 普通用户只需开启 Clash 等软件的“系统代理”，无需手工配置环境变量。
-          if !environment_is_set("HTTP_PROXY") {
-            if let Some(value) = proxy.http_proxy {
-              sidecar = sidecar.env("HTTP_PROXY", value);
-            }
-          }
-          if !environment_is_set("HTTPS_PROXY") {
-            if let Some(value) = proxy.https_proxy {
-              sidecar = sidecar.env("HTTPS_PROXY", value);
-            }
-          }
-          if !environment_is_set("NO_PROXY") {
-            sidecar = sidecar.env("NO_PROXY", proxy.no_proxy);
-          }
-        }
-        sidecar
-      };
+      #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+      let sidecar = sidecar.env("LINGTU_SYSTEM_PROXY", "");
 
       let (mut events, child) = sidecar.spawn()?;
       app.manage(SidecarState {
@@ -398,23 +346,17 @@ mod tests {
 
   #[test]
   fn parses_shared_windows_proxy_for_http_and_https() {
-    let proxy = parse_proxy_server("127.0.0.1:7897", Some("<local>;*.example.com")).unwrap();
+    let proxy = parse_proxy_server("127.0.0.1:7897").unwrap();
 
     assert_eq!(proxy.http_proxy.as_deref(), Some("http://127.0.0.1:7897"));
     assert_eq!(proxy.https_proxy.as_deref(), Some("http://127.0.0.1:7897"));
-    assert_eq!(proxy.no_proxy, "localhost,127.0.0.1,::1,*.example.com");
   }
 
   #[test]
   fn parses_protocol_specific_windows_proxy() {
-    let proxy = parse_proxy_server(
-      "http=127.0.0.1:7890;https=https://127.0.0.1:7891;socks=127.0.0.1:7892",
-      None,
-    )
-    .unwrap();
+    let proxy = parse_proxy_server("http=127.0.0.1:7890;https=https://127.0.0.1:7891;socks=127.0.0.1:7892").unwrap();
 
     assert_eq!(proxy.http_proxy.as_deref(), Some("http://127.0.0.1:7890"));
     assert_eq!(proxy.https_proxy.as_deref(), Some("https://127.0.0.1:7891"));
-    assert_eq!(proxy.no_proxy, "localhost,127.0.0.1,::1");
   }
 }

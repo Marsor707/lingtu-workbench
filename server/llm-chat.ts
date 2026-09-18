@@ -1,8 +1,10 @@
+import { networkInit } from './network.js'
+
 /**
  * OpenAI 兼容的视觉 LLM 调用底座：图片命名与商品标题生成共用同一套端点拼接、超时和响应解析。
  * 本模块只负责「把图片和文本发给模型并取回文本」，具体提示词与结果校验由调用方负责。
  */
-export type LlmChatConfig = { baseUrl: string; apiKey: string; model: string }
+export type LlmChatConfig = { baseUrl: string; apiKey: string; model: string; proxyUrl?: string }
 
 export class LlmChatError extends Error {
   constructor(public readonly code: string, message: string, public readonly status?: number) {
@@ -61,7 +63,7 @@ export async function chatVision(config: LlmChatConfig, system: string, text: st
           ] },
         ],
       }),
-      signal: requestSignal,
+      ...networkInit(requestSignal, config.proxyUrl),
     })
   } catch (error) {
     if (timeoutSignal.aborted && !signal?.aborted) throw new LlmChatError('llm_timeout', 'LLM 请求超时')
