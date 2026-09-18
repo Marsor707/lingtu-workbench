@@ -93,6 +93,12 @@ jobs:
           TAURI_TARGET: ${{ matrix.target }}
         run: npx --no-install tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundle }}
 
+      # GitHub Release 会剥掉资产名里的非 ASCII 字符（中文 productName 会被整段删掉，
+      # `灵图工作台_1.0.5_x64-setup.exe` → `_1.0.5_x64-setup.exe`），
+      # 所以上传前先把安装包改成纯 ASCII 名；只改发布用文件名，不影响安装后的名称。
+      - name: 规范安装包文件名
+        run: node scripts/rename-installers.mjs
+
       - name: 上传安装包
         uses: actions/upload-artifact@v4
         with:
@@ -123,8 +129,8 @@ jobs:
         id: release
         uses: softprops/action-gh-release@v2
         with:
-          # 只发布两端安装包：.dmg 与 .exe 是更新源清单识别的平台资产；
-          # 早期 macOS Intel 构建产出的 .zip 已随该构建一并移除。
+          # 资产名由 scripts/rename-installers.mjs 规范为纯 ASCII，否则 GitHub 会剥掉中文；
+          # .dmg 与 .exe 是更新源清单识别的平台资产，早期 macOS Intel 构建产出的 .zip 已随该构建一并移除。
           files: |
             release-assets/**/*.dmg
             release-assets/**/*.exe

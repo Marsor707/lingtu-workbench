@@ -4,8 +4,9 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 // latest.json 是客户端检查更新的唯一事实来源，必须和 Release 里的安装包严格对应。
-// 安装包名由 Tauri 从中文 productName 剥离而来（例如 `_1.0.5_aarch64.dmg`），
-// 不能凭约定拼接，只能列出 Release 资产按后缀匹配。
+// 安装包名不能凭约定拼接，只能列出 Release 资产按后缀匹配：
+// v1.0.5 之前的资产名是 GitHub 剥掉中文后的 `_1.0.5_aarch64.dmg`，
+// 之后由 `scripts/rename-installers.mjs` 统一成 `lingtu-workbench_1.0.5_aarch64.dmg`。
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 const MIN_SUPPORTED_VERSION = '1.0.5' // 首个带检查更新能力的版本；低于它的客户端只能手动重装。

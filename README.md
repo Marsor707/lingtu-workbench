@@ -129,6 +129,15 @@ src-tauri/binaries/lingtu-server-x86_64-pc-windows-msvc.exe
 
 每个平台的 job 都应执行 `npm ci`、构建对应平台的 Node sidecar、放置 target triple 文件，然后运行 `tauri build`。Windows 安装包由 Windows runner 生成，不依赖本地 Windows 机器。发布前再配置 macOS 签名/公证、Windows 代码签名和构建产物 SHA-256。
 
+安装包在发布前会被 `scripts/rename-installers.mjs` 改名：Tauri 按中文 `productName` 拼名（`灵图工作台_1.0.5_x64-setup.exe`），而 GitHub 上传 Release 资产时会剔除非 ASCII 字符，把它存成 `_1.0.5_x64-setup.exe`——中文丢失、地址不可预期、用户也无法辨认。所以发布资产一律用纯 ASCII 名：
+
+```
+lingtu-workbench_1.0.5_x64-setup.exe
+lingtu-workbench_1.0.5_aarch64.dmg
+```
+
+改名只影响下载文件名；安装后的快捷方式、安装目录、卸载项仍取自 `productName`，用户无感知。
+
 ### 发版流程
 
 版本号同时存在于 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json`，不一致会让检查更新静默失灵（永远提示有新版本，或永远不提示）。
@@ -152,6 +161,7 @@ git commit -am "升级版本至 1.0.5" && git tag v1.0.5 && git push origin main
 - **不做就地更新**，因此不需要签名密钥；`latest.json` 只告知版本与安装包位置。原因与代价见 ADR 0009。
 - 更新逻辑跑在 Node 本地服务里（`GET /api/update/check`、`POST /api/update/download`），复用 sidecar 的系统代理环境；原因见 ADR 0010。
 - 下载地址由服务端重新解析，不接受前端传入的 URL；文件名只取 basename，防止写出下载目录。
+- 安装包资产名是纯 ASCII（`lingtu-workbench_<版本>_<架构>-setup.exe` / `.dmg`），原因见「GitHub Actions 跨平台打包」；客户端不对文件名做任何假设，而是直接用 `latest.json` 里的 `name`。
 
 > 本能力只能对已安装该版本的客户端生效。低版本用户（含 v1.0.4）必须手动安装一次，自动更新从这一版之后才开始工作。
 
