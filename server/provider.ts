@@ -6,6 +6,8 @@ export type GenerationRequest = {
   size?: string
   quality?: string
   signal?: AbortSignal
+  // 请求体已交给 fetch 时回调；与响应返回分开计时，才能判断长耗时发生在发送阶段还是服务端生成阶段。
+  onRequestSent?: () => void
 }
 
 export type EditImageRequest = {
@@ -17,6 +19,7 @@ export type EditImageRequest = {
   size?: string
   quality?: string
   signal?: AbortSignal
+  onRequestSent?: () => void
 }
 
 export type GenerationResult = {
@@ -46,7 +49,14 @@ function timedSignal(signal?: AbortSignal): { signal: AbortSignal; timeoutSignal
 
 function errorDetail(error: unknown): string | undefined {
   if (!(error instanceof Error)) return undefined
-  return `${error.name}: ${error.message}`.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/https?:\/\/[^\s)]+/gi, '[url]').slice(0, 500)
+  // 网络异常常在 cause 链里保留底层错误码（UND_ERR_SOCKET / ETIMEDOUT / ENOTFOUND），
+  // 只取最外层会退化成无信息量的「TypeError: fetch failed」，无法区分隧道被断开还是链路不通。
+  const chain: string[] = []
+  for (let current: unknown = error; current instanceof Error && chain.length < 5; current = current.cause) {
+    const code = (current as { code?: unknown }).code
+    chain.push(`${current.name}: ${current.message}${typeof code === 'string' ? ` (${code})` : ''}`)
+  }
+  return chain.join(' <- ').replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/https?:\/\/[^\s)]+/gi, '[url]').slice(0, 500)
 }
 
 function networkError(timeoutSignal: AbortSignal, callerSignal?: AbortSignal, message = 'Provider 网络请求失败，请检查接口地址或网络', error?: unknown): ProviderError {
@@ -147,6 +157,7 @@ export async function generateImage(request: GenerationRequest): Promise<Generat
   const requestSignal = timedSignal(request.signal)
   let response: Response
   try {
+    request.onRequestSent?.()
     response = await fetch(endpoint(request.baseUrl, 'generations'), {
       method: 'POST',
       headers: {
@@ -188,6 +199,7 @@ export async function editImage(request: EditImageRequest): Promise<GenerationRe
   const requestSignal = timedSignal(request.signal)
   let response: Response
   try {
+    request.onRequestSent?.()
     response = await fetch(endpoint(request.baseUrl, 'edits'), {
       method: 'POST',
       headers: {

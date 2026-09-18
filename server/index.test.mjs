@@ -1105,7 +1105,7 @@ test('Mock Provider 返回图片 URL 时由后端下载并落盘', async () => {
   const store = new JobStore(join(directory, 'jobs.db'))
   const app = await startServer(0, '127.0.0.1', store, {
     workspaceDir: directory,
-    generateImage: async () => ({ kind: 'url', value: `http://127.0.0.1:${resultPort}/result.png` }),
+    generateImage: async ({ onRequestSent }) => { onRequestSent?.(); return { kind: 'url', value: `http://127.0.0.1:${resultPort}/result.png` } },
   })
   const appBaseUrl = `http://127.0.0.1:${app.address().port}`
   try {
@@ -1125,6 +1125,9 @@ test('Mock Provider 返回图片 URL 时由后端下载并落盘', async () => {
     assert.match(executionLog, /"timestamp":"[^\"]+\+08:00"/)
     assert.match(executionLog, new RegExp(`"event":"job_started".*"jobId":"${created.id}"`))
     assert.match(executionLog, /"event":"provider_response_received".*"resultKind":"url"/)
+    // 请求发出与响应返回分开记录，才能判断长耗时发生在发送阶段还是服务端生成阶段。
+    assert.match(executionLog, new RegExp(`"event":"provider_request_sent".*"jobId":"${created.id}".*"prepareMs":\\d+`))
+    assert.match(executionLog, new RegExp(`"event":"provider_response_received".*"durationMs":\\d+.*"prepareMs":\\d+`))
     assert.match(executionLog, new RegExp(`"event":"provider_response_received".*"resultUrl":"http://127\\.0\\.0\\.1:${resultPort}/result\\.png"`))
     assert.match(executionLog, /"event":"provider_result_materialized".*"bytes":9/)
     assert.match(executionLog, /"event":"job_completed"/)

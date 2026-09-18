@@ -633,16 +633,25 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         providerStage = 'request'
         appendExecutionLog(workspaceDir, 'provider_request_started', { jobId: id, mode: initial.mode, itemIndex: results.length, providerHost: providerHost(provider.baseUrl), model: imageModel, size: request.size, resolution: request.resolution, quality: request.quality })
         const effectivePrompt = buildEffectivePrompt(prompt, request.layout, request.size, request.resolution)
+        // 请求体真正交给 fetch 的时刻。它与 provider_request_started 的差值反映任务准备耗时，
+        // 与 provider_response_received 的差值才是服务端真正的生成耗时；两者分开才能判断超时发生在哪一段。
+        let requestSentAt = 0
+        const onRequestSent = (): void => {
+          requestSentAt = Date.now()
+          appendExecutionLog(workspaceDir, 'provider_request_sent', { jobId: id, itemIndex: results.length, prepareMs: requestSentAt - requestStartedAt })
+        }
         const result: GenerationResult = initial.mode === 'edit'
-          ? await imageEditor({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: imageModel, prompt: effectivePrompt, sourceImage: request.sourceImage!, size: request.size, quality: request.quality, signal: runtime.controller.signal })
-          : await imageGenerator({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: imageModel, prompt: effectivePrompt, size: request.size, quality: request.quality, signal: runtime.controller.signal })
+          ? await imageEditor({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: imageModel, prompt: effectivePrompt, sourceImage: request.sourceImage!, size: request.size, quality: request.quality, signal: runtime.controller.signal, onRequestSent })
+          : await imageGenerator({ baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: imageModel, prompt: effectivePrompt, size: request.size, quality: request.quality, signal: runtime.controller.signal, onRequestSent })
         appendExecutionLog(workspaceDir, 'provider_response_received', {
           jobId: id,
           itemIndex: results.length,
           resultKind: result.kind,
           // URL 结果需要二次下载；记录实际地址便于用户定位 CDN、代理或有效期问题。该地址可能带签名参数，仅用于本地诊断。
           ...(result.kind === 'url' ? { resultUrl: result.value } : {}),
-          durationMs: Date.now() - requestStartedAt,
+          // fetch 在本地校验阶段就失败时不会触发回调，此时退回 started 计时，避免出现无意义的巨大耗时。
+          durationMs: Date.now() - (requestSentAt || requestStartedAt),
+          ...(requestSentAt ? { prepareMs: requestSentAt - requestStartedAt } : {}),
         })
         // Provider 可能返回 base64，也可能返回短时效图片 URL；URL 必须在任务执行期间下载后再落盘。
         providerStage = 'materialize'

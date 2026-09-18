@@ -79,6 +79,35 @@ test('Provider 主请求网络异常时返回可诊断错误码', async () => {
   )
 })
 
+test('Provider 网络异常时把 cause 链里的底层错误码带进 detail', async () => {
+  const originalFetch = globalThis.fetch
+  const socketClosed = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' })
+  globalThis.fetch = async () => { throw new TypeError('fetch failed', { cause: socketClosed }) }
+  try {
+    // 「隧道被对端断开」与「链路超时」外层都是 fetch failed，只有 cause 链能区分两者。
+    await assert.rejects(
+      generateImage({ baseUrl: 'https://provider.example', apiKey: 'test-secret', prompt: 'cause 链测试' }),
+      (error) => error instanceof ProviderError
+        && error.code === 'provider_network_error'
+        && error.detail?.includes('TypeError: fetch failed')
+        && error.detail?.includes('UND_ERR_SOCKET'),
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('Provider 请求体交给 fetch 前回调一次，本地校验失败时不回调', async () => {
+  let sent = 0
+  await generateImage({ baseUrl: `http://127.0.0.1:${port}`, apiKey: 'test-secret', prompt: '回调测试', onRequestSent: () => { sent += 1 } })
+  assert.equal(sent, 1)
+  await assert.rejects(
+    generateImage({ baseUrl: `http://127.0.0.1:${port}`, apiKey: '', prompt: '回调测试', onRequestSent: () => { sent += 1 } }),
+    (error) => error instanceof ProviderError && error.code === 'provider_not_configured',
+  )
+  assert.equal(sent, 1)
+})
+
 test('Provider 返回图片 URL 时下载为可落盘的图片字节', async () => {
   const bytes = await materializeImageResult({ kind: 'url', value: `http://127.0.0.1:${imageResultPort}/result.png` })
   assert.deepEqual(Buffer.from(bytes), Buffer.from('fake-image'))
