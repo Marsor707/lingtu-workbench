@@ -66,6 +66,49 @@ test('写入没有实际变化时返回原文，供 setVersion 判定是否需�
   assert.equal(target.write('[[package]]\nname = "lingtu-workbench"\nversion = "1.0.6"\n', '1.0.6'), '[[package]]\nname = "lingtu-workbench"\nversion = "1.0.6"\n')
 })
 
+// package-lock.json 的 version 有两处根节点，其余都是依赖自身的版本；
+// 多改一处会让 npm ci 装出与锁定不一致的依赖，所以同样单独验证读写。
+const PACKAGE_LOCK = `{
+  "name": "lingtu-local-workbench",
+  "version": "1.0.4",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "lingtu-local-workbench",
+      "version": "1.0.4",
+      "dependencies": {
+        "@tauri-apps/api": "2.11.1"
+      }
+    },
+    "node_modules/@tauri-apps/api": {
+      "version": "2.11.1"
+    }
+  }
+}
+`
+
+function packageLockTarget() {
+  const target = versionTargets.find((item) => item.path.endsWith('package-lock.json'))
+  assert.ok(target, 'version.mjs 必须包含 package-lock.json')
+  return target
+}
+
+test('package-lock.json 同步两处根节点版本，依赖版本不受影响', () => {
+  const next = packageLockTarget().write(PACKAGE_LOCK, '1.0.6')
+  assert.equal((next.match(/"version": "1\.0\.6"/g) ?? []).length, 2)
+  assert.ok(next.includes('"node_modules/@tauri-apps/api": {\n      "version": "2.11.1"'))
+  assert.equal(packageLockTarget().read(next), '1.0.6')
+})
+
+test('package-lock.json 同步的是真实文件，且两处根节点都跟清单一致', () => {
+  const target = packageLockTarget()
+  const text = readFileSync(join(import.meta.dirname, '..', 'package-lock.json'), 'utf8')
+  const manifest = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'package.json'), 'utf8'))
+  assert.equal(target.read(text), manifest.version)
+  // 这正是本次要修的漏改：顶层与 packages[""] 一度停在 1.0.7，而 package.json 已是 1.0.9。
+  assert.equal(JSON.parse(text).packages[''].version, manifest.version)
+})
+
 // setVersion 会遍历所有 target 并写盘；用临时目录验证端到端，避免污染真实清单。
 test('setVersion 能把 Cargo.lock 一起同步', async () => {
   const { setVersion, versionTargets: targets } = await import('../scripts/version.mjs')

@@ -25,6 +25,16 @@ export const versionTargets = [
     write: (text, version) => text.replace(/^  "version": "[^"]*",/m, `  "version": "${version}",`),
   },
   {
+    // package-lock.json 的 version 出现两处根节点（顶层与 packages[""]）加每个依赖条目。
+    // npm ci 不校验它们，但根节点漂移同样会让同一次提交里的清单版本不一致；
+    // 只改这两处，依赖自身的版本必须原样保留。
+    path: join(projectRoot, 'package-lock.json'),
+    read: (text) => { const version = JSON.parse(text).version; if (typeof version !== 'string') throw new Error('package-lock.json 缺少 version'); return version },
+    write: (text, version) => text
+      .replace(/^(  "version"\s*:\s*)"[^"]*"/m, `$1"${version}"`)
+      .replace(/("packages"\s*:\s*\{\s*\n\s*""\s*:\s*\{\s*\n\s*"name"\s*:\s*"[^"]*"\s*,\s*\n\s*"version"\s*:\s*)"[^"]*"/, `$1"${version}"`),
+  },
+  {
     // Cargo.lock 里 version 出现多处（依赖自身也各有版本），必须锚定 lingtu-workbench 包块，
     // 否则会把依赖的版本号改掉，导致 Cargo 重新解析锁定版本。
     path: join(projectRoot, 'src-tauri', 'Cargo.lock'),
