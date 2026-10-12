@@ -19,7 +19,7 @@
     "release:manifest": "node scripts/generate-latest-json.mjs"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/api": "2.11.1",
     "@vitejs/plugin-react": "latest",
     "jpeg-js": "^0.4.4",
     "lucide-react": "latest",

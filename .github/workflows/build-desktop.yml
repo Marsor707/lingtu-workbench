@@ -83,15 +83,13 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
-      - name: 安装 Tauri CLI
-        run: npm install --no-save --no-package-lock '@tauri-apps/cli@^2'
-
-      # build:desktop 会按 TAURI_TARGET 生成对应架构的 Node sidecar；
-      # tauri build 随后执行 tauri.conf.json 中的 beforeBuildCommand。
+      # 用 npx 现取 CLI，而不是往项目里装：`npm install` 会忽略 package-lock 重新解析整棵树，
+      # 曾把 @tauri-apps/api 从 2.11.1 顶到 2.12.3，与 Rust 侧 tauri 2.11.5 不同 minor，
+      # 触发 Tauri 的版本不匹配检查而构建失败；npx 把 CLI 装到缓存目录，不碰项目依赖。
       - name: 构建 Tauri 安装包
         env:
           TAURI_TARGET: ${{ matrix.target }}
-        run: npx --no-install tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundle }}
+        run: npx --yes '@tauri-apps/cli@^2' build --target ${{ matrix.target }} --bundles ${{ matrix.bundle }}
 
       # GitHub Release 会剥掉资产名里的非 ASCII 字符（中文 productName 会被整段删掉，
       # `灵图工作台_1.0.5_x64-setup.exe` → `_1.0.5_x64-setup.exe`），
