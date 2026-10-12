@@ -18,7 +18,7 @@ import { builtinPrompts } from './prompts.js'
 declare const process: { env: Record<string, string | undefined>; argv: string[]; exitCode?: number; pid: number; kill(pid: number, signal?: number | string): boolean; exit(code?: number): void; on(event: string, listener: (...args: any[]) => void): void; stdin?: { on(event: string, listener: (...args: any[]) => void): void; resume(): void } }
 type HttpRequest = { method?: string; url?: string; headers: Record<string, string | string[] | undefined>; on(event: string, listener: (...args: any[]) => void): void }
 type HttpResponse = { statusCode: number; setHeader(name: string, value: string): void; writeHead(statusCode: number, headers?: Record<string, string>): void; write(chunk: string | Uint8Array): void; end(chunk?: string | Uint8Array): void; on?(event: string, listener: (...args: any[]) => void): void }
-type NativeServer = { listen(port: number, host: string, callback: () => void): void; close(callback: (error?: Error) => void): void; address(): { port: number } | string | null; once?(event: string, listener: (...args: any[]) => void): void }
+type NativeServer = { listen(port: number, host: string, callback?: () => void): void; close(callback: (error?: Error) => void): void; address(): { port: number } | string | null; once?(event: string, listener: (...args: any[]) => void): void; off?(event: string, listener: (...args: any[]) => void): void }
 
 export type JobMode = 'generate' | 'edit' | 'text_to_image' | 'one_to_many'
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
@@ -880,7 +880,9 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
   }
   return createServer(async (req: HttpRequest, res: HttpResponse) => {
     setCors(res); if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }; const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
-    if (req.method === 'GET' && path === '/health') { json(res, 200, { status: 'ok', service: 'lingtu-workbench' }); return }
+    // 启动器用端口、版本、进程号识别「本地服务是否就绪」以及 8765 上跑的是不是自己人；
+    // runningJobs 供托盘判断「有任务执行中」时是否禁用重启。
+    if (req.method === 'GET' && path === '/health') { json(res, 200, { status: 'ok', service: 'lingtu-workbench', version: currentVersion, pid: process.pid, runningJobs: store.runningCount() }); return }
     if (req.method === 'GET' && path === '/api/stats') { json(res, 200, store.stats(workspaceDir)); return }
     if (req.method === 'GET' && path === '/api/settings') { json(res, 200, { maxConcurrency, pixelUpscale, imageNamingEnabled, systemProxy, detectedProxy }); return }
     if (req.method === 'PUT' && path === '/api/settings') {
@@ -1231,5 +1233,27 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     errorResponse(res, 404, 'not_found', '接口不存在')
   }) as unknown as NativeServer
 }
-export function startServer(port = portFromEnvironment(), host = DEFAULT_HOST, store = new JobStore(), options: AppOptions = {}): Promise<NativeServer> { const server = createApp(store, options); return new Promise((resolveServer, reject) => { server.listen(port, host, () => resolveServer(server)); server.once?.('error', reject) }) }
+/** 只负责一次 listen 的成败；失败的监听回调必须摘掉，否则回退成功后旧回调会一起触发。 */
+function listenServer(server: NativeServer, port: number, host: string): Promise<void> {
+  return new Promise((resolveListen, reject) => {
+    const onListening = (): void => { cleanup(); resolveListen() }
+    const onError = (error: Error): void => { cleanup(); reject(error) }
+    const cleanup = (): void => { server.off?.('listening', onListening); server.off?.('error', onError) }
+    server.once?.('listening', onListening)
+    server.once?.('error', onError)
+    server.listen(port, host)
+  })
+}
+
+/** 期望端口被占用时回退到系统分配端口重试一次，让固定端口冲突不再等于本地服务整体不可用。 */
+export async function startServer(port = portFromEnvironment(), host = DEFAULT_HOST, store = new JobStore(), options: AppOptions = {}): Promise<NativeServer> {
+  const server = createApp(store, options)
+  try {
+    await listenServer(server, port, host)
+  } catch (error) {
+    if (port === 0 || (error as { code?: string }).code !== 'EADDRINUSE') throw error
+    await listenServer(server, 0, host)
+  }
+  return server
+}
 if (isSea() || (process.argv[1] && basename(process.argv[1]) === 'index.js')) { const dbPath = process.env.LINGTU_DB_PATH ?? 'workspace/lingtu.db'; const parentPid = Number(process.env.LINGTU_PARENT_PID); watchParentProcess(Number.isInteger(parentPid) && parentPid > 0 ? parentPid : undefined); startServer(portFromEnvironment(), DEFAULT_HOST, new JobStore(dbPath)).then((server) => { const address = server.address(); const port = typeof address === 'object' && address ? address.port : portFromEnvironment(); console.log(JSON.stringify({ ready: true, port, host: DEFAULT_HOST })) }).catch((error) => { console.error(error); process.exitCode = 1 }) }

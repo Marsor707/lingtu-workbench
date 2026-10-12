@@ -30,10 +30,34 @@ async function request(path, options = {}) {
   return { response, body }
 }
 
-test('健康检查保持既有契约', async () => {
+test('健康检查暴露就绪判定所需的事实', async () => {
   const { response, body } = await request('/health')
   assert.equal(response.status, 200)
-  assert.deepEqual(body, { status: 'ok', service: 'lingtu-workbench' })
+  assert.equal(body.status, 'ok')
+  assert.equal(body.service, 'lingtu-workbench')
+  assert.equal(typeof body.pid, 'number')
+  assert.equal(typeof body.runningJobs, 'number')
+})
+
+test('期望端口被占用时回退到系统分配端口', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-port-fallback-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const blocker = createHttpServer()
+  await new Promise((resolve) => blocker.listen(0, '127.0.0.1', resolve))
+  const occupiedPort = blocker.address().port
+  let app
+  try {
+    app = await startServer(occupiedPort, '127.0.0.1', store)
+    assert.notEqual(app.address().port, occupiedPort)
+    const health = await fetch(`http://127.0.0.1:${app.address().port}/health`)
+    assert.equal(health.status, 200)
+    assert.equal((await health.json()).status, 'ok')
+  } finally {
+    if (app) await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
+    await new Promise((resolve) => blocker.close(resolve))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
 })
 
 test('提示词接口返回安装时初始化的 80 条内置数据', async () => {
