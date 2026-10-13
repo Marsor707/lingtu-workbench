@@ -80,6 +80,34 @@ test('Provider 主请求网络异常时返回可诊断错误码', async () => {
   )
 })
 
+test('Provider 401/403 给出账号级排查文案，其他状态码保持原文案', async () => {
+  // 状态码从 baseUrl 路径的第一段读取，避免为每个用例各起一个服务。
+  const denied = createServer((req, res) => {
+    res.statusCode = Number(new URL(req.url, 'http://local').pathname.split('/')[1])
+    res.end('{"error":{"message":"insufficient quota"}}')
+  })
+  await new Promise((resolve) => denied.listen(0, '127.0.0.1', resolve))
+  const baseUrl = `http://127.0.0.1:${denied.address().port}`
+  const expected = {
+    401: 'Provider 拒绝请求（HTTP 401），请检查供应商账户余额或模型权限',
+    403: 'Provider 拒绝请求（HTTP 403），请检查供应商账户余额或模型权限',
+    500: 'Provider 请求失败（HTTP 500）',
+  }
+  try {
+    for (const [status, message] of Object.entries(expected)) {
+      await assert.rejects(
+        generateImage({ baseUrl: `${baseUrl}/${status}`, apiKey: 'test-secret', prompt: '拒绝文案测试' }),
+        (error) => error instanceof ProviderError
+          && error.code === 'provider_http_error'
+          && error.status === Number(status)
+          && error.message === message,
+      )
+    }
+  } finally {
+    await new Promise((resolve, reject) => denied.close((error) => error ? reject(error) : resolve()))
+  }
+})
+
 test('Provider 网络异常时把 cause 链里的底层错误码带进 detail', async () => {
   const originalFetch = globalThis.fetch
   const socketClosed = Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' })

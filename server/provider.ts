@@ -87,7 +87,11 @@ function endpoint(baseUrl: string, resource: 'generations' | 'edits'): string {
 async function parseImageResponse(response: Response, timeoutSignal?: AbortSignal, callerSignal?: AbortSignal): Promise<GenerationResult> {
   if (!response.ok) {
     // 错误信息不拼接响应原文，避免 Provider 回显凭据或用户提示词。
-    throw new ProviderError('provider_http_error', `Provider 请求失败（HTTP ${response.status}）`, response.status)
+    // 401/403 是账号级拒绝（密钥无效、余额不足或模型未授权），换参数或重试都不会变，文案直接指向可操作项。
+    const message = response.status === 401 || response.status === 403
+      ? `Provider 拒绝请求（HTTP ${response.status}），请检查供应商账户余额或模型权限`
+      : `Provider 请求失败（HTTP ${response.status}）`
+    throw new ProviderError('provider_http_error', message, response.status)
   }
 
   let body: unknown
