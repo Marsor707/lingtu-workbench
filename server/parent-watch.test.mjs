@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -123,5 +123,45 @@ test('未注入 LINGTU_PARENT_PID 时独立运行的服务不会自杀', async (
     assert.equal(sidecar.child.exitCode, null, '独立运行的服务不能被父进程监听误杀')
   } finally {
     cleanup(sidecar)
+  }
+})
+
+test('启动事实写进执行日志，带版本与真实端口', async () => {
+  // 用户反馈「一直启动中」时只能拿到 workspace/logs/execution.log；
+  // 如果日志里没有启动记录，就无法区分「没起来」和「起来了但页面打不开」。
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-startup-log-'))
+  const child = spawn(process.execPath, [serverEntry], {
+    env: {
+      ...process.env,
+      LINGTU_PORT: '0',
+      LINGTU_DB_PATH: join(directory, 'lingtu.db'),
+      LINGTU_WORKSPACE: directory,
+      LINGTU_APP_VERSION: '9.9.9',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  const ready = new Promise((resolve, reject) => {
+    let buffer = ''
+    const timer = setTimeout(() => reject(new Error(`sidecar 未在预期时间内就绪：${buffer}`)), 5000)
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk
+      const matched = buffer.match(/"ready":true,"port":(\d+)/)
+      if (matched) { clearTimeout(timer); resolve(Number(matched[1])) }
+    })
+    child.once('exit', () => { clearTimeout(timer); reject(new Error(`sidecar 在就绪前退出：${buffer}`)) })
+  })
+
+  try {
+    const port = await ready
+    const logPath = join(directory, 'logs', 'execution.log')
+    const lines = readFileSync(logPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+    const started = lines.find((line) => line.event === 'service_started')
+    assert.ok(started, '执行日志里必须有 service_started 记录')
+    assert.equal(started.version, '9.9.9')
+    assert.equal(started.port, port)
+    assert.equal(started.pid, child.pid)
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    rmSync(directory, { recursive: true, force: true })
   }
 })

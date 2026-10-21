@@ -14,6 +14,7 @@ use tauri::{
   tray::TrayIconBuilder,
   Manager,
 };
+use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_shell::{
   process::{CommandChild, CommandEvent},
   ShellExt,
@@ -34,6 +35,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const PORT_FREE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 就绪后刷新执行中任务数的间隔，它决定「重启本地服务」是否可用。
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// 日志与托盘文案里附带的错误原文上限：一行 stdout 可能是整段堆栈，原样照抄会淹没关键信息。
+const BRIEF_CHARS: usize = 240;
+/// 用户数据目录名。
+///
+/// 刻意**不**等于 bundle identifier：NSIS 卸载器在用户勾选「删除应用数据」时会
+/// `RmDir /r "$APPDATA\<identifier>"` 与 `$LOCALAPPDATA\<identifier>`，数据库和图片
+/// 原先就在这两个目录里，于是「先卸载再装」（重装选新文件夹必经此页）等于清空提示词库。
+const DATA_ROOT_NAME: &str = "lingtu-workbench-data";
 
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
 #[derive(Debug, PartialEq)]
@@ -163,33 +172,44 @@ struct ServiceStatus {
   started_at: Option<Instant>,
   /// 旧版本实例的 (pid, version)，用于接管前复核身份。
   foreign: Option<(u32, String)>,
+  /// 未就绪的具体原因。写进托盘菜单的状态项，让用户不必翻日志也能说清现象。
+  detail: Option<String>,
 }
 
 impl ServiceStatus {
   fn starting() -> Self {
-    Self { phase: ServicePhase::Starting, port: None, running_jobs: 0, started_at: Some(Instant::now()), foreign: None }
+    Self { phase: ServicePhase::Starting, port: None, running_jobs: 0, started_at: Some(Instant::now()), foreign: None, detail: None }
   }
 
   fn ready(port: u16, running_jobs: u32) -> Self {
-    Self { phase: ServicePhase::Ready, port: Some(port), running_jobs, started_at: None, foreign: None }
+    Self { phase: ServicePhase::Ready, port: Some(port), running_jobs, started_at: None, foreign: None, detail: None }
   }
 
-  fn not_ready() -> Self {
-    Self { phase: ServicePhase::NotReady, port: None, running_jobs: 0, started_at: None, foreign: None }
+  fn not_ready(detail: impl Into<String>) -> Self {
+    Self { phase: ServicePhase::NotReady, port: None, running_jobs: 0, started_at: None, foreign: None, detail: Some(detail.into()) }
   }
 
   fn restarting() -> Self {
-    Self { phase: ServicePhase::Restarting, port: None, running_jobs: 0, started_at: None, foreign: None }
+    Self { phase: ServicePhase::Restarting, port: None, running_jobs: 0, started_at: None, foreign: None, detail: None }
   }
 
   fn foreign(pid: u32, version: String) -> Self {
-    Self { phase: ServicePhase::ForeignVersion, port: Some(DEFAULT_PORT), running_jobs: 0, started_at: None, foreign: Some((pid, version)) }
+    Self { phase: ServicePhase::ForeignVersion, port: Some(DEFAULT_PORT), running_jobs: 0, started_at: None, foreign: Some((pid, version)), detail: None }
+  }
+
+  fn detail_text(&self) -> String {
+    self.detail.clone().unwrap_or_else(|| "原因未知".to_owned())
   }
 }
 
 /// 托盘文案。抽成纯函数，让状态与文案的对应关系由单测锁住，而不是每次手工点。
+///
+/// `status` 是菜单里那个禁用状态项的文案：Windows 的托盘 tooltip 只在悬停时出现、
+/// 且由 shell 缓存，用户反馈「一直显示正在启动本地服务」时无法判断是状态真的没变化
+/// 还是 tooltip 没刷新；菜单项每次右键都重新读取，是可信的那一面。
 struct MenuView {
   tooltip: String,
+  status: String,
   open_label: &'static str,
   open_enabled: bool,
   restart_label: &'static str,
@@ -197,16 +217,50 @@ struct MenuView {
 }
 
 fn menu_view(status: &ServiceStatus) -> MenuView {
+  let make = |tooltip: String, open_label: &'static str, open_enabled: bool, restart_label: &'static str, restart_enabled: bool| MenuView {
+    status: status_text(status),
+    tooltip,
+    open_label,
+    open_enabled,
+    restart_label,
+    restart_enabled,
+  };
+
   match status.phase {
-    ServicePhase::Starting => MenuView { tooltip: "灵图工作台 · 正在启动本地服务".to_owned(), open_label: "打开灵图工作台", open_enabled: false, restart_label: "重启本地服务", restart_enabled: false },
-    ServicePhase::Restarting => MenuView { tooltip: "灵图工作台 · 正在重启本地服务".to_owned(), open_label: "打开灵图工作台", open_enabled: false, restart_label: "重启本地服务", restart_enabled: false },
+    ServicePhase::Starting => make("灵图工作台 · 正在启动本地服务".to_owned(), "打开灵图工作台", false, "重启本地服务", false),
+    ServicePhase::Restarting => make("灵图工作台 · 正在重启本地服务".to_owned(), "打开灵图工作台", false, "重启本地服务", false),
     // 有任务执行中时禁止重启：被中断的 running 任务不会被服务端恢复，只会永久停在执行中。
-    ServicePhase::Ready if status.running_jobs > 0 => MenuView { tooltip: format!("灵图工作台 · 有 {} 个任务执行中", status.running_jobs), open_label: "打开灵图工作台", open_enabled: true, restart_label: "重启本地服务（有任务执行中）", restart_enabled: false },
-    ServicePhase::Ready => MenuView { tooltip: "灵图工作台".to_owned(), open_label: "打开灵图工作台", open_enabled: true, restart_label: "重启本地服务", restart_enabled: true },
+    ServicePhase::Ready if status.running_jobs > 0 => make(format!("灵图工作台 · 有 {} 个任务执行中", status.running_jobs), "打开灵图工作台", true, "重启本地服务（有任务执行中）", false),
+    ServicePhase::Ready => make("灵图工作台".to_owned(), "打开灵图工作台", true, "重启本地服务", true),
     // 未就绪时主项改为「重启并打开」，避免把用户指向一个拒绝连接的页面。
-    ServicePhase::NotReady => MenuView { tooltip: "灵图工作台 · 本地服务未就绪".to_owned(), open_label: "重启并打开灵图工作台", open_enabled: true, restart_label: "重启本地服务", restart_enabled: true },
-    ServicePhase::ForeignVersion => MenuView { tooltip: "灵图工作台 · 检测到旧版本服务在运行".to_owned(), open_label: "打开灵图工作台", open_enabled: true, restart_label: "重启本地服务", restart_enabled: true },
+    ServicePhase::NotReady => make(format!("灵图工作台 · 本地服务未就绪（{}）", status.detail_text()), "重启并打开灵图工作台", true, "重启本地服务", true),
+    ServicePhase::ForeignVersion => make("灵图工作台 · 检测到旧版本服务在运行".to_owned(), "打开灵图工作台", true, "重启本地服务", true),
   }
+}
+
+/// 菜单里的状态项文案。就绪时带上真实端口，因为回退端口后手输 8765 不再可靠。
+fn status_text(status: &ServiceStatus) -> String {
+  match status.phase {
+    ServicePhase::Starting => "状态：正在启动本地服务".to_owned(),
+    ServicePhase::Restarting => "状态：正在重启本地服务".to_owned(),
+    ServicePhase::Ready if status.running_jobs > 0 => format!("状态：运行中 · {} 个任务执行中", status.running_jobs),
+    ServicePhase::Ready => format!("状态：运行中 · {}", server_url(status.port.unwrap_or(DEFAULT_PORT))),
+    ServicePhase::NotReady => format!("状态：本地服务未就绪 · {}", status.detail_text()),
+    ServicePhase::ForeignVersion => match &status.foreign {
+      Some((_, version)) => format!("状态：检测到旧版本服务在运行（v{version}）"),
+      None => "状态：检测到旧版本服务在运行".to_owned(),
+    },
+  }
+}
+
+/// 截断一段可能很长的一行输出（堆栈、JSON），供日志与托盘文案使用。
+fn brief(text: &str, max_chars: usize) -> String {
+  let trimmed = text.trim();
+  let mut brief = trimmed.chars().take(max_chars).collect::<String>();
+  if trimmed.chars().count() > max_chars {
+    brief.push('…');
+  }
+  brief
 }
 
 /// sidecar 就绪时会在 stdout 打一行 ready JSON。端口以它为准，启动器不再硬编码。
@@ -338,10 +392,112 @@ fn kill_process_by_pid(pid: u32) -> Result<(), String> {
   }
 }
 
+/// 递归复制目录。迁移只能复制不能移动：旧目录保留，出错时两边都还在。
+fn copy_directory(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+  std::fs::create_dir_all(to)?;
+  for entry in std::fs::read_dir(from)? {
+    let entry = entry?;
+    let destination = to.join(entry.file_name());
+    if entry.file_type()?.is_dir() {
+      copy_directory(&entry.path(), &destination)?;
+    } else if !destination.exists() {
+      std::fs::copy(entry.path(), &destination)?;
+    }
+  }
+  Ok(())
+}
+
+/// 把旧位置的数据搬到新的用户数据目录：数据库三件套 + 两处可能的 workspace。
+///
+/// 两处 workspace 分别是：旧版 appdata 下的 workspace，和安装目录里的 workspace
+/// （历史上 workspace 是相对当前工作目录解析的，跟着安装目录跑）。
+fn migrate_legacy_data(
+  legacy_app_data: &std::path::Path,
+  install_workspace: Option<&std::path::Path>,
+  target: &std::path::Path,
+) -> Result<(), String> {
+  std::fs::create_dir_all(target).map_err(|error| format!("创建数据目录失败: {error}"))?;
+  // 数据库的 -wal / -shm 必须一起搬，否则 WAL 里的已提交事务会丢。
+  for name in ["lingtu.db", "lingtu.db-wal", "lingtu.db-shm"] {
+    let source = legacy_app_data.join(name);
+    let destination = target.join(name);
+    if source.exists() && !destination.exists() {
+      std::fs::copy(&source, &destination).map_err(|error| format!("复制 {name} 失败: {error}"))?;
+      log::info!("已迁移 {}", source.display());
+    }
+  }
+  let target_workspace = target.join("workspace");
+  let mut sources = vec![legacy_app_data.join("workspace")];
+  if let Some(install_workspace) = install_workspace {
+    sources.push(install_workspace.to_path_buf());
+  }
+  for source in sources {
+    if source.is_dir() && !target_workspace.exists() {
+      copy_directory(&source, &target_workspace).map_err(|error| format!("复制 {} 失败: {error}", source.display()))?;
+      log::info!("已迁移 {}", source.display());
+    }
+  }
+  Ok(())
+}
+
+/// 用户数据根目录（数据库 + 生成的图片）。
+///
+/// 选择 `$LOCALAPPDATA\lingtu-workbench-data` 而不是 `%APPDATA%\<identifier>`：
+/// 后者正是 NSIS 卸载器「删除应用数据」要递归删除的目录，而重装选新文件夹必经该选项。
+///
+/// `migrate = false` 时只算路径不搬数据：旧版实例还在跑时复制数据库会拿到不一致的快照。
+fn resolve_data_root(paths: &tauri::path::PathResolver<tauri::Wry>, migrate: bool) -> tauri::Result<std::path::PathBuf> {
+  let legacy = paths.app_data_dir()?;
+  let target = paths.local_data_dir()?.join(DATA_ROOT_NAME);
+  if !migrate {
+    return Ok(target);
+  }
+  let install_workspace = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|directory| directory.join("workspace")));
+  let legacy_workspace = install_workspace.as_ref().map(|path| path.is_dir()).unwrap_or(false);
+  // 已经有新数据库就什么都不做；否则只要旧位置有数据就迁移一次。
+  let needs_migration = !target.join("lingtu.db").exists() && (legacy.join("lingtu.db").exists() || legacy_workspace);
+  if !needs_migration {
+    return Ok(target);
+  }
+  match migrate_legacy_data(&legacy, install_workspace.as_deref(), &target) {
+    Ok(()) => Ok(target),
+    // 迁移失败宁可继续用旧目录：换目录失败绝不能表现成「提示词全没了」。
+    Err(error) => {
+      log::error!("迁移用户数据失败，继续使用旧目录（{}）: {error}", legacy.display());
+      Ok(legacy)
+    }
+  }
+}
+
+/// 解析数据目录与 sidecar 启动参数。
+/// `migrate = true` 用于「确定要自己拉起服务」的时刻，重启/接管旧实例后同样适用。
+fn resolve_sidecar_paths(app: &tauri::AppHandle, migrate: bool) -> Result<(std::path::PathBuf, SidecarConfig), String> {
+  let data_root = resolve_data_root(app.path(), migrate).map_err(|error| format!("解析数据目录失败: {error}"))?;
+  let workspace_path = data_root.join("workspace");
+  if let Err(error) = std::fs::create_dir_all(&workspace_path) {
+    log::error!("创建数据目录失败: {error}");
+  }
+  // 发布包把前端 dist 放入 resources/dist，sidecar 通过环境变量读取该目录。
+  let static_directory = app.path().resource_dir().map_err(|error| format!("解析资源目录失败: {error}"))?.join("dist");
+  #[cfg(any(target_os = "windows", target_os = "macos"))]
+  let system_proxy = detected_proxy_url().unwrap_or_default();
+  #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+  let system_proxy = String::new();
+  let config = SidecarConfig {
+    database_path: data_root.join("lingtu.db").to_string_lossy().to_string(),
+    workspace_path: workspace_path.to_string_lossy().to_string(),
+    static_directory: static_directory.to_string_lossy().to_string(),
+    app_version: env!("CARGO_PKG_VERSION").to_owned(),
+    system_proxy,
+  };
+  Ok((data_root, config))
+}
+
 /// sidecar 的启动参数。重启要复用同一份，所以从 setup 里提出来存进状态。
 #[derive(Clone)]
 struct SidecarConfig {
   database_path: String,
+  workspace_path: String,
   static_directory: String,
   app_version: String,
   system_proxy: String,
@@ -353,9 +509,11 @@ struct LauncherState {
   /// 下次就绪时是否自动打开浏览器：首次启动与「重启并打开」为真。
   open_on_ready: AtomicBool,
   allow_exit: AtomicBool,
+  status_item: MenuItem<tauri::Wry>,
   open_item: MenuItem<tauri::Wry>,
   restart_item: MenuItem<tauri::Wry>,
-  config: SidecarConfig,
+  /// 用户数据目录（数据库 + 图片），供「打开数据目录」使用。
+  data_root: std::path::PathBuf,
 }
 
 fn current_status(app: &tauri::AppHandle) -> Option<ServiceStatus> {
@@ -388,12 +546,15 @@ fn apply_status(app: &tauri::AppHandle, status: ServiceStatus) {
   }
 
   let view = menu_view(&status);
+  // 先落盘再动托盘：托盘与菜单更新都是同步的跨线程 Shell/menu 调用，卡住时这条日志能定位在哪个阶段断了。
+  log::info!("托盘状态: {}", view.status);
   if let Some(tray) = app.tray_by_id(TRAY_ID) {
     if let Err(error) = tray.set_tooltip(Some(view.tooltip.as_str())) {
       log::error!("更新托盘提示失败: {error}");
     }
   }
   for result in [
+    state.status_item.set_text(view.status.as_str()),
     state.open_item.set_text(view.open_label),
     state.open_item.set_enabled(view.open_enabled),
     state.restart_item.set_text(view.restart_label),
@@ -403,6 +564,7 @@ fn apply_status(app: &tauri::AppHandle, status: ServiceStatus) {
       log::error!("更新托盘菜单失败: {error}");
     }
   }
+  log::info!("托盘已更新");
 
   {
     let locked = state.status.lock();
@@ -415,11 +577,18 @@ fn apply_status(app: &tauri::AppHandle, status: ServiceStatus) {
 /// 拉起 sidecar，并把它的 stdout 当作就绪通道。端口由 sidecar 自己决定：
 /// 默认 8765，被占用时回退到系统分配端口，再通过 ready JSON 报回真实端口。
 fn spawn_sidecar(app: &tauri::AppHandle, config: &SidecarConfig, open_when_ready: bool) -> Result<(), String> {
+  log::info!(
+    "拉起本地服务: 数据库={} 工作区={} 静态目录={} 版本={}",
+    config.database_path, config.workspace_path, config.static_directory, config.app_version
+  );
   let (mut events, child) = app
     .shell()
     .sidecar("lingtu-server")
-    .map_err(|error| error.to_string())?
+    .map_err(|error| format!("找不到本地服务程序: {error}"))?
     .env("LINGTU_DB_PATH", config.database_path.clone())
+    // workspace（生成的图片、执行日志）也放进用户数据目录：它过去相对当前工作目录解析，
+    // 跟着安装目录跑，换安装文件夹后历史任务里的图片就全变死链接了。
+    .env("LINGTU_WORKSPACE", config.workspace_path.clone())
     .env("LINGTU_STATIC_DIR", config.static_directory.clone())
     // 启动器被强杀（安装器覆盖安装、任务管理器结束进程）时不会走 RunEvent::Exit，
     // sidecar 会变成孤儿并锁住安装目录里的 lingtu-server.exe。把自身 PID 交给 sidecar，
@@ -431,7 +600,7 @@ fn spawn_sidecar(app: &tauri::AppHandle, config: &SidecarConfig, open_when_ready
     // 这里只把检测到的系统代理作为该设置的默认值，用户可在界面上修改或清空。
     .env("LINGTU_SYSTEM_PROXY", config.system_proxy.clone())
     .spawn()
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| format!("启动本地服务程序失败: {error}"))?;
 
   if let Some(state) = app.try_state::<LauncherState>() {
     if let Ok(mut slot) = state.child.lock() {
@@ -448,8 +617,9 @@ fn spawn_sidecar(app: &tauri::AppHandle, config: &SidecarConfig, open_when_ready
         CommandEvent::Stdout(line) => {
           let text = String::from_utf8_lossy(&line).trim().to_owned();
           if !text.is_empty() {
-            if let Some(port) = parse_ready_line(&text) {
-              mark_ready(&app_handle, port);
+            match parse_ready_line(&text) {
+              Some(port) => mark_ready(&app_handle, port),
+              None => log::info!("本地服务 stdout: {}", brief(&text, BRIEF_CHARS)),
             }
             let _ = tauri::Emitter::emit(&app_handle, "sidecar-output", text);
           }
@@ -457,10 +627,15 @@ fn spawn_sidecar(app: &tauri::AppHandle, config: &SidecarConfig, open_when_ready
         CommandEvent::Stderr(line) => {
           let text = String::from_utf8_lossy(&line).trim().to_owned();
           if !text.is_empty() {
+            // release 包没有可见控制台，stderr 是启动失败唯一的一手证据，必须落盘。
+            log::error!("本地服务 stderr: {}", brief(&text, BRIEF_CHARS));
             let _ = tauri::Emitter::emit(&app_handle, "sidecar-error", text);
           }
         }
-        CommandEvent::Terminated(_) => mark_terminated(&app_handle),
+        CommandEvent::Terminated(payload) => {
+          log::error!("本地服务进程退出: code={:?} signal={:?}", payload.code, payload.signal);
+          mark_terminated(&app_handle, payload.code);
+        }
         _ => {}
       }
     }
@@ -476,7 +651,7 @@ fn spawn_sidecar(app: &tauri::AppHandle, config: &SidecarConfig, open_when_ready
     let timed_out = status.started_at.map(|started_at| started_at.elapsed() >= READY_TIMEOUT).unwrap_or(false);
     if status.phase == ServicePhase::Starting && timed_out {
       log::error!("本地服务在 {} 秒内未就绪", READY_TIMEOUT.as_secs());
-      apply_status(&watchdog, ServiceStatus::not_ready());
+      apply_status(&watchdog, ServiceStatus::not_ready(format!("{} 秒内没有输出就绪信息", READY_TIMEOUT.as_secs())));
     }
   });
 
@@ -488,20 +663,32 @@ fn mark_ready(app: &tauri::AppHandle, port: u16) {
     .try_state::<LauncherState>()
     .map(|state| state.open_on_ready.swap(false, Ordering::SeqCst))
     .unwrap_or(false);
-  // 这次探测顺带取执行中任务数；探测失败不改判定，ready JSON 才是就绪的事实来源。
-  let running_jobs = probe_health(port).map(|health| health.running_jobs).unwrap_or(0);
-  apply_status(app, ServiceStatus::ready(port, running_jobs));
+  // 这次探测顺带取执行中任务数与版本：探测失败不改判定，ready JSON 才是就绪的事实来源。
+  let health = probe_health(port);
+  let running_jobs = health.as_ref().map(|health| health.running_jobs).unwrap_or(0);
+  // 日志里带上双方版本：排查「旧 sidecar 配新启动器」时一眼就能看出来。
+  log::info!(
+    "本地服务就绪: 启动器版本={} 服务版本={} port={port}",
+    env!("CARGO_PKG_VERSION"),
+    health.as_ref().map(|health| health.version.as_str()).unwrap_or("未知")
+  );
+  // 先开浏览器再更新托盘：托盘更新是同步的 shell 调用，万一卡住也不能让用户连页面都拿不到。
   if open_now {
     if let Err(error) = open_browser(port) {
       log::error!("{error}");
     }
   }
+  apply_status(app, ServiceStatus::ready(port, running_jobs));
 }
 
-fn mark_terminated(app: &tauri::AppHandle) {
+fn mark_terminated(app: &tauri::AppHandle, code: Option<i32>) {
   // 重启路径会主动结束子进程，此时状态已进入「重启中」，不能改成「未就绪」。
+  let detail = match code {
+    Some(code) => format!("本地服务进程意外退出（退出码 {code}）"),
+    None => "本地服务进程意外退出".to_owned(),
+  };
   match current_phase(app) {
-    Some(ServicePhase::Ready) | Some(ServicePhase::Starting) => apply_status(app, ServiceStatus::not_ready()),
+    Some(ServicePhase::Ready) | Some(ServicePhase::Starting) => apply_status(app, ServiceStatus::not_ready(detail)),
     _ => {}
   }
 }
@@ -522,7 +709,7 @@ fn watch_service(app: tauri::AppHandle) {
     };
     match probe_health(port) {
       Some(health) => apply_status(&app, ServiceStatus::ready(port, health.running_jobs)),
-      None => apply_status(&app, ServiceStatus::not_ready()),
+      None => apply_status(&app, ServiceStatus::not_ready("本地服务已无响应")),
     }
   });
 }
@@ -540,7 +727,6 @@ fn restart_service(app: &tauri::AppHandle) {
   let Some(status) = state.status.lock().ok().map(|status| status.clone()) else {
     return;
   };
-  let config = state.config.clone();
   apply_status(app, ServiceStatus::restarting());
 
   if status.phase == ServicePhase::ForeignVersion {
@@ -552,15 +738,25 @@ fn restart_service(app: &tauri::AppHandle) {
     let port = status.port.unwrap_or(DEFAULT_PORT);
     if is_port_listening(port) && !wait_port_free(port, PORT_FREE_TIMEOUT) {
       log::error!("本地服务未在 {port} 释放端口");
-      apply_status(app, ServiceStatus::not_ready());
+      apply_status(app, ServiceStatus::not_ready(format!("端口 {port} 未被释放")));
       return;
     }
   }
 
+  // 重启时重新解析数据目录：此刻旧进程已结束，才轮得到迁移旧数据库。
+  let config = match resolve_sidecar_paths(app, true) {
+    Ok((_, config)) => config,
+    Err(error) => {
+      log::error!("初始化数据目录失败: {error}");
+      apply_status(app, ServiceStatus::not_ready(format!("初始化数据目录失败：{}", brief(&error, BRIEF_CHARS))));
+      return;
+    }
+  };
+
   // 重启后端口可能变化，旧标签页会指向失效端口，所以总是打开一个新标签页。
   if let Err(error) = spawn_sidecar(app, &config, true) {
     log::error!("重启本地服务失败: {error}");
-    apply_status(app, ServiceStatus::not_ready());
+    apply_status(app, ServiceStatus::not_ready(format!("重启失败：{}", brief(&error, BRIEF_CHARS))));
   }
 }
 
@@ -568,7 +764,7 @@ fn restart_service(app: &tauri::AppHandle) {
 /// 避免两个服务写同一个数据库、重复执行同一批任务。
 fn take_over_foreign_service(app: &tauri::AppHandle, foreign: Option<(u32, String)>) -> bool {
   let Some((pid, version)) = foreign else {
-    apply_status(app, ServiceStatus::not_ready());
+    apply_status(app, ServiceStatus::not_ready("未找到旧版本服务进程"));
     return false;
   };
   match probe_health(DEFAULT_PORT) {
@@ -605,11 +801,22 @@ fn open_current_service(app: &tauri::AppHandle) {
   }
 }
 
-fn create_tray(app: &mut tauri::App, view: &MenuView) -> tauri::Result<(MenuItem<tauri::Wry>, MenuItem<tauri::Wry>)> {
+/// 托盘的三个可变项：状态项只读，另外两个是用户可点的动作。
+struct TrayItems {
+  status: MenuItem<tauri::Wry>,
+  open: MenuItem<tauri::Wry>,
+  restart: MenuItem<tauri::Wry>,
+}
+
+fn create_tray(app: &mut tauri::App, view: &MenuView) -> tauri::Result<TrayItems> {
+  let status_item = MenuItem::with_id(app, "status", view.status.as_str(), false, None::<&str>)?;
   let open_item = MenuItem::with_id(app, "open-workbench", view.open_label, view.open_enabled, None::<&str>)?;
   let restart_item = MenuItem::with_id(app, "restart-service", view.restart_label, view.restart_enabled, None::<&str>)?;
+  let logs_item = MenuItem::with_id(app, "open-logs", "打开日志目录", true, None::<&str>)?;
+  // 数据目录独立于安装目录，用户重装 / 换盘时需要能找到历史图片和提示词库。
+  let data_item = MenuItem::with_id(app, "open-data", "打开数据目录", true, None::<&str>)?;
   let exit_item = MenuItem::with_id(app, "exit", "退出", true, None::<&str>)?;
-  let menu = Menu::with_items(app, &[&open_item, &restart_item, &exit_item])?;
+  let menu = Menu::with_items(app, &[&status_item, &open_item, &restart_item, &logs_item, &data_item, &exit_item])?;
   let mut tray = TrayIconBuilder::with_id(TRAY_ID)
     .menu(&menu)
     .tooltip(view.tooltip.as_str())
@@ -620,6 +827,20 @@ fn create_tray(app: &mut tauri::App, view: &MenuView) -> tauri::Result<(MenuItem
         _ => open_current_service(app),
       },
       "restart-service" => request_restart(app),
+      // release 包没有可见控制台，日志目录是用户唯一能回传的一手证据。
+      "open-logs" => {
+        if let Err(error) = open_log_directory(app) {
+          log::error!("{error}");
+        }
+      }
+      "open-data" => {
+        let directory = app.try_state::<LauncherState>().map(|state| state.data_root.clone());
+        if let Some(directory) = directory {
+          if let Err(error) = open_in_file_manager(&directory) {
+            log::error!("{error}");
+          }
+        }
+      }
       "exit" => {
         if let Some(state) = app.try_state::<LauncherState>() {
           state.allow_exit.store(true, Ordering::SeqCst);
@@ -633,32 +854,48 @@ fn create_tray(app: &mut tauri::App, view: &MenuView) -> tauri::Result<(MenuItem
     tray = tray.icon(icon);
   }
   tray.build(app)?;
-  Ok((open_item, restart_item))
+  Ok(TrayItems { status: status_item, open: open_item, restart: restart_item })
+}
+
+/// 在文件管理器里打开日志目录；目录还没创建时先建出来，避免打开报错。
+fn open_log_directory(app: &tauri::AppHandle) -> Result<(), String> {
+  let directory = app.path().app_log_dir().map_err(|error| format!("读取日志目录失败: {error}"))?;
+  std::fs::create_dir_all(&directory).map_err(|error| format!("创建日志目录失败: {error}"))?;
+  open_in_file_manager(&directory)
+}
+
+fn open_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+  #[cfg(target_os = "windows")]
+  let mut command = Command::new("explorer");
+  #[cfg(target_os = "macos")]
+  let mut command = Command::new("open");
+  #[cfg(target_os = "linux")]
+  let mut command = Command::new("xdg-open");
+  #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+  return Err("当前平台没有可用的文件管理器启动方式".to_owned());
+
+  command.arg(path).spawn().map(|_| ()).map_err(|error| format!("打开文件管理器失败: {error}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    // release 包没有可见控制台：日志必须落盘，否则「一直启动中 / 未就绪」永远无法取证（ADR 0016）。
+    .plugin(
+      tauri_plugin_log::Builder::default()
+        .level(log::LevelFilter::Info)
+        .max_file_size(5 * 1024 * 1024)
+        .targets([
+          Target::new(TargetKind::Stdout),
+          Target::new(TargetKind::LogDir { file_name: Some("launcher".to_owned()) }),
+        ])
+        .build(),
+    )
     .plugin(tauri_plugin_shell::init())
     .setup(|app| {
-      let database_path = app.path().app_data_dir()?.join("lingtu.db");
-      // 发布包把前端 dist 放入 resources/dist，sidecar 通过环境变量读取该目录。
-      let static_directory = app.path().resource_dir()?.join("dist");
-      #[cfg(any(target_os = "windows", target_os = "macos"))]
-      let system_proxy = detected_proxy_url().unwrap_or_default();
-      #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-      let system_proxy = String::new();
-      let config = SidecarConfig {
-        database_path: database_path.to_string_lossy().to_string(),
-        static_directory: static_directory.to_string_lossy().to_string(),
-        app_version: env!("CARGO_PKG_VERSION").to_owned(),
-        system_proxy,
-      };
-
-      // 8765 上已经有自己人时不再起第二个服务：同版本只打开浏览器并让本次启动退出
-      // （两个同版本托盘图标没有区分度），异版本交给用户点「重启本地服务」接管。
+      // 先探 8765：决定本次是接管旧实例、直接打开，还是拉起新服务。
       let initial = match probe_health(DEFAULT_PORT) {
-        Some(health) if health.version == config.app_version => {
+        Some(health) if health.version == env!("CARGO_PKG_VERSION") => {
           let app_handle = app.handle().clone();
           std::thread::spawn(move || {
             if let Err(error) = open_browser(DEFAULT_PORT) {
@@ -671,33 +908,51 @@ pub fn run() {
         Some(health) => ServiceStatus::foreign(health.pid, health.version),
         None => ServiceStatus::starting(),
       };
+      // 只有确定要自己拉服务时才迁移数据：此刻 8765 上没人在写 WAL，复制数据库才是安全快照。
+      let migrating = initial.phase == ServicePhase::Starting;
+      let (data_root, config) = match resolve_sidecar_paths(app.handle(), migrating) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+          log::error!("初始化数据目录失败: {error}");
+          apply_status(app.handle(), ServiceStatus::not_ready(format!("初始化数据目录失败：{}", brief(&error, BRIEF_CHARS))));
+          return Ok(());
+        }
+      };
 
-      let (open_item, restart_item) = create_tray(app, &menu_view(&initial))?;
+      let log_directory = app.path().app_log_dir().map(|path| path.to_string_lossy().to_string()).unwrap_or_default();
+      // 启动事实全部落盘：版本、数据库、静态资源、代理是否检测到，足以复盘大多数装机问题。
+      log::info!(
+        "启动器就绪: 版本={} 日志目录={} 数据目录={} 数据库={} 工作区={} 静态目录={} 系统代理={}",
+        config.app_version,
+        log_directory,
+        data_root.display(),
+        config.database_path,
+        config.workspace_path,
+        config.static_directory,
+        if config.system_proxy.is_empty() { "未检测到" } else { "已检测到" }
+      );
+      log::info!("8765 探测结果: {:?}", initial);
+
+      let items = create_tray(app, &menu_view(&initial))?;
       app.manage(LauncherState {
         child: Mutex::new(None),
         status: Mutex::new(initial.clone()),
         open_on_ready: AtomicBool::new(false),
         allow_exit: AtomicBool::new(false),
-        open_item,
-        restart_item,
-        config: config.clone(),
+        status_item: items.status,
+        open_item: items.open,
+        restart_item: items.restart,
+        data_root,
       });
 
       if initial.phase == ServicePhase::Starting {
         if let Err(error) = spawn_sidecar(app.handle(), &config, true) {
           log::error!("启动本地服务失败: {error}");
-          apply_status(app.handle(), ServiceStatus::not_ready());
+          apply_status(app.handle(), ServiceStatus::not_ready(format!("启动失败：{}", brief(&error, BRIEF_CHARS))));
         }
       }
       watch_service(app.handle().clone());
 
-      if cfg!(debug_assertions) {
-        app.handle().plugin(
-          tauri_plugin_log::Builder::default()
-            .level(log::LevelFilter::Info)
-            .build(),
-        )?;
-      }
       Ok(())
     })
     .build(tauri::generate_context!())
@@ -783,19 +1038,29 @@ mod tests {
     assert!(view.restart_enabled);
   }
 
+  /// 状态项必须报出真实端口：端口回退后手输 8765 会打开别的东西。
+  #[test]
+  fn status_item_shows_the_real_port() {
+    let view = menu_view(&ServiceStatus::ready(51423, 0));
+    assert_eq!(view.status, "状态：运行中 · http://127.0.0.1:51423");
+  }
+
   #[test]
   fn running_jobs_disable_restart() {
     let view = menu_view(&ServiceStatus::ready(8765, 2));
     assert_eq!(view.tooltip, "灵图工作台 · 有 2 个任务执行中");
+    assert_eq!(view.status, "状态：运行中 · 2 个任务执行中");
     assert_eq!(view.restart_label, "重启本地服务（有任务执行中）");
     assert!(view.open_enabled);
     assert!(!view.restart_enabled);
   }
 
+  /// tooltip 可能被 shell 缓存，菜单状态项是用户真正看到的那一面，必须带出原因。
   #[test]
-  fn not_ready_offers_restart_and_open() {
-    let view = menu_view(&ServiceStatus::not_ready());
-    assert_eq!(view.tooltip, "灵图工作台 · 本地服务未就绪");
+  fn not_ready_offers_restart_and_shows_reason() {
+    let view = menu_view(&ServiceStatus::not_ready("本地服务进程意外退出（退出码 1）"));
+    assert_eq!(view.tooltip, "灵图工作台 · 本地服务未就绪（本地服务进程意外退出（退出码 1））");
+    assert_eq!(view.status, "状态：本地服务未就绪 · 本地服务进程意外退出（退出码 1）");
     assert_eq!(view.open_label, "重启并打开灵图工作台");
     assert!(view.open_enabled);
     assert!(view.restart_enabled);
@@ -808,14 +1073,88 @@ mod tests {
       assert!(!view.open_enabled);
       assert!(!view.restart_enabled);
     }
+    assert_eq!(menu_view(&ServiceStatus::starting()).status, "状态：正在启动本地服务");
+    assert_eq!(menu_view(&ServiceStatus::restarting()).status, "状态：正在重启本地服务");
   }
 
   #[test]
   fn foreign_version_is_surfaced_with_its_own_wording() {
     let view = menu_view(&ServiceStatus::foreign(42, "1.0.5".to_owned()));
     assert_eq!(view.tooltip, "灵图工作台 · 检测到旧版本服务在运行");
+    assert_eq!(view.status, "状态：检测到旧版本服务在运行（v1.0.5）");
     assert_eq!(view.open_label, "打开灵图工作台");
     assert!(view.restart_enabled);
+  }
+
+  /// stderr 的一行可能是整段推栈，日志与托盘只能带开头部分。
+  #[test]
+  fn brief_cuts_long_output() {
+    assert_eq!(brief("  正常行  ", 10), "正常行");
+    assert_eq!(brief("一二三四五六", 3), "一二三…");
+    assert_eq!(brief("一二三", 3), "一二三");
+  }
+
+  /// 临时目录在用例结束后自清，避影影响后续用例。
+  struct TempDirectory(std::path::PathBuf);
+
+  impl TempDirectory {
+    fn new(name: &str) -> Self {
+      let path = std::env::temp_dir().join(format!("lingtu-test-{name}-{}", std::process::id()));
+      let _ = std::fs::remove_dir_all(&path);
+      std::fs::create_dir_all(&path).expect("必须能创建测试目录");
+      Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+      &self.0
+    }
+  }
+
+  impl Drop for TempDirectory {
+    fn drop(&mut self) {
+      let _ = std::fs::remove_dir_all(&self.0);
+    }
+  }
+
+  /// 「重装选新文件夹」等于卸载 + 勾删除；迁移必须把数据库和图片完整搬到新目录。
+  /// 旧目录刻意保留：迁移失败时不能两边都不完整。
+  #[test]
+  fn migrates_database_and_workspace_to_stable_directory() {
+    let root = TempDirectory::new("migrate");
+    let legacy = root.path().join("appdata-com.lingtu.workbench");
+    let install_workspace = root.path().join("old-install").join("workspace");
+    let target = root.path().join("data");
+
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("lingtu.db"), b"prompts").unwrap();
+    // WAL 里的已提交事务必须跟着走，否则看起来就像“提示词退回了旧版本”。
+    std::fs::write(legacy.join("lingtu.db-wal"), b"wal").unwrap();
+    std::fs::create_dir_all(install_workspace.join("jobs")).unwrap();
+    std::fs::write(install_workspace.join("jobs").join("a.png"), b"png").unwrap();
+
+    migrate_legacy_data(&legacy, Some(&install_workspace), &target).unwrap();
+
+    assert_eq!(std::fs::read(target.join("lingtu.db")).unwrap(), b"prompts");
+    assert_eq!(std::fs::read(target.join("lingtu.db-wal")).unwrap(), b"wal");
+    assert_eq!(std::fs::read(target.join("workspace").join("jobs").join("a.png")).unwrap(), b"png");
+    // 旧目录不清空：删除属于用户的决定。
+    assert!(legacy.join("lingtu.db").exists());
+  }
+
+  /// 已有新数据库时不能再拿旧数据覆盖，否则升级回退会复活旧提示词。
+  #[test]
+  fn migration_never_overwrites_existing_data() {
+    let root = TempDirectory::new("no-overwrite");
+    let legacy = root.path().join("legacy");
+    let target = root.path().join("data");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(legacy.join("lingtu.db"), b"old").unwrap();
+    std::fs::write(target.join("lingtu.db"), b"new").unwrap();
+
+    migrate_legacy_data(&legacy, None, &target).unwrap();
+
+    assert_eq!(std::fs::read(target.join("lingtu.db")).unwrap(), b"new");
   }
 
   #[test]
