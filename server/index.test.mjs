@@ -1418,7 +1418,12 @@ test('任务列表不把源图 base64 物化进内存', async () => {
 
     const listed = await fetch(`${base}/api/jobs`).then((response) => response.text())
     assert.ok(listed.length < 100_000, `列表接口也不应携带源图，实际 ${listed.length} 字节`)
-    assert.match(listed, /第 0 条/)
+    // 默认按最新优先分页：60 条只回 20 条，最新的是「第 59 条」。
+    const listedBody = JSON.parse(listed)
+    assert.equal(listedBody.items.length, 20)
+    assert.equal(listedBody.total, 60)
+    assert.equal(listedBody.pageCount, 3)
+    assert.match(listed, /第 59 条/)
     // 重试仍要拿得到原图，所以只允许从列表里摘掉，不能从库里删。
     assert.equal(store.request(items[0].id)?.sourceImage?.data.length, sourceImage.data.length)
   } finally {
@@ -1440,6 +1445,144 @@ test('启动恢复只回可执行的排队任务', () => {
     assert.deepEqual(ids.sort(), [runnable.job.id, windows.job.id].sort())
     assert.ok(!ids.includes(legacyEmpty.job.id))
   } finally {
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('任务列表支持分页、状态筛选、搜索，计数来自全库', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-paging-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const app = await startServer(0, '127.0.0.1', store)
+  const base = `http://127.0.0.1:${app.address().port}`
+  const list = async (query) => (await fetch(`${base}/api/jobs?${new URLSearchParams(query)}`)).json()
+  try {
+    // 25 条：偶数条成功、奇数条失败；每条都带约 200KB 原图，确保分页不会把大字段带出来。
+    const sourceImage = { data: Buffer.alloc(200_000).toString('base64'), mimeType: 'image/png', name: 'a.png' }
+    const ids = []
+    for (let index = 0; index < 25; index += 1) {
+      const job = store.create({ mode: 'edit', prompt: `分页测试 ${index}`, sourceImage })
+      ids.push(job.job.id)
+      if (index % 2 === 0) store.update(job.job.id, 'completed', { results: [] })
+      else store.update(job.job.id, 'failed', { error: { message: `余额不足 ${index}` } })
+    }
+    const first = await list({})
+    assert.equal(first.items.length, 20)
+    assert.equal(first.total, 25)
+    assert.equal(first.pageCount, 2)
+    assert.equal(first.counts.all, 25)
+    assert.equal(first.counts.completed, 13)
+    assert.equal(first.counts.failed, 12)
+
+    const second = await list({ page: '2' })
+    assert.equal(second.items.length, 5)
+    assert.equal(second.page, 2)
+    // 页码越界靠到最后一页，不给空白页。
+    assert.equal((await list({ page: '99' })).page, 2)
+
+    const completed = await list({ status: 'completed', pageSize: '50' })
+    assert.equal(completed.items.length, 13)
+    assert.ok(completed.items.every((job) => job.status === 'completed'))
+    // 标签计数不受筛选影响，仍是全库口径。
+    assert.equal(completed.counts.all, 25)
+
+    const searched = await list({ search: '余额不足 21' })
+    assert.equal(searched.items.length, 1)
+    assert.equal(searched.items[0].status, 'failed')
+    // 通配符必须被转义，不能让它变成“匹配一切”。
+    assert.equal((await list({ search: '%' })).items.length, 0)
+    assert.equal((await list({ search: ids[3] })).items.length, 1)
+  } finally {
+    await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('清理只删已完成任务，并跳过后台压缩之外的其它状态', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-cleanup-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const app = await startServer(0, '127.0.0.1', store)
+  const base = `http://127.0.0.1:${app.address().port}`
+  const cleanup = async (body) => {
+    const response = await fetch(`${base}/api/jobs/cleanup`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    return { status: response.status, body: await response.json() }
+  }
+  try {
+    const completedOld = store.create({ mode: 'text_to_image', prompt: '很久以前完成' })
+    store.update(completedOld.job.id, 'completed', { results: [] })
+    const completedNew = store.create({ mode: 'text_to_image', prompt: '刚刚完成' })
+    store.update(completedNew.job.id, 'completed', { results: [] })
+    const failed = store.create({ mode: 'text_to_image', prompt: '失败任务' })
+    store.update(failed.job.id, 'failed', { error: { message: '上游超时' } })
+    const review = store.create({ mode: 'text_to_image', prompt: '待复核任务' })
+    store.update(review.job.id, 'review')
+    const queued = store.create({ mode: 'text_to_image', prompt: '排队中任务' })
+
+    // 把“很久以前”推到 30 天前，验证按时间保留只删该删的。
+    const oldTimestamp = new Date(Date.now() - 40 * 86_400_000).toISOString()
+    const writer = new DatabaseSync(join(directory, 'jobs.db'))
+    writer.prepare('UPDATE jobs SET created_at = ? WHERE id = ?').run(oldTimestamp, completedOld.job.id)
+    writer.close()
+
+    assert.equal((await cleanup({ keepDays: 10 })).status, 400)
+    const partial = await cleanup({ keepDays: 30 })
+    assert.equal(partial.status, 200)
+    assert.equal(partial.body.deleted, 1)
+    assert.equal(partial.body.counts.completed, 1)
+    // 失败、待复核、排队一律不许被清理动到。
+    assert.equal(partial.body.counts.failed, 1)
+    assert.equal(partial.body.counts.review, 1)
+    assert.equal(partial.body.counts.queued, 1)
+
+    const rest = await cleanup({ keepDays: 'all' })
+    assert.equal(rest.body.deleted, 1)
+    assert.equal(rest.body.counts.completed, 0)
+    assert.equal(rest.body.counts.failed, 1)
+    assert.equal(store.get(queued.job.id)?.status, 'queued')
+  } finally {
+    await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('清理后自动在后台压缩数据库，主服务不受影响', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-vacuum-'))
+  const dbPath = join(directory, 'jobs.db')
+  const store = new JobStore(dbPath)
+  const app = await startServer(0, '127.0.0.1', store)
+  const base = `http://127.0.0.1:${app.address().port}`
+  try {
+    // 40 条 × 约 400KB 原图，删掉后 VACUUM 能明显把文件压小。
+    const sourceImage = { data: Buffer.alloc(400_000).toString('base64'), mimeType: 'image/png', name: 'a.png' }
+    for (let index = 0; index < 40; index += 1) {
+      const job = store.create({ mode: 'edit', prompt: `压缩测试 ${index}`, sourceImage })
+      store.update(job.job.id, 'completed', { results: [] })
+    }
+    const before = store.fileSize()
+    const cleanup = await fetch(`${base}/api/jobs/cleanup`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ keepDays: 'all' }) }).then((response) => response.json())
+    assert.equal(cleanup.deleted, 40)
+    assert.ok(['running', 'done'].includes(cleanup.vacuum.state))
+
+    // 压缩在子进程里跑，主进程这段时间必须照常响应。
+    const health = await fetch(`${base}/health`)
+    assert.equal(health.status, 200)
+
+    let status
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      status = await fetch(`${base}/api/maintenance`).then((response) => response.json())
+      if (status.vacuum.state === 'done' || status.vacuum.state === 'failed') break
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 100))
+    }
+    assert.equal(status.vacuum.state, 'done', status.vacuum.error)
+    const after = store.fileSize()
+    assert.ok(after.database + after.wal < before.database + before.wal, `压缩后文件应变小：${before.database} → ${after.database}`)
+    assert.ok(status.vacuum.reclaimedBytes > 0)
+    // 压缩后数据仍可正常读写。
+    assert.equal((await fetch(`${base}/api/jobs`).then((response) => response.json())).total, 0)
+  } finally {
+    await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
     store.close()
     rmSync(directory, { recursive: true, force: true })
   }

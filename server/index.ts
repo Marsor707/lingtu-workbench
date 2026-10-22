@@ -1,4 +1,7 @@
 import { createServer } from 'node:http'
+import { spawn } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -15,7 +18,7 @@ import { detectedSystemProxy, normalizeProxyUrl } from './network.js'
 import { LlmChatError } from './llm-chat.js'
 import { builtinPrompts } from './prompts.js'
 
-declare const process: { env: Record<string, string | undefined>; argv: string[]; exitCode?: number; pid: number; kill(pid: number, signal?: number | string): boolean; exit(code?: number): void; on(event: string, listener: (...args: any[]) => void): void; stdin?: { on(event: string, listener: (...args: any[]) => void): void; resume(): void } }
+declare const process: { env: Record<string, string | undefined>; argv: string[]; execPath: string; exitCode?: number; pid: number; kill(pid: number, signal?: number | string): boolean; exit(code?: number): void; on(event: string, listener: (...args: any[]) => void): void; stdin?: { on(event: string, listener: (...args: any[]) => void): void; resume(): void } }
 type HttpRequest = { method?: string; url?: string; headers: Record<string, string | string[] | undefined>; on(event: string, listener: (...args: any[]) => void): void }
 type HttpResponse = { statusCode: number; setHeader(name: string, value: string): void; writeHead(statusCode: number, headers?: Record<string, string>): void; write(chunk: string | Uint8Array): void; end(chunk?: string | Uint8Array): void; on?(event: string, listener: (...args: any[]) => void): void }
 type NativeServer = { listen(port: number, host: string, callback?: () => void): void; close(callback: (error?: Error) => void): void; address(): { port: number } | string | null; once?(event: string, listener: (...args: any[]) => void): void; off?(event: string, listener: (...args: any[]) => void): void }
@@ -66,6 +69,18 @@ const MODE_ALIASES: Record<string, JobMode> = { text: 'text_to_image', 'one-to-m
 // FATAL ERROR（Reached heap limit）退出，表现就是「本地服务未就绪（退出码 134）」。
 // 重试等需要原图的路径仍走单条的 get(id)，不受影响。
 const JOB_SUMMARY_COLUMNS = "id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, cancelled_at, json_remove(request_json, '$.sourceImage') AS request_json, results_json, error_json, provider_id"
+// 任务列表一律分页：历史可以有上千条，整表返回既慢又让前端用不上（筛选/搜索已交给服务端）。
+const DEFAULT_PAGE_SIZE = 20
+const MAX_PAGE_SIZE = 100
+const JOB_STATUSES = ['queued', 'running', 'review', 'completed', 'failed', 'cancelled'] as const
+// 清理只针对已完成；运行中、排队、待复核一律不动。
+const CLEANUP_KEEP_DAYS = [7, 30, 90] as const
+function escapeLike(value: string): string { return value.replace(/[\\%_]/g, (char) => `\\${char}`) }
+function positiveInteger(value: unknown, fallback: number, max = Number.MAX_SAFE_INTEGER): number {
+  const parsed = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback
+  return Math.min(max, Math.trunc(parsed))
+}
 
 type OutputLayoutSpec = { name: string; arrangement: string }
 const OUTPUT_LAYOUTS: Record<string, OutputLayoutSpec> = {
@@ -296,13 +311,18 @@ function effectiveProviderMetadata(store: JobStore): { baseUrl: string; configur
 
 export class JobStore {
   private readonly db: DatabaseSync
+  private readonly dbPath: string
   // Provider 密钥只保存在本地配置表，不写入任务快照、列表接口或日志。
   private readonly runtimeProviders = new Map<string, ProviderConfig>()
   constructor(dbPath = ':memory:') {
+    this.dbPath = dbPath
     if (dbPath !== ':memory:' && !dbPath.startsWith('file:')) mkdirSync(dirname(resolve(dbPath)), { recursive: true })
     this.db = new DatabaseSync(dbPath)
+    // 历史库可能很大，翻页必须走索引：没有索引时 ORDER BY created_at 会把整张表读一遍再排序。
+    this.db.exec('PRAGMA busy_timeout = 5000')
     this.db.exec(`PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE, mode TEXT NOT NULL, status TEXT NOT NULL, windows_json TEXT, provider_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, cancelled_at TEXT, request_json TEXT, results_json TEXT, error_json TEXT, provider_id TEXT);`)
     for (const column of ['request_json TEXT', 'results_json TEXT', 'error_json TEXT', 'provider_id TEXT']) { try { this.db.exec(`ALTER TABLE jobs ADD COLUMN ${column}`) } catch { /* 兼容已包含列的旧数据库 */ } }
+    this.db.exec('CREATE INDEX IF NOT EXISTS jobs_created_at_idx ON jobs(created_at DESC, id DESC)')
     this.db.exec('CREATE TABLE IF NOT EXISTS prompts (id TEXT PRIMARY KEY, category TEXT NOT NULL, title TEXT NOT NULL, text TEXT NOT NULL, layout TEXT NOT NULL, purpose TEXT NOT NULL DEFAULT \'generation\', builtin INTEGER NOT NULL, source_name TEXT NOT NULL, customized INTEGER NOT NULL DEFAULT 0)')
     try { this.db.exec('ALTER TABLE prompts ADD COLUMN customized INTEGER NOT NULL DEFAULT 0') } catch { /* 兼容已包含该列的旧数据库 */ }
     try { this.db.exec('ALTER TABLE prompts ADD COLUMN purpose TEXT NOT NULL DEFAULT \'generation\'') } catch { /* 兼容已包含该列的旧数据库 */ }
@@ -360,7 +380,61 @@ export class JobStore {
     this.runtimeProviders.set(job.id, request.provider)
     return { job, created: true }
   }
-  list(): Job[] { return (this.db.prepare(`SELECT ${JOB_SUMMARY_COLUMNS} FROM jobs ORDER BY created_at DESC`).all() as Record<string, unknown>[]).map((row) => this.fromRow(row)) }
+  list(): Job[] { return (this.db.prepare(`SELECT ${JOB_SUMMARY_COLUMNS} FROM jobs ORDER BY created_at DESC, id DESC`).all() as Record<string, unknown>[]).map((row) => this.fromRow(row)) }
+  /**
+   * 分页列表。筛选和搜索由服务端完成：前端一次只拿一页，不再依赖“全量列表再本地过滤”。
+   * 搜索只命中低成本列（编号、模式、错误原文）；提示词正文存在大字段里，不参与搜索（见 ADR 0020）。
+   */
+  page(query: { page?: unknown; pageSize?: unknown; status?: unknown; search?: unknown } = {}): { items: Job[]; total: number; page: number; pageSize: number; pageCount: number } {
+    const pageSize = positiveInteger(query.pageSize, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+    const status = typeof query.status === 'string' && (JOB_STATUSES as readonly string[]).includes(query.status) ? query.status : undefined
+    const search = typeof query.search === 'string' ? query.search.trim() : ''
+    const where: string[] = []
+    const params: string[] = []
+    if (status) { where.push('status = ?'); params.push(status) }
+    if (search) {
+      const pattern = `%${escapeLike(search.toLowerCase())}%`
+      where.push("(lower(id) LIKE ? ESCAPE '\\' OR lower(mode) LIKE ? ESCAPE '\\' OR lower(coalesce(error_json, '')) LIKE ? ESCAPE '\\')")
+      params.push(pattern, pattern, pattern)
+    }
+    const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM jobs ${clause}`).get(...params) as { count?: number }).count ?? 0)
+    // 页码超出范围时靠到底：清理完以后旧页码会失效，不该给一张空白页。
+    const pageCount = Math.max(1, Math.ceil(total / pageSize))
+    const page = Math.min(positiveInteger(query.page, 1), pageCount)
+    const rows = this.db.prepare(`SELECT ${JOB_SUMMARY_COLUMNS} FROM jobs ${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`).all(...params, pageSize, (page - 1) * pageSize) as Record<string, unknown>[]
+    return { items: rows.map((row) => this.fromRow(row)), total, page, pageSize, pageCount }
+  }
+  /** 各状态条数：筛选标签的计数必须来自全库，而不是当前页。 */
+  statusCounts(): Record<string, number> {
+    const counts: Record<string, number> = { all: 0 }
+    for (const status of JOB_STATUSES) counts[status] = 0
+    for (const row of this.db.prepare('SELECT status, COUNT(*) AS count FROM jobs GROUP BY status').all() as { status?: string; count?: number }[]) {
+      const count = Number(row.count ?? 0)
+      counts.all += count
+      if (row.status && Object.hasOwn(counts, String(row.status))) counts[String(row.status)] = count
+    }
+    return counts
+  }
+  /** 只删除已完成任务；返回删除条数，供界面告诉用户实际影响范围。 */
+  deleteCompleted(before?: string): number {
+    const statement = before
+      ? this.db.prepare("DELETE FROM jobs WHERE status = 'completed' AND created_at < ?")
+      : this.db.prepare("DELETE FROM jobs WHERE status = 'completed'")
+    const result = before ? statement.run(before) : statement.run()
+    return Number(result.changes ?? 0)
+  }
+  /** 有排队或在跑的任务时不适合压缩数据库：VACUUM 需要独占，会把正在写库的请求卡住。 */
+  activeCount(): number { return Number((this.db.prepare("SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued', 'running')").get() as { count?: number }).count ?? 0) }
+  /** 数据库体积（含 WAL）：压缩前后用它算出实际回收了多少。 */
+  fileSize(): { database: number; wal: number } {
+    const sizeOf = (target: string): number => { try { return statSync(target).size } catch { return 0 } }
+    return { database: sizeOf(this.dbPath), wal: sizeOf(`${this.dbPath}-wal`) }
+  }
+  /** VACUUM 后必须 checkpoint：否则回收的空间要等连接关闭才落到主库文件上，界面上看不到变小。 */
+  checkpoint(): void { try { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)') } catch { /* 读事务占用时跳过，下次写入会继续尝试 */ } }
+  /** 供后台压缩子进程使用的数据库路径。 */
+  databasePath(): string { return this.dbPath }
   /**
    * 启动恢复只关心「哪些 queued 任务还该继续跑」。
    * 这里刻意不调 list()：它有几千条历史就要把整张表连同源图 base64 物化到 JS 堆，
@@ -611,6 +685,100 @@ export class JobStore {
   }
 }
 export class RequestValidationError extends Error { constructor(public readonly code: string, message: string) { super(message) } }
+
+/**
+ * 数据库压缩（VACUUM）状态。
+ * VACUUM 会把整个库重写一遍，GB 级库要几十秒且会独占数据库，所以放在子进程里跑：
+ * 主进程继续响应请求，页面上的操作不会因为「清理任务」而卡死。
+ */
+export type MaintenanceStatus = { state: 'idle' | 'pending' | 'running' | 'done' | 'failed'; startedAt?: string; finishedAt?: string; reclaimedBytes?: number; error?: string }
+const maintenance: MaintenanceStatus = { state: 'idle' }
+let vacuumChild: ChildProcess | null = null
+let vacuumPendingTimer: ReturnType<typeof setInterval> | undefined
+let exitHookRegistered = false
+
+/** 子进程只做一件事：打开库、VACUUM、退出。SEA 下是复用自身二进制，开发态是重跑本模块。 */
+function vacuumCommand(dbPath: string): { file: string; args: string[] } {
+  if (isSea()) return { file: process.execPath, args: ['--vacuum-db', dbPath] }
+  return { file: process.execPath, args: [fileURLToPath(import.meta.url), '--vacuum-db', dbPath] }
+}
+
+function startVacuum(store: JobStore): void {
+  const dbPath = resolve(store.databasePath())
+  const before = store.fileSize()
+  const { file, args } = vacuumCommand(dbPath)
+  let child: ChildProcess
+  try {
+    child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env } })
+  } catch (error) {
+    maintenance.state = 'failed'
+    maintenance.finishedAt = new Date().toISOString()
+    maintenance.error = (error as Error).message
+    return
+  }
+  vacuumChild = child
+  if (!exitHookRegistered) {
+    // 启动器被强杀时不能让压缩子进程变孤儿，否则它手里的独占锁会卡住下一次启动。
+    exitHookRegistered = true
+    process.on('exit', () => { try { vacuumChild?.kill() } catch { /* 已经退出 */ } })
+  }
+  maintenance.state = 'running'
+  maintenance.startedAt = new Date().toISOString()
+  maintenance.finishedAt = undefined
+  maintenance.reclaimedBytes = undefined
+  maintenance.error = undefined
+  let stderrTail = ''
+  child.stderr?.on('data', (chunk: Buffer) => { stderrTail = `${stderrTail}${String(chunk)}`.slice(-500) })
+  const finish = (code: number | null): void => {
+    vacuumChild = null
+    maintenance.finishedAt = new Date().toISOString()
+    if (code === 0) {
+      store.checkpoint()
+      const after = store.fileSize()
+      const reclaimed = before.database + before.wal - (after.database + after.wal)
+      maintenance.state = 'done'
+      maintenance.reclaimedBytes = Math.max(0, reclaimed)
+      maintenance.error = undefined
+    } else {
+      maintenance.state = 'failed'
+      // 磁盘不足是压缩最常见的失败原因，原因必须原样留给界面。
+      maintenance.error = stderrTail.trim().slice(-200) || `压缩进程退出码 ${code ?? 'unknown'}`
+    }
+  }
+  child.on('error', (error: Error) => { stderrTail = error.message; finish(null) })
+  child.on('exit', (code: number | null) => { if (vacuumChild === child) finish(code) })
+}
+
+/** 清理完成就自动安排压缩；有任务在跑时挂起，空闲后自己开始。 */
+function scheduleVacuum(store: JobStore): MaintenanceStatus {
+  if (maintenance.state === 'running') return maintenance
+  if (store.databasePath() === ':memory:') return maintenance
+  if (store.activeCount() > 0) {
+    maintenance.state = 'pending'
+    vacuumPendingTimer ??= setInterval(() => {
+      if (store.activeCount() > 0) return
+      if (vacuumPendingTimer) clearInterval(vacuumPendingTimer)
+      vacuumPendingTimer = undefined
+      startVacuum(store)
+    }, 15_000)
+    // 轮询手不需要阻止进程退出。
+    vacuumPendingTimer.unref?.()
+    return maintenance
+  }
+  startVacuum(store)
+  return maintenance
+}
+
+/** 子进程入口：VACUUM 失败时把原因写到 stderr 并以非零码退出。 */
+function vacuumDatabase(dbPath: string): void {
+  const db = new DatabaseSync(dbPath)
+  try {
+    db.exec('PRAGMA busy_timeout = 5000')
+    db.exec('VACUUM')
+  } finally {
+    db.close()
+  }
+}
 /**
  * 启动器被强杀时不会走任何清理路径，sidecar 会变成孤儿，继续占用安装目录里的
  * lingtu-server.exe，导致覆盖安装报 "Error opening file for writing"。
@@ -1126,7 +1294,28 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         if (result.created && (result.job.prompt || result.job.windows)) queue(result.job.id)
       } catch (error) { if (error instanceof RequestValidationError) { errorResponse(res, 400, error.code, error.message); return }; errorResponse(res, 500, 'internal_error', '创建任务失败') }; return
     }
-    if (req.method === 'GET' && path === '/api/jobs') { const items = store.list(); json(res, 200, { items, total: items.length }); return }
+    if (req.method === 'GET' && path === '/api/jobs') {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+      const result = store.page({ page: url.searchParams.get('page'), pageSize: url.searchParams.get('pageSize'), status: url.searchParams.get('status'), search: url.searchParams.get('search') })
+      // counts 来自全库：筛选标签的计数不能受当前页影响。
+      json(res, 200, { ...result, counts: store.statusCounts() })
+      return
+    }
+    if (req.method === 'POST' && path === '/api/jobs/cleanup') {
+      let body: unknown
+      try { body = await readBody(req) } catch (error) { errorResponse(res, 400, 'invalid_json', (error as Error).message); return }
+      const item = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
+      // keepDays 省略表示“清理全部已完成”；给了天数就只删该天数之前创建的。
+      const keepDays = item.keepDays === undefined || item.keepDays === 'all' ? undefined : Number(item.keepDays)
+      if (keepDays !== undefined && !(CLEANUP_KEEP_DAYS as readonly number[]).includes(keepDays)) { errorResponse(res, 400, 'invalid_keep_days', `保留天数只能是 ${CLEANUP_KEEP_DAYS.join('、')} 天或全部`); return }
+      try {
+        const before = keepDays === undefined ? undefined : new Date(Date.now() - keepDays * 86_400_000).toISOString()
+        const deleted = store.deleteCompleted(before)
+        json(res, 200, { deleted, counts: store.statusCounts(), vacuum: scheduleVacuum(store) })
+      } catch (error) { errorResponse(res, 500, 'cleanup_failed', (error as Error).message) }
+      return
+    }
+    if (req.method === 'GET' && path === '/api/maintenance') { json(res, 200, { vacuum: maintenance, size: store.fileSize() }); return }
     const resultMatch = path.match(/^\/api\/jobs\/([^/]+)\/results\/(\d+)$/)
     if (req.method === 'GET' && resultMatch) {
       const job = store.get(decodeURIComponent(resultMatch[1]))
@@ -1273,4 +1462,8 @@ export async function startServer(port = portFromEnvironment(), host = DEFAULT_H
   return server
 }
 // 启动事实先写进执行日志再报 ready：用户只能拿到 execution.log 时，才能分清「压根没起来」和「起来了但页面打不开」。
-if (isSea() || (process.argv[1] && basename(process.argv[1]) === 'index.js')) { const dbPath = process.env.LINGTU_DB_PATH ?? 'workspace/lingtu.db'; const workspaceDir = resolve(process.env.LINGTU_WORKSPACE ?? 'workspace'); const appVersion = process.env.LINGTU_APP_VERSION ?? ''; const parentPid = Number(process.env.LINGTU_PARENT_PID); watchParentProcess(Number.isInteger(parentPid) && parentPid > 0 ? parentPid : undefined); startServer(portFromEnvironment(), DEFAULT_HOST, new JobStore(dbPath)).then((server) => { const address = server.address(); const port = typeof address === 'object' && address ? address.port : portFromEnvironment(); appendExecutionLog(workspaceDir, 'service_started', { version: appVersion, port, pid: process.pid, dbPath, workspaceDir }); console.log(JSON.stringify({ ready: true, port, host: DEFAULT_HOST })) }).catch((error) => { console.error(error); appendExecutionLog(workspaceDir, 'service_start_failed', { version: appVersion, dbPath, errorMessage: (error as Error).message }); process.exitCode = 1 }) }
+const vacuumArgument = process.argv.indexOf('--vacuum-db')
+if (vacuumArgument > 0 && process.argv[vacuumArgument + 1]) {
+  // 后台压缩子进程：只做 VACUUM，不监听端口、不写执行日志。
+  try { vacuumDatabase(resolve(process.argv[vacuumArgument + 1])) } catch (error) { console.error(error); process.exitCode = 1 }
+} else if (isSea() || (process.argv[1] && basename(process.argv[1]) === 'index.js')) { const dbPath = process.env.LINGTU_DB_PATH ?? 'workspace/lingtu.db'; const workspaceDir = resolve(process.env.LINGTU_WORKSPACE ?? 'workspace'); const appVersion = process.env.LINGTU_APP_VERSION ?? ''; const parentPid = Number(process.env.LINGTU_PARENT_PID); watchParentProcess(Number.isInteger(parentPid) && parentPid > 0 ? parentPid : undefined); startServer(portFromEnvironment(), DEFAULT_HOST, new JobStore(dbPath)).then((server) => { const address = server.address(); const port = typeof address === 'object' && address ? address.port : portFromEnvironment(); appendExecutionLog(workspaceDir, 'service_started', { version: appVersion, port, pid: process.pid, dbPath, workspaceDir }); console.log(JSON.stringify({ ready: true, port, host: DEFAULT_HOST })) }).catch((error) => { console.error(error); appendExecutionLog(workspaceDir, 'service_start_failed', { version: appVersion, dbPath, errorMessage: (error as Error).message }); process.exitCode = 1 }) }

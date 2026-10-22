@@ -589,3 +589,26 @@ h1 { font-size: clamp(25px, 2.2vw, 33px); line-height: 1.18; letter-spacing: -.4
 
 @media (max-width: 1100px) { .title-generation-workspace { grid-template-columns: 1fr; } .title-generation-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 760px) { .title-generation-grid { grid-template-columns: 1fr; } .title-generation-panel { min-height: 320px; padding: 17px 15px; } .prompt-toolbar { grid-template-columns: 1fr; } }
+
+/* 任务队列分页：改动最少的定位方式——列表下方一行，上一页/下一页 + 总数。
+   分页后筛选与搜索都走服务端，标签上的数字来自全库统计，不再受当前页影响。 */
+.queue-pagination { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 14px; color: var(--muted); font-size: 11px; }
+.queue-pagination strong { color: var(--text); font: 11px var(--mono); }
+.queue-pagination.single { justify-content: flex-end; padding-right: 4px; color: var(--muted-2); }
+.queue-list.is-loading { opacity: .6; }
+.queue-cleanup:disabled { color: var(--muted-2); border-color: var(--border); background: var(--surface-soft); cursor: not-allowed; }
+.queue-cleanup:disabled:hover { border-color: var(--border); background: var(--surface-soft); }
+/* 清理是破坏性操作：按钮用红色系，和「全部重试」这类可逆动作区分开。 */
+.button-danger { color: #8c2f22; border: 1px solid #e2ada5; background: #fdf3f1; }
+.button-danger:hover:not(:disabled) { border-color: #d69a90; background: #fbe8e4; }
+.button-danger:disabled { color: var(--muted-2); border-color: var(--border); background: var(--surface-soft); cursor: not-allowed; }
+.cleanup-modal { width: min(470px, 100%); }
+.cleanup-options { display: grid; gap: 8px; padding: 16px 23px; }
+.cleanup-option { display: flex; align-items: flex-start; gap: 10px; padding: 11px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); cursor: pointer; transition: border-color 160ms ease, background 160ms ease; }
+.cleanup-option:hover { border-color: var(--border-strong); }
+.cleanup-option.active { border-color: var(--green); background: var(--green-deep); }
+.cleanup-option input { margin-top: 2px; accent-color: var(--green); }
+.cleanup-option span { display: grid; gap: 3px; }
+.cleanup-option strong { font-size: 12px; }
+.cleanup-option small { color: var(--muted-2); font-size: 10px; }
+.gallery-more { display: flex; justify-content: center; margin-top: 16px; }
