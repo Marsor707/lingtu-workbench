@@ -28,7 +28,9 @@ const DEFAULT_PORT: u16 = 8765;
 const HEALTH_PATH: &str = "/health";
 const TRAY_ID: &str = "lingtu-tray";
 /// 启动器等待 sidecar 输出 ready JSON 的上限。超时后托盘进入「未就绪」，不再静默。
-const READY_TIMEOUT: Duration = Duration::from_secs(20);
+/// 给到 60 秒：历史库可能有几个 GB（源图 base64 存在任务行里），SQLite 打开并回收 WAL
+/// 本身就要几十秒，20 秒会把「正在慢慢恢复」误报成「没起来」。
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// 本地 HTTP 探测的单次连接与读取超时。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// 重启时等待旧进程释放端口的上限。
@@ -37,6 +39,8 @@ const PORT_FREE_TIMEOUT: Duration = Duration::from_secs(3);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// 日志与托盘文案里附带的错误原文上限：一行 stdout 可能是整段堆栈，原样照抄会淹没关键信息。
 const BRIEF_CHARS: usize = 240;
+/// stderr 落盘时允许更长：Node 的 FATAL ERROR 后面常跟着几行堆栈，托盘只取首行，日志要留全。
+const STDERR_LOG_CHARS: usize = 1200;
 /// 用户数据目录名。
 ///
 /// 刻意**不**等于 bundle identifier：NSIS 卸载器在用户勾选「删除应用数据」时会
@@ -514,6 +518,9 @@ struct LauncherState {
   restart_item: MenuItem<tauri::Wry>,
   /// 用户数据目录（数据库 + 图片），供「打开数据目录」使用。
   data_root: std::path::PathBuf,
+  /// 服务最近一行 stderr。Node 抛 FATAL ERROR 时是 abort 退出，JS 层没机会写日志，
+  /// 这行原始输出是唯一能说清原因的东西，所以它要能直接进托盘文案。
+  last_stderr: Mutex<Option<String>>,
 }
 
 fn current_status(app: &tauri::AppHandle) -> Option<ServiceStatus> {
@@ -628,7 +635,12 @@ fn spawn_sidecar(app: &tauri::AppHandle, config: &SidecarConfig, open_when_ready
           let text = String::from_utf8_lossy(&line).trim().to_owned();
           if !text.is_empty() {
             // release 包没有可见控制台，stderr 是启动失败唯一的一手证据，必须落盘。
-            log::error!("本地服务 stderr: {}", brief(&text, BRIEF_CHARS));
+            log::error!("本地服务 stderr: {}", brief(&text, STDERR_LOG_CHARS));
+            if let Some(state) = app_handle.try_state::<LauncherState>() {
+              if let Ok(mut last) = state.last_stderr.lock() {
+                *last = Some(brief(&text, BRIEF_CHARS));
+              }
+            }
             let _ = tauri::Emitter::emit(&app_handle, "sidecar-error", text);
           }
         }
@@ -683,14 +695,25 @@ fn mark_ready(app: &tauri::AppHandle, port: u16) {
 
 fn mark_terminated(app: &tauri::AppHandle, code: Option<i32>) {
   // 重启路径会主动结束子进程，此时状态已进入「重启中」，不能改成「未就绪」。
-  let detail = match code {
-    Some(code) => format!("本地服务进程意外退出（退出码 {code}）"),
-    None => "本地服务进程意外退出".to_owned(),
-  };
+  let stderr = app
+    .try_state::<LauncherState>()
+    .and_then(|state| state.last_stderr.lock().ok().and_then(|last| last.clone()));
+  let detail = exit_detail(code, stderr.as_deref());
+  log::error!("本地服务未就绪原因: {detail}");
   match current_phase(app) {
     Some(ServicePhase::Ready) | Some(ServicePhase::Starting) => apply_status(app, ServiceStatus::not_ready(detail)),
     _ => {}
   }
+}
+
+/// 退出原因文案。带上 stderr 首行：`FATAL ERROR: ...` 这类 abort 不会留下其他痕迹。
+fn exit_detail(code: Option<i32>, stderr: Option<&str>) -> String {
+  let cause = match (code, stderr.map(str::trim)) {
+    (Some(code), Some(text)) if !text.is_empty() => format!("退出码 {code}：{text}"),
+    (Some(code), _) => format!("退出码 {code}"),
+    _ => return "本地服务进程意外退出".to_owned(),
+  };
+  format!("本地服务意外退出（{cause}）")
 }
 
 /// 就绪后定期复核服务与执行中任务数：任务数是「重启本地服务」是否可用的唯一依据，
@@ -943,6 +966,7 @@ pub fn run() {
         open_item: items.open,
         restart_item: items.restart,
         data_root,
+        last_stderr: Mutex::new(None),
       });
 
       if initial.phase == ServicePhase::Starting {
@@ -1084,6 +1108,18 @@ mod tests {
     assert_eq!(view.status, "状态：检测到旧版本服务在运行（v1.0.5）");
     assert_eq!(view.open_label, "打开灵图工作台");
     assert!(view.restart_enabled);
+  }
+
+  /// 退出原因文案。带上 stderr 首行：`FATAL ERROR: ...` 这类 abort 不会留下其他痕迹。
+  #[test]
+  fn exit_detail_carries_first_stderr_line() {
+    assert_eq!(
+      exit_detail(Some(134), Some("FATAL ERROR: Reached heap limit Allocation failed")),
+      "本地服务意外退出（退出码 134：FATAL ERROR: Reached heap limit Allocation failed）"
+    );
+    assert_eq!(exit_detail(Some(134), None), "本地服务意外退出（退出码 134）");
+    assert_eq!(exit_detail(Some(134), Some("   ")), "本地服务意外退出（退出码 134）");
+    assert_eq!(exit_detail(None, Some("ignored")), "本地服务进程意外退出");
   }
 
   /// stderr 的一行可能是整段推栈，日志与托盘只能带开头部分。

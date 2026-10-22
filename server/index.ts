@@ -61,6 +61,11 @@ const DEFAULT_MAX_CONCURRENCY = 4
 const MAX_CONCURRENCY = 20
 const VALID_MODES = new Set<JobMode>(['generate', 'edit', 'text_to_image', 'one_to_many'])
 const MODE_ALIASES: Record<string, JobMode> = { text: 'text_to_image', 'one-to-many': 'one_to_many' }
+// 列表/统计类查询不要携带源图 base64：一次编辑任务的原图最多 8MB（base64 约 10.7MB），
+// 几千条历史用 SELECT * 物化就是几个 GB 的 JS 字符串，在 Windows 默认 4GB 堆限下直接
+// FATAL ERROR（Reached heap limit）退出，表现就是「本地服务未就绪（退出码 134）」。
+// 重试等需要原图的路径仍走单条的 get(id)，不受影响。
+const JOB_SUMMARY_COLUMNS = "id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, cancelled_at, json_remove(request_json, '$.sourceImage') AS request_json, results_json, error_json, provider_id"
 
 type OutputLayoutSpec = { name: string; arrangement: string }
 const OUTPUT_LAYOUTS: Record<string, OutputLayoutSpec> = {
@@ -355,7 +360,19 @@ export class JobStore {
     this.runtimeProviders.set(job.id, request.provider)
     return { job, created: true }
   }
-  list(): Job[] { return (this.db.prepare('SELECT * FROM jobs ORDER BY created_at DESC').all() as Record<string, unknown>[]).map((row) => this.fromRow(row)) }
+  list(): Job[] { return (this.db.prepare(`SELECT ${JOB_SUMMARY_COLUMNS} FROM jobs ORDER BY created_at DESC`).all() as Record<string, unknown>[]).map((row) => this.fromRow(row)) }
+  /**
+   * 启动恢复只关心「哪些 queued 任务还该继续跑」。
+   * 这里刻意不调 list()：它有几千条历史就要把整张表连同源图 base64 物化到 JS 堆，
+   * 大历史量下启动就会 OOM；判定条件用 SQL 表达，只回 id。
+   */
+  queuedJobIds(): string[] {
+    const rows = this.db.prepare(`SELECT id FROM jobs WHERE status = 'queued' AND (
+      (json_valid(request_json) AND trim(coalesce(json_extract(request_json, '$.prompt'), '')) <> '')
+      OR (json_valid(windows_json) AND json_array_length(windows_json) > 0)
+    ) ORDER BY created_at ASC`).all() as { id?: string }[]
+    return rows.map((row) => String(row.id))
+  }
   getProviderConfig(): ProviderConfig | undefined {
     const row = this.db.prepare('SELECT base_url, api_key FROM provider_config WHERE id = 1').get() as { base_url?: string; api_key?: string } | undefined
     return row?.base_url && row.api_key ? { baseUrl: String(row.base_url), apiKey: String(row.api_key) } : undefined
@@ -875,9 +892,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     return { provider: providerConfig(undefined, defaults), ...(activeProvider ? { providerId: activeProvider.id } : {}), imageNamingEnabled, ...(activeLlm ? { llmProviderId: activeLlm.id, llmProvider: { baseUrl: activeLlm.baseUrl, apiKey: activeLlm.apiKey, model: activeLlm.model } } : {}) }
   }
   // 后端重启后继续执行尚未领取的任务，避免前端页面状态成为任务可靠性的前提。
-  for (const job of store.list()) {
-    if (job.status === 'queued' && (job.prompt || (job.windows && job.windows.length > 0))) queue(job.id)
-  }
+  for (const jobId of store.queuedJobIds()) queue(jobId)
   return createServer(async (req: HttpRequest, res: HttpResponse) => {
     setCors(res); if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }; const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
     // 启动器用端口、版本、进程号识别「本地服务是否就绪」以及 8765 上跑的是不是自己人；

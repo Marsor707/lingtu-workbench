@@ -90,3 +90,10 @@ Get-Process -Id <PID> | Select-Object Id,ProcessName,Path
 2. 新建目录 `%LOCALAPPDATA%\lingtu-workbench-data`。
 3. 把备份里的 `lingtu.db`、`lingtu.db-wal`、`lingtu.db-shm` 复制进去。
 4. 启动应用，托盘右键「状态」应变成「运行中」，再打开页面确认提示词回来了。
+
+## 退出码 134 的含义（1.0.11 起可直接看托盘）
+
+`134` 是 Node 的 `SIGABRT`，日志里会跟着一行 `FATAL ERROR: ...`：
+
+- `Reached heap limit Allocation failed - JavaScript heap out of memory`：历史库太大，启动时把整张任务表读进内存爆掉了。1.0.11 已修（列表不再携带源图 base64）。
+- 其他 `FATAL ERROR`：把 `launcher.log` 里那几行发我们。

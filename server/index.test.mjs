@@ -1392,3 +1392,52 @@ test('模型供应商保存代理配置并在列表回显，非法代理被拒�
     rmSync(directory, { recursive: true, force: true })
   }
 })
+
+test('任务列表不把源图 base64 物化进内存', async () => {
+  // 真实故障：几千条编辑任务的历史库里，每次编辑的原图（最大 8MB）都以 base64 存在
+  // request_json 里；旧实现的 list() 用 SELECT * 把它们全部读进 JS 堆，Windows 默认
+  // 4GB 堆限下直接 FATAL ERROR 退出，侧车连 8765 都没监听上，表现为「本地服务未就绪（退出码 134）」。
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-job-list-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  const app = await startServer(0, '127.0.0.1', store)
+  const base = `http://127.0.0.1:${app.address().port}`
+  try {
+    // 每张约 2MB 原图、60 条 ≈ 120MB：SELECT * 的物化量级足以和阈值区分开。
+    const sourceImage = { data: Buffer.alloc(2_000_000).toString('base64'), mimeType: 'image/png', name: 'a.png' }
+    for (let index = 0; index < 60; index += 1) {
+      store.create({ mode: 'edit', prompt: `第 ${index} 条`, sourceImage })
+    }
+    const before = process.memoryUsage().heapUsed
+    const items = store.list()
+    const grown = process.memoryUsage().heapUsed - before
+    assert.equal(items.length, 60)
+    assert.ok(grown < 40 * 1024 * 1024, `list() 不应把源图读进堆，实际新增 ${Math.round(grown / 1024 / 1024)}MB`)
+
+    const listed = await fetch(`${base}/api/jobs`).then((response) => response.text())
+    assert.ok(listed.length < 100_000, `列表接口也不应携带源图，实际 ${listed.length} 字节`)
+    assert.match(listed, /第 0 条/)
+    // 重试仍要拿得到原图，所以只允许从列表里摘掉，不能从库里删。
+    assert.equal(store.request(items[0].id)?.sourceImage?.data.length, sourceImage.data.length)
+  } finally {
+    await new Promise((resolve, reject) => app.close((error) => error ? reject(error) : resolve()))
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('启动恢复只回可执行的排队任务', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-queued-ids-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  try {
+    const runnable = store.create({ mode: 'text_to_image', prompt: '画一只橘猫' })
+    // 历史遗留：没有 prompt 也没有窗口的 generate 任务，恢复时不应被重新排队。
+    const legacyEmpty = store.create({ mode: 'generate' })
+    const windows = store.create({ mode: 'one_to_many', windows: [{ prompt: '窗口一' }, { prompt: '窗口二' }] })
+    const ids = store.queuedJobIds()
+    assert.deepEqual(ids.sort(), [runnable.job.id, windows.job.id].sort())
+    assert.ok(!ids.includes(legacyEmpty.job.id))
+  } finally {
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
