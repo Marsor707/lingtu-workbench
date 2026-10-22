@@ -97,3 +97,10 @@ Get-Process -Id <PID> | Select-Object Id,ProcessName,Path
 
 - `Reached heap limit Allocation failed - JavaScript heap out of memory`：历史库太大，启动时把整张任务表读进内存爆掉了。1.0.11 已修（列表不再携带源图 base64）。
 - 其他 `FATAL ERROR`：把 `launcher.log` 里那几行发我们。
+
+## 数据目录在哪、怎么换
+
+- 默认：`%LOCALAPPDATA%\lingtu-workbench-data`（数据库 + `workspace\jobs` 里的图片）。
+- 托盘右键 →「打开数据目录」直接定位；「更换数据目录…」可以把整个数据目录搬到别的盘（如 `E:\灵图数据`），复制完自动重启服务，旧目录保留不删。
+- 选择结果记在 `%LOCALAPPDATA%\lingtu-workbench-data-root.txt`。若它指向的目录不存在（移动硬盘没插、目录被删），托盘会显示「上次选择的数据目录不存在：…」，用「更换数据目录…」重选即可，数据不会被自动替换成别的目录。
+- 建议只选本地固定盘；网络盘上 SQLite 的锁语义不可靠。

@@ -37,6 +37,9 @@ test('健康检查暴露就绪判定所需的事实', async () => {
   assert.equal(body.service, 'lingtu-workbench')
   assert.equal(typeof body.pid, 'number')
   assert.equal(typeof body.runningJobs, 'number')
+  // 图片「落到哪了」只能由服务自己回答，探活同时暴露实际工作区。
+  assert.equal(typeof body.workspaceDir, 'string')
+  assert.ok(body.workspaceDir.length > 0)
 })
 
 test('期望端口被占用时回退到系统分配端口', async () => {

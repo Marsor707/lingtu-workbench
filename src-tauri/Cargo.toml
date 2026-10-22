@@ -1,6 +1,6 @@
 [package]
 name = "lingtu-workbench"
-version = "1.0.11"
+version = "1.0.12"
 description = "A Tauri App"
 authors = ["you"]
 license = ""
@@ -24,6 +24,8 @@ log = "0.4"
 tauri = { version = "2.11.3", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 tauri-plugin-shell = "2"
+# 数据目录可选：需要系统原生的「选择文件夹」对话框。
+tauri-plugin-dialog = "2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

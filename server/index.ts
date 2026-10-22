@@ -826,6 +826,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
         mkdirSync(join(workspaceDir, directory), { recursive: true })
         const relativePath = uniqueImagePath(workspaceDir, directory, outputStem)
         writeFileSync(join(workspaceDir, relativePath), imageBytes)
+        appendExecutionLog(workspaceDir, 'result_saved', { jobId: id, itemIndex: index, path: join(workspaceDir, relativePath) })
         results.push({ path: relativePath, index, ...(imageName ? { name: imageName } : {}) })
         providerStage = undefined
         const current = store.get(id); if (!isCurrentExecution() || current?.status === 'cancelled' || runtime.controller.signal.aborted) return
@@ -897,7 +898,7 @@ export function createApp(store = new JobStore(), options: AppOptions = {}): Nat
     setCors(res); if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return }; const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
     // 启动器用端口、版本、进程号识别「本地服务是否就绪」以及 8765 上跑的是不是自己人；
     // runningJobs 供托盘判断「有任务执行中」时是否禁用重启。
-    if (req.method === 'GET' && path === '/health') { json(res, 200, { status: 'ok', service: 'lingtu-workbench', version: currentVersion, pid: process.pid, runningJobs: store.runningCount() }); return }
+    if (req.method === 'GET' && path === '/health') { json(res, 200, { status: 'ok', service: 'lingtu-workbench', version: currentVersion, pid: process.pid, runningJobs: store.runningCount(), workspaceDir }); return }
     if (req.method === 'GET' && path === '/api/stats') { json(res, 200, store.stats(workspaceDir)); return }
     if (req.method === 'GET' && path === '/api/settings') { json(res, 200, { maxConcurrency, pixelUpscale, imageNamingEnabled, systemProxy, detectedProxy }); return }
     if (req.method === 'PUT' && path === '/api/settings') {
@@ -1272,4 +1273,4 @@ export async function startServer(port = portFromEnvironment(), host = DEFAULT_H
   return server
 }
 // 启动事实先写进执行日志再报 ready：用户只能拿到 execution.log 时，才能分清「压根没起来」和「起来了但页面打不开」。
-if (isSea() || (process.argv[1] && basename(process.argv[1]) === 'index.js')) { const dbPath = process.env.LINGTU_DB_PATH ?? 'workspace/lingtu.db'; const workspaceDir = resolve(process.env.LINGTU_WORKSPACE ?? 'workspace'); const appVersion = process.env.LINGTU_APP_VERSION ?? ''; const parentPid = Number(process.env.LINGTU_PARENT_PID); watchParentProcess(Number.isInteger(parentPid) && parentPid > 0 ? parentPid : undefined); startServer(portFromEnvironment(), DEFAULT_HOST, new JobStore(dbPath)).then((server) => { const address = server.address(); const port = typeof address === 'object' && address ? address.port : portFromEnvironment(); appendExecutionLog(workspaceDir, 'service_started', { version: appVersion, port, pid: process.pid, dbPath }); console.log(JSON.stringify({ ready: true, port, host: DEFAULT_HOST })) }).catch((error) => { console.error(error); appendExecutionLog(workspaceDir, 'service_start_failed', { version: appVersion, dbPath, errorMessage: (error as Error).message }); process.exitCode = 1 }) }
+if (isSea() || (process.argv[1] && basename(process.argv[1]) === 'index.js')) { const dbPath = process.env.LINGTU_DB_PATH ?? 'workspace/lingtu.db'; const workspaceDir = resolve(process.env.LINGTU_WORKSPACE ?? 'workspace'); const appVersion = process.env.LINGTU_APP_VERSION ?? ''; const parentPid = Number(process.env.LINGTU_PARENT_PID); watchParentProcess(Number.isInteger(parentPid) && parentPid > 0 ? parentPid : undefined); startServer(portFromEnvironment(), DEFAULT_HOST, new JobStore(dbPath)).then((server) => { const address = server.address(); const port = typeof address === 'object' && address ? address.port : portFromEnvironment(); appendExecutionLog(workspaceDir, 'service_started', { version: appVersion, port, pid: process.pid, dbPath, workspaceDir }); console.log(JSON.stringify({ ready: true, port, host: DEFAULT_HOST })) }).catch((error) => { console.error(error); appendExecutionLog(workspaceDir, 'service_start_failed', { version: appVersion, dbPath, errorMessage: (error as Error).message }); process.exitCode = 1 }) }

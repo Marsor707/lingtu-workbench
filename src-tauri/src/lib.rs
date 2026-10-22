@@ -197,6 +197,11 @@ impl ServiceStatus {
     Self { phase: ServicePhase::Restarting, port: None, running_jobs: 0, started_at: None, foreign: None, detail: None }
   }
 
+  /// 重启中且要告诉用户具体在忙什么（例如切换数据目录时的大库复制，可能要几分钟）。
+  fn restarting_with(detail: impl Into<String>) -> Self {
+    Self { phase: ServicePhase::Restarting, port: None, running_jobs: 0, started_at: None, foreign: None, detail: Some(detail.into()) }
+  }
+
   fn foreign(pid: u32, version: String) -> Self {
     Self { phase: ServicePhase::ForeignVersion, port: Some(DEFAULT_PORT), running_jobs: 0, started_at: None, foreign: Some((pid, version)), detail: None }
   }
@@ -232,7 +237,16 @@ fn menu_view(status: &ServiceStatus) -> MenuView {
 
   match status.phase {
     ServicePhase::Starting => make("灵图工作台 · 正在启动本地服务".to_owned(), "打开灵图工作台", false, "重启本地服务", false),
-    ServicePhase::Restarting => make("灵图工作台 · 正在重启本地服务".to_owned(), "打开灵图工作台", false, "重启本地服务", false),
+    ServicePhase::Restarting => make(
+      match &status.detail {
+        Some(detail) => format!("灵图工作台 · {detail}"),
+        None => "灵图工作台 · 正在重启本地服务".to_owned(),
+      },
+      "打开灵图工作台",
+      false,
+      "重启本地服务",
+      false,
+    ),
     // 有任务执行中时禁止重启：被中断的 running 任务不会被服务端恢复，只会永久停在执行中。
     ServicePhase::Ready if status.running_jobs > 0 => make(format!("灵图工作台 · 有 {} 个任务执行中", status.running_jobs), "打开灵图工作台", true, "重启本地服务（有任务执行中）", false),
     ServicePhase::Ready => make("灵图工作台".to_owned(), "打开灵图工作台", true, "重启本地服务", true),
@@ -246,7 +260,10 @@ fn menu_view(status: &ServiceStatus) -> MenuView {
 fn status_text(status: &ServiceStatus) -> String {
   match status.phase {
     ServicePhase::Starting => "状态：正在启动本地服务".to_owned(),
-    ServicePhase::Restarting => "状态：正在重启本地服务".to_owned(),
+    ServicePhase::Restarting => match &status.detail {
+      Some(detail) => format!("状态：{detail}"),
+      None => "状态：正在重启本地服务".to_owned(),
+    },
     ServicePhase::Ready if status.running_jobs > 0 => format!("状态：运行中 · {} 个任务执行中", status.running_jobs),
     ServicePhase::Ready => format!("状态：运行中 · {}", server_url(status.port.unwrap_or(DEFAULT_PORT))),
     ServicePhase::NotReady => format!("状态：本地服务未就绪 · {}", status.detail_text()),
@@ -435,8 +452,11 @@ fn migrate_legacy_data(
   if let Some(install_workspace) = install_workspace {
     sources.push(install_workspace.to_path_buf());
   }
+  // 两处 workspace 都要并进来：历史上它们可能同时存在（旧版把图片写进安装目录，
+  // 早期版本写在 appdata），只搬第一处会让另一处的历史图片变成死链接。
+  // copy_directory 是非覆盖式合并，同一相对路径以先到者的版本为准。
   for source in sources {
-    if source.is_dir() && !target_workspace.exists() {
+    if source.is_dir() {
       copy_directory(&source, &target_workspace).map_err(|error| format!("复制 {} 失败: {error}", source.display()))?;
       log::info!("已迁移 {}", source.display());
     }
@@ -446,19 +466,58 @@ fn migrate_legacy_data(
 
 /// 用户数据根目录（数据库 + 生成的图片）。
 ///
-/// 选择 `$LOCALAPPDATA\lingtu-workbench-data` 而不是 `%APPDATA%\<identifier>`：
+/// 默认 `$LOCALAPPDATA\lingtu-workbench-data`，而不是 `%APPDATA%\<identifier>`：
 /// 后者正是 NSIS 卸载器「删除应用数据」要递归删除的目录，而重装选新文件夹必经该选项。
 ///
-/// `migrate = false` 时只算路径不搬数据：旧版实例还在跑时复制数据库会拿到不一致的快照。
-fn resolve_data_root(paths: &tauri::path::PathResolver<tauri::Wry>, migrate: bool) -> tauri::Result<std::path::PathBuf> {
-  let legacy = paths.app_data_dir()?;
-  let target = paths.local_data_dir()?.join(DATA_ROOT_NAME);
+/// 用户可以在托盘菜单里改到任意目录（常见原因：系统盘空间不够，想把图片放到别的盘）。
+/// 选择结果记在 `$LOCALAPPDATA\lingtu-workbench-data-root.txt`：指针必须落在
+/// 「数据目录自身之外、又不在卸载器删除范围内」的位置，否则换目录后它就跟着丢了。
+const DATA_ROOT_POINTER: &str = "lingtu-workbench-data-root.txt";
+
+/// 指针文件内容 → 实际数据目录。空内容 / 目录不存在时回到默认值，
+/// 避免用户手动删了外部目录后整个应用起不来。
+/// 指针文件内容 → 实际数据目录。
+///
+/// 指针指向的目录不存在时**明确报错**，不静默退回默认目录：默认目录里可能是
+/// 切目录之前的旧快照，静默用它会变成「提示词和图片全退回去了」的假数据丢失。
+fn data_root_from(local_data_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+  let default = local_data_dir.join(DATA_ROOT_NAME);
+  let pointer = local_data_dir.join(DATA_ROOT_POINTER);
+  let chosen = std::fs::read_to_string(&pointer).ok().map(|text| text.trim().to_owned()).filter(|text| !text.is_empty());
+  match chosen {
+    Some(path) => {
+      let path = std::path::PathBuf::from(path);
+      if path.is_dir() {
+        Ok(path)
+      } else {
+        Err(format!(
+          "上次选择的数据目录不存在：{}（移动硬盘未连接或目录被删除），请用托盘菜单「更换数据目录…」重新选择",
+          path.display()
+        ))
+      }
+    }
+    None => Ok(default),
+  }
+}
+
+/// 写入用户选择；失败时返回错误，调用方不要重启服务，保持旧目录可用。
+fn write_data_root_pointer(local_data_dir: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+  std::fs::create_dir_all(local_data_dir).map_err(|error| format!("创建配置目录失败: {error}"))?;
+  let pointer = local_data_dir.join(DATA_ROOT_POINTER);
+  std::fs::write(&pointer, target.to_string_lossy().as_bytes()).map_err(|error| format!("记录数据目录失败: {error}"))
+}
+
+fn resolve_data_root(paths: &tauri::path::PathResolver<tauri::Wry>, migrate: bool) -> Result<std::path::PathBuf, String> {
+  let legacy = paths.app_data_dir().map_err(|error| format!("解析旧数据目录失败: {error}"))?;
+  let local_data = paths.local_data_dir().map_err(|error| format!("解析本地数据目录失败: {error}"))?;
+  let target = data_root_from(&local_data)?;
   if !migrate {
     return Ok(target);
   }
+  // 用户已经指定过目录（或已经在新目录里跑过）就不再从旧位置搬数据：
+  // 否则每换一次目录都会把旧库重新拖进来一份。
   let install_workspace = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|directory| directory.join("workspace")));
   let legacy_workspace = install_workspace.as_ref().map(|path| path.is_dir()).unwrap_or(false);
-  // 已经有新数据库就什么都不做；否则只要旧位置有数据就迁移一次。
   let needs_migration = !target.join("lingtu.db").exists() && (legacy.join("lingtu.db").exists() || legacy_workspace);
   if !needs_migration {
     return Ok(target);
@@ -473,10 +532,25 @@ fn resolve_data_root(paths: &tauri::path::PathResolver<tauri::Wry>, migrate: boo
   }
 }
 
+/// 切换数据目录的实际搬运：目标已有数据库就直接用（用户可能是在切回旧目录），
+/// 没有才把当前目录整个复制过去。只复制不删除，旧目录永远是完整的退路。
+fn adopt_data_root(current: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+  std::fs::create_dir_all(target).map_err(|error| format!("创建目录失败: {error}"))?;
+  if target.join("lingtu.db").exists() {
+    log::info!("目标目录已有数据，直接切换: {}", target.display());
+    return Ok(());
+  }
+  copy_directory(current, target).map_err(|error| format!("复制数据到新目录失败: {error}"))?;
+  if !target.join("lingtu.db").exists() {
+    return Err("复制后目标目录里没有数据库文件".to_owned());
+  }
+  Ok(())
+}
+
 /// 解析数据目录与 sidecar 启动参数。
 /// `migrate = true` 用于「确定要自己拉起服务」的时刻，重启/接管旧实例后同样适用。
 fn resolve_sidecar_paths(app: &tauri::AppHandle, migrate: bool) -> Result<(std::path::PathBuf, SidecarConfig), String> {
-  let data_root = resolve_data_root(app.path(), migrate).map_err(|error| format!("解析数据目录失败: {error}"))?;
+  let data_root = resolve_data_root(app.path(), migrate)?;
   let workspace_path = data_root.join("workspace");
   if let Err(error) = std::fs::create_dir_all(&workspace_path) {
     log::error!("创建数据目录失败: {error}");
@@ -516,8 +590,6 @@ struct LauncherState {
   status_item: MenuItem<tauri::Wry>,
   open_item: MenuItem<tauri::Wry>,
   restart_item: MenuItem<tauri::Wry>,
-  /// 用户数据目录（数据库 + 图片），供「打开数据目录」使用。
-  data_root: std::path::PathBuf,
   /// 服务最近一行 stderr。Node 抛 FATAL ERROR 时是 abort 退出，JS 层没机会写日志，
   /// 这行原始输出是唯一能说清原因的东西，所以它要能直接进托盘文案。
   last_stderr: Mutex<Option<String>>,
@@ -838,8 +910,10 @@ fn create_tray(app: &mut tauri::App, view: &MenuView) -> tauri::Result<TrayItems
   let logs_item = MenuItem::with_id(app, "open-logs", "打开日志目录", true, None::<&str>)?;
   // 数据目录独立于安装目录，用户重装 / 换盘时需要能找到历史图片和提示词库。
   let data_item = MenuItem::with_id(app, "open-data", "打开数据目录", true, None::<&str>)?;
+  // 改目录是重操作（拷库 + 重启服务），单独一个菜单项，不跟「打开数据目录」合并。
+  let choose_data_item = MenuItem::with_id(app, "choose-data", "更换数据目录…", true, None::<&str>)?;
   let exit_item = MenuItem::with_id(app, "exit", "退出", true, None::<&str>)?;
-  let menu = Menu::with_items(app, &[&status_item, &open_item, &restart_item, &logs_item, &data_item, &exit_item])?;
+  let menu = Menu::with_items(app, &[&status_item, &open_item, &restart_item, &logs_item, &data_item, &choose_data_item, &exit_item])?;
   let mut tray = TrayIconBuilder::with_id(TRAY_ID)
     .menu(&menu)
     .tooltip(view.tooltip.as_str())
@@ -857,12 +931,20 @@ fn create_tray(app: &mut tauri::App, view: &MenuView) -> tauri::Result<TrayItems
         }
       }
       "open-data" => {
-        let directory = app.try_state::<LauncherState>().map(|state| state.data_root.clone());
-        if let Some(directory) = directory {
-          if let Err(error) = open_in_file_manager(&directory) {
-            log::error!("{error}");
+        // 每次现算：用户可以随时改数据目录，状态里缓存一份只会变成陈的。
+        match resolve_data_root(app.path(), false) {
+          Ok(directory) => {
+            if let Err(error) = open_in_file_manager(&directory) {
+              log::error!("{error}");
+            }
           }
+          Err(error) => log::error!("读取数据目录失败: {error}"),
         }
+      }
+      "choose-data" => {
+        // 选目录 + 拷数据库不能让菜单回调（主线程）阻塞，更不能在 macOS 主线程弹 blocking 对话框。
+        let app_handle = app.clone();
+        std::thread::spawn(move || choose_data_root(&app_handle));
       }
       "exit" => {
         if let Some(state) = app.try_state::<LauncherState>() {
@@ -878,6 +960,87 @@ fn create_tray(app: &mut tauri::App, view: &MenuView) -> tauri::Result<TrayItems
   }
   tray.build(app)?;
   Ok(TrayItems { status: status_item, open: open_item, restart: restart_item })
+}
+
+/// 托盘「更换数据目录…」：选目录 → 停服务 → 复制数据 → 记指针 → 重启。
+/// 任何一步失败都把服务拉回旧目录：换目录不能表现成「工作台打不开了」。
+fn choose_data_root(app: &tauri::AppHandle) {
+  use tauri_plugin_dialog::DialogExt;
+  // 在子线程调 blocking：Windows / macOS 都不允许主线程阻塞等系统对话框。
+  let Some(folder) = app.dialog().file().set_title("选择灵图工作台数据目录").blocking_pick_folder() else {
+    return;
+  };
+  let target = match folder.into_path() {
+    Ok(path) => path,
+    Err(error) => {
+      log::error!("解析所选目录失败: {error}");
+      return;
+    }
+  };
+  // 当前目录可能恰好就是「上次选的目录已不可用」那种坏状态：这时也要允许改目录，
+  // 否则用户就锁死在打不开的工作台里了（本轮要修的正是这种死局）。
+  let current = resolve_data_root(app.path(), false);
+  if let Ok(current) = &current {
+    if same_directory(current, &target) {
+      notify(app, "这就是当前数据目录，无需切换。");
+      return;
+    }
+    log::info!("切换数据目录: {} → {}", current.display(), target.display());
+  } else if let Err(error) = &current {
+    log::warn!("当前数据目录不可用（{error}），直接切到 {}", target.display());
+  }
+
+  // 先停服务：运行中的进程在写 WAL，此刻复制数据库会拿到坏快照。
+  stop_sidecar(app);
+  // 大库复制可能几分钟：托盘必须能看出「在忙什么」，否则用户会以为程序卡死。
+  apply_status(app, ServiceStatus::restarting_with(format!("正在更换数据目录，复制数据到 {}…", target.display())));
+  let started = std::time::Instant::now();
+  let port = current_status(app).and_then(|status| status.port).unwrap_or(DEFAULT_PORT);
+  if is_port_listening(port) && !wait_port_free(port, PORT_FREE_TIMEOUT) {
+    log::error!("切换数据目录失败: 端口 {port} 未被释放");
+    notify(app, &format!("本地服务未能停止（端口 {port} 仍被占用），请稍后再试。"));
+    request_restart(app);
+    return;
+  }
+  let carried = match &current {
+    Ok(current) => adopt_data_root(current, &target),
+    // 当前目录不可用时没有东西可搬：直接在新目录建服务，旧数据仍在原来的盘上。
+    Err(_) => std::fs::create_dir_all(&target).map_err(|error| format!("创建目录失败: {error}")),
+  };
+  if let Err(error) = carried {
+    log::error!("切换数据目录失败: {error}");
+    notify(app, &format!("切换到 {} 失败：{error}\n仍使用原目录。", target.display()));
+    request_restart(app);
+    return;
+  }
+  let recorded = app
+    .path()
+    .local_data_dir()
+    .map_err(|error| format!("读取配置目录失败: {error}"))
+    .and_then(|local_data| write_data_root_pointer(&local_data, &target));
+  if let Err(error) = recorded {
+    log::error!("记录数据目录失败: {error}");
+    notify(app, &format!("记录新目录失败：{error}\n仍使用原目录。"));
+    request_restart(app);
+    return;
+  }
+  log::info!("数据目录已切换为 {}（耗时 {:?}）", target.display(), started.elapsed());
+  request_restart(app);
+  let carried_note = if current.is_ok() { "\n\n旧目录保留未删，确认无误后可自行清理。" } else { "\n\n原目录不可用，未能搬运其中数据。" };
+  notify(app, &format!("数据目录已切换到：\n{}{carried_note}", target.display()));
+}
+
+fn same_directory(left: &std::path::Path, right: &std::path::Path) -> bool {
+  fn normalized(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    text.trim_end_matches('/').to_lowercase()
+  }
+  normalized(left) == normalized(right)
+}
+
+fn notify(app: &tauri::AppHandle, message: &str) {
+  use tauri_plugin_dialog::DialogExt;
+  app.dialog().message(message).title("灵图工作台").blocking_show();
 }
 
 /// 在文件管理器里打开日志目录；目录还没创建时先建出来，避免打开报错。
@@ -915,6 +1078,8 @@ pub fn run() {
         .build(),
     )
     .plugin(tauri_plugin_shell::init())
+    // 数据目录可选需要系统原生文件对话框（ADR 0019）。
+    .plugin(tauri_plugin_dialog::init())
     .setup(|app| {
       // 先探 8765：决定本次是接管旧实例、直接打开，还是拉起新服务。
       let initial = match probe_health(DEFAULT_PORT) {
@@ -965,7 +1130,6 @@ pub fn run() {
         status_item: items.status,
         open_item: items.open,
         restart_item: items.restart,
-        data_root,
         last_stderr: Mutex::new(None),
       });
 
@@ -1177,6 +1341,26 @@ mod tests {
     assert!(legacy.join("lingtu.db").exists());
   }
 
+  /// 两处旧 workspace 必须合并，不能只搬第一个存在的：否则另一处的历史图片全变死链接。
+  #[test]
+  fn migration_merges_both_workspace_sources() {
+    let root = TempDirectory::new("merge-workspaces");
+    let legacy = root.path().join("appdata-com.lingtu.workbench");
+    let install_workspace = root.path().join("old-install").join("workspace");
+    let target = root.path().join("data");
+
+    std::fs::create_dir_all(legacy.join("workspace").join("jobs").join("old")).unwrap();
+    std::fs::write(legacy.join("workspace").join("jobs").join("old").join("a.png"), b"a").unwrap();
+    std::fs::write(legacy.join("lingtu.db"), b"prompts").unwrap();
+    std::fs::create_dir_all(install_workspace.join("jobs").join("new")).unwrap();
+    std::fs::write(install_workspace.join("jobs").join("new").join("b.png"), b"b").unwrap();
+
+    migrate_legacy_data(&legacy, Some(&install_workspace), &target).unwrap();
+
+    assert_eq!(std::fs::read(target.join("workspace").join("jobs").join("old").join("a.png")).unwrap(), b"a");
+    assert_eq!(std::fs::read(target.join("workspace").join("jobs").join("new").join("b.png")).unwrap(), b"b");
+  }
+
   /// 已有新数据库时不能再拿旧数据覆盖，否则升级回退会复活旧提示词。
   #[test]
   fn migration_never_overwrites_existing_data() {
@@ -1191,6 +1375,74 @@ mod tests {
     migrate_legacy_data(&legacy, None, &target).unwrap();
 
     assert_eq!(std::fs::read(target.join("lingtu.db")).unwrap(), b"new");
+  }
+
+  /// 数据目录指针：写了就生效，没写就用默认目录。
+  #[test]
+  fn data_root_pointer_overrides_default() {
+    let root = TempDirectory::new("data-root-pointer");
+    let local_data = root.path().join("local-appdata");
+    let chosen = root.path().join("E-drive").join("lingtu-data");
+    std::fs::create_dir_all(&chosen).unwrap();
+
+    assert_eq!(data_root_from(&local_data).unwrap(), local_data.join(DATA_ROOT_NAME));
+
+    write_data_root_pointer(&local_data, &chosen).unwrap();
+    assert_eq!(data_root_from(&local_data).unwrap(), chosen);
+  }
+
+  /// 指针指向的目录消失时必须报错，不能静默用默认目录冒充用户数据。
+  #[test]
+  fn missing_chosen_directory_is_reported() {
+    let root = TempDirectory::new("data-root-missing");
+    let local_data = root.path().join("local-appdata");
+    let chosen = root.path().join("unplugged-drive").join("lingtu-data");
+
+    write_data_root_pointer(&local_data, &chosen).unwrap();
+
+    let error = data_root_from(&local_data).unwrap_err();
+    assert!(error.contains("unplugged-drive"), "错误里必须带出路径，否则用户不知道去哪儿找: {error}");
+  }
+
+  /// 切目录：目标空就复制一份；目标已有数据库就直接用，绝不覆盖。
+  #[test]
+  fn adopt_data_root_copies_once_and_never_overwrites() {
+    let root = TempDirectory::new("adopt-data-root");
+    let current = root.path().join("current");
+    let target = root.path().join("target");
+    std::fs::create_dir_all(current.join("workspace").join("jobs")).unwrap();
+    std::fs::write(current.join("lingtu.db"), b"prompts").unwrap();
+    std::fs::write(current.join("workspace").join("jobs").join("a.png"), b"png").unwrap();
+
+    adopt_data_root(&current, &target).unwrap();
+    assert_eq!(std::fs::read(target.join("lingtu.db")).unwrap(), b"prompts");
+    assert_eq!(std::fs::read(target.join("workspace").join("jobs").join("a.png")).unwrap(), b"png");
+
+    // 目标已有自己的库（用户切回旧目录）：以目标为准，不能被当前目录覆盖。
+    let other = root.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("lingtu.db"), b"newer").unwrap();
+    adopt_data_root(&current, &other).unwrap();
+    assert_eq!(std::fs::read(other.join("lingtu.db")).unwrap(), b"newer");
+  }
+
+  /// 换数据目录要复制几个 GB，托盘得说清楚在忙什么，且期间不能给用户点重启。
+  #[test]
+  fn restarting_shows_what_it_is_busy_with() {
+    let busy = ServiceStatus::restarting_with("正在更换数据目录，复制数据到 E:\\data…");
+    let view = menu_view(&busy);
+    assert_eq!(view.tooltip, "灵图工作台 · 正在更换数据目录，复制数据到 E:\\data…");
+    assert_eq!(view.status, "状态：正在更换数据目录，复制数据到 E:\\data…");
+    assert!(!view.open_enabled);
+    assert!(!view.restart_enabled);
+    // 没有附加说明时保持原来的「正在重启本地服务」。
+    assert_eq!(status_text(&ServiceStatus::restarting()), "状态：正在重启本地服务");
+  }
+
+  #[test]
+  fn same_directory_ignores_case_and_trailing_separator() {
+    assert!(same_directory(std::path::Path::new("C:\\Data\\Lingtu"), std::path::Path::new("c:/data/lingtu/")));
+    assert!(!same_directory(std::path::Path::new("C:\\Data\\Lingtu"), std::path::Path::new("D:\\Data\\Lingtu")));
   }
 
   #[test]
