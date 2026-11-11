@@ -68,7 +68,9 @@ const MODE_ALIASES: Record<string, JobMode> = { text: 'text_to_image', 'one-to-m
 // 几千条历史用 SELECT * 物化就是几个 GB 的 JS 字符串，在 Windows 默认 4GB 堆限下直接
 // FATAL ERROR（Reached heap limit）退出，表现就是「本地服务未就绪（退出码 134）」。
 // 重试等需要原图的路径仍走单条的 get(id)，不受影响。
-const JOB_SUMMARY_COLUMNS = "id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, cancelled_at, json_remove(request_json, '$.sourceImage') AS request_json, results_json, error_json, provider_id"
+// json_remove 遇到非 JSON 的历史脏行会直接抛 SQLITE_ERROR，必须先用 json_valid 兜住，
+// 否则一条坏记录就让列表、统计、批量重试全部失败。
+const JOB_SUMMARY_COLUMNS = "id, idempotency_key, mode, status, windows_json, provider_json, created_at, updated_at, cancelled_at, CASE WHEN json_valid(request_json) THEN json_remove(request_json, '$.sourceImage') ELSE '{}' END AS request_json, results_json, error_json, provider_id"
 // 任务列表一律分页：历史可以有上千条，整表返回既慢又让前端用不上（筛选/搜索已交给服务端）。
 const DEFAULT_PAGE_SIZE = 20
 const MAX_PAGE_SIZE = 100
@@ -646,7 +648,9 @@ export class JobStore {
     }
     return { ...counts, storageBytes }
   }
-  get(id: string): Job | undefined { const row = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as Record<string, unknown> | undefined; return row ? this.fromRow(row) : undefined }
+  // 单条读取也走摘要列：SELECT * 会把 11MB 源图整行物化成 JS 字符串，
+  // 取消/更新一次调两次 get()，并发任务多时既慢又会把堆推高到 SQLite 报 out of memory。
+  get(id: string): Job | undefined { const row = this.db.prepare(`SELECT ${JOB_SUMMARY_COLUMNS} FROM jobs WHERE id = ?`).get(id) as Record<string, unknown> | undefined; return row ? this.fromRow(row) : undefined }
   // 旧版持久化的请求快照保存的是 pixelUpscale4K 布尔，读取时归一为三态，保证历史任务重试与展示语义一致。
   request(id: string): StoredRequest | undefined { const row = this.db.prepare('SELECT request_json FROM jobs WHERE id = ?').get(id) as { request_json?: string } | undefined; return row?.request_json ? normalizeStoredRequest(JSON.parse(row.request_json) as StoredRequest) : undefined }
   provider(id: string): ProviderConfig | undefined { return this.runtimeProviders.get(id) }

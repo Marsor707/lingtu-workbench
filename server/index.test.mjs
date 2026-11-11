@@ -1433,6 +1433,63 @@ test('任务列表不把源图 base64 物化进内存', async () => {
   }
 })
 
+test('单条读取与取消不把源图 base64 物化进内存', () => {
+  // 真实故障：cancel() 前后各调一次 get()，而 get() 曾是 SELECT *，一次取消要把 11MB 源图
+  // 读两遍。并发任务多时取消排队、托盘「已无响应」，SQLite 还会报 out of memory。
+  // 单次读取的堆增长用「源图接近 8MB 上限」的场景来测：实测 SELECT * 每次稳定增长 20MB
+  // （base64 字符串 + JSON 解析的双份），走摘要列则是 0.01MB。量级相差 2000 倍，
+  // 阈值定在 2MB 既能抗 GC 噪声，又能稳定拦住退回 SELECT * 的回归。
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-job-get-'))
+  const store = new JobStore(join(directory, 'jobs.db'))
+  try {
+    const sourceImage = { data: Buffer.alloc(8_000_000).toString('base64'), mimeType: 'image/png', name: 'a.png' }
+    const ids = []
+    for (let index = 0; index < 5; index += 1) {
+      ids.push(store.create({ mode: 'edit', prompt: `第 ${index} 条`, sourceImage }).job.id)
+    }
+    const growth = []
+    for (const id of ids) {
+      const before = process.memoryUsage().heapUsed
+      store.get(id)
+      growth.push(process.memoryUsage().heapUsed - before)
+    }
+    const worst = Math.max(...growth)
+    assert.ok(worst < 2 * 1024 * 1024, `单次 get() 不应物化源图，实际最大增长 ${(worst / 1024 / 1024).toFixed(2)}MB`)
+    const cancelled = store.cancel(ids[0])
+    assert.equal(cancelled?.status, 'cancelled')
+    assert.equal(store.get(ids[0])?.status, 'cancelled')
+    assert.ok(cancelled?.cancelledAt)
+    // 执行与重试路径必须完整保留源图，否则改图任务会失去原图。
+    assert.equal(store.request(ids[0])?.sourceImage?.data.length, sourceImage.data.length)
+  } finally {
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+
+test('历史脏行 request_json 不会让列表与统计整体失败', () => {
+  // json_remove 遇到非 JSON 会抛 SQLITE_ERROR；旧实现没有 json_valid 兜底，
+  // 一条损坏的历史记录就让列表、统计、批量重试全部报错。
+  const directory = mkdtempSync(join(tmpdir(), 'lingtu-bad-json-'))
+  const dbPath = join(directory, 'jobs.db')
+  const store = new JobStore(dbPath)
+  try {
+    store.create({ mode: 'text_to_image', prompt: '正常任务' })
+    // 绕过 create() 直接写入被截断的历史值，模拟旧版本异常退出的残留。
+    const raw = new DatabaseSync(dbPath)
+    try {
+      raw.prepare("INSERT INTO jobs (id, mode, status, provider_json, created_at, updated_at, request_json) VALUES (?, ?, ?, ?, ?, ?, ?)").run('job_broken', 'text_to_image', 'completed', '{"status":"completed","invoked":true}', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', '{"prompt": "被截断')
+    } finally { raw.close() }
+    assert.equal(store.list().length, 2)
+    assert.doesNotThrow(() => store.page({}))
+    assert.doesNotThrow(() => store.statusCounts())
+  } finally {
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
 test('启动恢复只回可执行的排队任务', () => {
   const directory = mkdtempSync(join(tmpdir(), 'lingtu-queued-ids-'))
   const store = new JobStore(join(directory, 'jobs.db'))

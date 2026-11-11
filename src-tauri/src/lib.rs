@@ -32,7 +32,17 @@ const TRAY_ID: &str = "lingtu-tray";
 /// 本身就要几十秒，20 秒会把「正在慢慢恢复」误报成「没起来」。
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// 本地 HTTP 探测的单次连接与读取超时。
+/// 只用于「这端口上是不是自己人」这种一次性身份识别：短超时让启动路径不被拖慢。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+/// 健康巡检的探测超时。
+/// 托盘曾用 300ms 探测，但被 300ms 限住的其实是 sidecar 的响应时间——它要现查 SQLite 算
+/// runningJobs，在几十个任务并发或大库上轻松超过 300ms。用户日志里「就绪 2 秒后立刻无响应」
+/// 反复出现一整个月，而进程一直活着，就是这条假阳性。
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// 连续多少次健康探测失败才判定服务未就绪。
+/// 单次超时只能说明「这一秒忙」，不能说明「服务死了」；Rust 侧用连续失败做去抖，
+/// 代价是托盘状态最多滞后 FAILURES_BEFORE_NOT_READY × REFRESH_INTERVAL。
+const FAILURES_BEFORE_NOT_READY: u32 = 3;
 /// 重启时等待旧进程释放端口的上限。
 const PORT_FREE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 就绪后刷新执行中任务数的间隔，它决定「重启本地服务」是否可用。
@@ -303,10 +313,10 @@ struct Health {
 
 /// 探测某个端口上的本地服务。只用于识别「8765 上是不是自己人」和刷新任务数，
 /// 「服务是否就绪」一律以 ready JSON 为准。
-fn probe_health(port: u16) -> Option<Health> {
+fn probe_health(port: u16, timeout: Duration) -> Option<Health> {
   let address = format!("{SERVER_HOST}:{port}");
-  let mut stream = TcpStream::connect_timeout(&address.parse().ok()?, PROBE_TIMEOUT).ok()?;
-  let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
+  let mut stream = TcpStream::connect_timeout(&address.parse().ok()?, timeout).ok()?;
+  let _ = stream.set_read_timeout(Some(timeout));
   let request = format!("GET {HEALTH_PATH} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
   stream.write_all(request.as_bytes()).ok()?;
 
@@ -748,7 +758,8 @@ fn mark_ready(app: &tauri::AppHandle, port: u16) {
     .map(|state| state.open_on_ready.swap(false, Ordering::SeqCst))
     .unwrap_or(false);
   // 这次探测顺带取执行中任务数与版本：探测失败不改判定，ready JSON 才是就绪的事实来源。
-  let health = probe_health(port);
+  // 服务刚启动就可能已在恢复积压任务，查询不一定快，这里也用健康巡检的超时。
+  let health = probe_health(port, HEALTH_PROBE_TIMEOUT);
   let running_jobs = health.as_ref().map(|health| health.running_jobs).unwrap_or(0);
   // 日志里带上双方版本：排查「旧 sidecar 配新启动器」时一眼就能看出来。
   log::info!(
@@ -788,23 +799,56 @@ fn exit_detail(code: Option<i32>, stderr: Option<&str>) -> String {
   format!("本地服务意外退出（{cause}）")
 }
 
+/// 健康探测失败的累积器：把「连续失败多少次才算未就绪」从线程循环里提出来，
+/// 既能单独测试，也避免把去抖逻辑散在 sleep 循环里。
+#[derive(Default)]
+struct ProbeDebounce {
+  consecutive_failures: u32,
+}
+
+impl ProbeDebounce {
+  /// 记录一次成功：计数归零。
+  fn record_success(&mut self) {
+    self.consecutive_failures = 0;
+  }
+
+  /// 记录一次失败，返回是否已经可以判定「无响应」。
+  fn record_failure(&mut self) -> bool {
+    self.consecutive_failures += 1;
+    self.consecutive_failures >= FAILURES_BEFORE_NOT_READY
+  }
+}
+
 /// 就绪后定期复核服务与执行中任务数：任务数是「重启本地服务」是否可用的唯一依据，
 /// 服务消失时也靠它立刻更新状态，而不是等用户自己发现问题。
 fn watch_service(app: tauri::AppHandle) {
+  // 单次探测超时只说明服务在忙，连续多次才判未就绪。
+  let mut debounce = ProbeDebounce::default();
   std::thread::spawn(move || loop {
     std::thread::sleep(REFRESH_INTERVAL);
     let Some(status) = current_status(&app) else {
       continue;
     };
     if status.phase != ServicePhase::Ready {
+      // 状态已不是就绪，计数作废，避免下次就绪时带着旧的失败次数。
+      debounce.record_success();
       continue;
     }
     let Some(port) = status.port else {
       continue;
     };
-    match probe_health(port) {
-      Some(health) => apply_status(&app, ServiceStatus::ready(port, health.running_jobs)),
-      None => apply_status(&app, ServiceStatus::not_ready("本地服务已无响应")),
+    match probe_health(port, HEALTH_PROBE_TIMEOUT) {
+      Some(health) => {
+        debounce.record_success();
+        apply_status(&app, ServiceStatus::ready(port, health.running_jobs));
+      }
+      None => {
+        // 未达阈值时刻意不动托盘：反复在「运行中/未就绪」之间抖动比滞后更难用。
+        if debounce.record_failure() {
+          log::error!("本地服务连续 {} 次探测失败，判定为无响应", debounce.consecutive_failures);
+          apply_status(&app, ServiceStatus::not_ready("本地服务已无响应"));
+        }
+      }
     }
   });
 }
@@ -862,7 +906,7 @@ fn take_over_foreign_service(app: &tauri::AppHandle, foreign: Option<(u32, Strin
     apply_status(app, ServiceStatus::not_ready("未找到旧版本服务进程"));
     return false;
   };
-  match probe_health(DEFAULT_PORT) {
+  match probe_health(DEFAULT_PORT, PROBE_TIMEOUT) {
     // 复核身份，避免 pid 被复用后杀错进程。
     Some(health) if health.pid != pid || health.version != version => {
       log::error!("旧版本服务身份已变化，未执行接管");
@@ -1082,7 +1126,7 @@ pub fn run() {
     .plugin(tauri_plugin_dialog::init())
     .setup(|app| {
       // 先探 8765：决定本次是接管旧实例、直接打开，还是拉起新服务。
-      let initial = match probe_health(DEFAULT_PORT) {
+      let initial = match probe_health(DEFAULT_PORT, PROBE_TIMEOUT) {
         Some(health) if health.version == env!("CARGO_PKG_VERSION") => {
           let app_handle = app.handle().clone();
           std::thread::spawn(move || {
@@ -1208,13 +1252,42 @@ mod tests {
   #[test]
   fn probes_identity_and_running_jobs_from_health() {
     let port = serve_once("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\",\"service\":\"lingtu-workbench\",\"version\":\"1.0.8\",\"pid\":42,\"runningJobs\":3}\n");
-    assert_eq!(probe_health(port), Some(Health { version: "1.0.8".to_owned(), pid: 42, running_jobs: 3 }));
+    assert_eq!(probe_health(port, PROBE_TIMEOUT), Some(Health { version: "1.0.8".to_owned(), pid: 42, running_jobs: 3 }));
   }
 
   #[test]
   fn ignores_health_response_from_another_service() {
     let port = serve_once("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"status\":\"ok\",\"service\":\"别的服务\"}");
-    assert_eq!(probe_health(port), None);
+    assert_eq!(probe_health(port, PROBE_TIMEOUT), None);
+  }
+
+  /// 用户日志里「就绪 2 秒后立刻无响应」反复出现一整个月，而进程一直活着：
+  /// 单次探测超时不能当成服务死亡，必须连续失败到阈值才改托盘。
+  #[test]
+  fn single_probe_failure_must_not_mark_service_dead() {
+    let mut debounce = ProbeDebounce::default();
+    assert!(!debounce.record_failure());
+    assert!(!debounce.record_failure());
+    assert!(debounce.record_failure(), "连续 {FAILURES_BEFORE_NOT_READY} 次才可判定无响应");
+  }
+
+  #[test]
+  fn probe_success_resets_failure_streak() {
+    // 失败—成功—失败这种抖动不能累积成「无响应」，否则慢查询一多托盘就变红。
+    let mut debounce = ProbeDebounce::default();
+    for _ in 0..10 {
+      assert!(!debounce.record_failure());
+      debounce.record_success();
+      assert!(!debounce.record_failure());
+      debounce.record_success();
+    }
+  }
+
+  #[test]
+  fn health_probe_timeout_is_longer_than_identity_probe() {
+    // /health 要现查 SQLite 算 runningJobs，300ms 在几十个并发任务时必然超时；
+    // 身份识别必须保持短超时，否则启动路径会被拖慢。两种用途不能共用一个值。
+    assert!(HEALTH_PROBE_TIMEOUT > PROBE_TIMEOUT);
   }
 
   #[test]
