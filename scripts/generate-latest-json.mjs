@@ -40,8 +40,14 @@ function buildDocument({ version, notes, assets, baseUrl }) {
     if (platforms[platform]) throw new Error(`平台 ${platform} 匹配到多个安装包：${platforms[platform].name}、${asset.name}`)
     platforms[platform] = { url: `${baseUrl}/${encodeURIComponent(asset.name)}`, size: asset.size, name: asset.name }
   }
-  const missing = ['darwin-arm64', 'windows-x64'].filter((platform) => !platforms[platform])
-  if (missing.length > 0) throw new Error(`Release 缺少以下平台的安装包：${missing.join('、')}`)
+  // 只要求至少有一份可识别的安装包。原先强制两个平台齐全，本意是避免发布残缺更新源，
+  // 但那把一个平台的构建故障放大成「整次发布失败」——用户连另一个平台的包也拿不到。
+  // 客户端 resolveUpdate 对缺失平台返回 latest 状态，不会拿错包，所以缺平台是安全的；
+  // 下面把缺失情况打出来，便于排查究竟是哪个平台没产出。
+  const allPlatforms = ['darwin-arm64', 'windows-x64']
+  const missing = allPlatforms.filter((platform) => !platforms[platform])
+  if (missing.length === allPlatforms.length) throw new Error(`Release ${version} 里没有任何可识别的安装包`)
+  if (missing.length > 0) console.warn(JSON.stringify({ warning: '更新源缺少平台', missing }))
   return {
     version,
     min_supported_version: MIN_SUPPORTED_VERSION,

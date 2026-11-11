@@ -50,7 +50,10 @@ jobs:
       matrix:
         include:
           - name: macOS ARM64
-            os: macos-14
+            # 不能用 macos-14：它已被 GitHub 标记废弃（actions/runner-images#15226），
+            # 而且官方表格里 macos-14 是 x64 镜像，与下面 aarch64-apple-darwin 目标矛盾，
+            # 会直接被判成不支持的配置而在 0 秒内失败。macos-15 才是 arm64 镜像。
+            os: macos-15
             bundle: app,dmg
             target: aarch64-apple-darwin
             artifact: lingtu-macos-arm64
@@ -108,9 +111,15 @@ jobs:
   # 版本 tag 或带 release_tag 的手动运行才创建 Release；留空时手动运行仅验证构建。
   release:
     name: 发布 GitHub Release
+    # always() 是必需的：默认 needs 语义下只要 matrix 里任一平台失败（例如某天某个
+    # runner 标签被下线），这个 job 就会被整体跳过，于是明明已经打好的 Windows 包
+    # 也不会发出去，用户拿不到任何下载。发布只关心「哪些平台真的产出了包」，
+    # 已在下面用 fail_on_unmatched_files 兜住完全无包的情况。
     if: >-
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+      always() && (
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+        (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+      )
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -122,6 +131,8 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
+          # 某个平台构建失败时没有可分发的 artifact，不能让整个下载步骤报错退出。
+          pattern: lingtu-*
 
       - name: 创建 GitHub Release
         id: release
@@ -133,8 +144,12 @@ jobs:
             release-assets/**/*.dmg
             release-assets/**/*.exe
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          # 说明由 GitHub 按提交自动生成；这里不手写平台列表，避免与实际情况不一致。
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          # 不能要 true：某个平台的构建 job 失败时那个格式自然匹配不到文件，
+          # fail_on_unmatched_files 会把整次发布判失败，等于让「单平台故障」重新变成
+          # 「所有平台都发不出」。完全没包的情况由上面的 if-no-files-found 与下载步骤兜底。
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
