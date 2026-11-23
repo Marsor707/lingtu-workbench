@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test, { after } from 'node:test'
 import { createServer } from 'node:http'
 import { connect } from 'node:net'
-import { DEFAULT_PROVIDER_TIMEOUT_MS, editImage, generateImage, materializeImageResult, ProviderError } from '../dist-server/provider.js'
+import { DEFAULT_PROVIDER_TIMEOUT_MS, editImage, generateImage, materializeImageResult, normalizeImageQuality, normalizeImageSize, ProviderError } from '../dist-server/provider.js'
 
 const requests = []
 const mock = createServer(async (req, res) => {
@@ -50,6 +50,51 @@ test('Provider 发送 OpenAI 兼容请求并解析 base64 图片', async () => {
     quality: 'high',
     n: 1,
   })
+})
+
+test('尺寸归一化：把展示用乘号尺寸转成 Provider 接受的半角 x 写法', () => {
+  // 前端尺寸选项用「1024 × 1024」，实测 Provider 对乘号返回 invalid_image_size。
+  assert.equal(normalizeImageSize('1024 × 1024'), '1024x1024')
+  assert.equal(normalizeImageSize('3840 × 2160'), '3840x2160')
+  assert.equal(normalizeImageSize('1024×1024'), '1024x1024')
+  assert.equal(normalizeImageSize('1024X1024'), '1024x1024')
+  assert.equal(normalizeImageSize('1024x1024'), '1024x1024')
+  assert.equal(normalizeImageSize('  800 * 600  '), '800x600')
+  assert.equal(normalizeImageSize(undefined), undefined)
+  assert.equal(normalizeImageSize(''), undefined)
+})
+
+test('质量归一化：把中文选项映射为 Provider 认可的英文枚举', () => {
+  // 实测上游对非法 quality 不报错，而是静默回落 medium，会把「高」降级成 medium，因此必须映射。
+  assert.equal(normalizeImageQuality('高'), 'high')
+  assert.equal(normalizeImageQuality('中'), 'medium')
+  assert.equal(normalizeImageQuality('自动'), 'auto')
+  assert.equal(normalizeImageQuality(' 高 '), 'high')
+  // 已是英文枚举或其他值保持原样，兼容直传英文的调用方。
+  assert.equal(normalizeImageQuality('high'), 'high')
+  assert.equal(normalizeImageQuality('low'), 'low')
+  assert.equal(normalizeImageQuality(undefined), undefined)
+  assert.equal(normalizeImageQuality(''), undefined)
+})
+
+test('Provider 生图时把乘号尺寸归一化后再出网', async () => {
+  await generateImage({
+    baseUrl: `http://127.0.0.1:${port}`,
+    apiKey: 'test-secret',
+    prompt: '尺寸归一化',
+    size: '1024 × 1024',
+  })
+  assert.equal(requests.at(-1).body.size, '1024x1024')
+})
+
+test('Provider 生图时把中文质量归一化后再出网', async () => {
+  await generateImage({
+    baseUrl: `http://127.0.0.1:${port}`,
+    apiKey: 'test-secret',
+    prompt: '质量归一化',
+    quality: '高',
+  })
+  assert.equal(requests.at(-1).body.quality, 'high')
 })
 
 test('Provider 使用调用方指定的生图模型', async () => {

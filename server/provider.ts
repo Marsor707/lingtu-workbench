@@ -84,6 +84,26 @@ function endpoint(baseUrl: string, resource: 'generations' | 'edits'): string {
   return parsed.toString()
 }
 
+// 前端尺寸选项用「1024 × 1024」这种带乘号的展示写法，Provider 只认半角 x 且不接受乘号，
+// 实测传 × 会被拒为 invalid_image_size，因此统一在出网边界归一化，避免改 UI 文案。
+export function normalizeImageSize(size?: string): string | undefined {
+  const trimmed = size?.trim()
+  if (!trimmed) return undefined
+  const matched = trimmed.match(/^(\d+)\s*[×xX*]\s*(\d+)$/)
+  return matched ? `${matched[1]}x${matched[2]}` : trimmed
+}
+
+// 前端质量选项用中文展示，Provider 只认 OpenAI 英文枚举。
+// 传入非法值时上游不报错，而是静默回落到默认 medium，导致选「高」实际按 medium 出图，
+// 因此必须在出网前映射，否则质量选项形同虚设。
+const IMAGE_QUALITY_MAP: Record<string, string> = { '高': 'high', '中': 'medium', '自动': 'auto' }
+
+export function normalizeImageQuality(quality?: string): string | undefined {
+  const trimmed = quality?.trim()
+  if (!trimmed) return undefined
+  return IMAGE_QUALITY_MAP[trimmed] ?? trimmed
+}
+
 async function parseImageResponse(response: Response, timeoutSignal?: AbortSignal, callerSignal?: AbortSignal): Promise<GenerationResult> {
   if (!response.ok) {
     // 错误信息不拼接响应原文，避免 Provider 回显凭据或用户提示词。
@@ -163,6 +183,8 @@ export async function generateImage(request: GenerationRequest): Promise<Generat
   if (!request.apiKey.trim()) throw new ProviderError('provider_not_configured', '未配置生图 API Key')
   if (!request.prompt.trim()) throw new ProviderError('invalid_prompt', '生图提示词不能为空')
 
+  const normalizedSize = normalizeImageSize(request.size)
+  const normalizedQuality = normalizeImageQuality(request.quality)
   const requestSignal = timedSignal(request.signal)
   let response: Response
   try {
@@ -177,8 +199,8 @@ export async function generateImage(request: GenerationRequest): Promise<Generat
       body: JSON.stringify({
         model: request.model ?? DEFAULT_IMAGE_MODEL,
         prompt: request.prompt.trim(),
-        ...(request.size ? { size: request.size } : {}),
-        ...(request.quality ? { quality: request.quality } : {}),
+        ...(normalizedSize ? { size: normalizedSize } : {}),
+        ...(normalizedQuality ? { quality: normalizedQuality } : {}),
         n: 1,
       }),
       ...networkInit(requestSignal.signal, request.proxyUrl),
@@ -201,8 +223,10 @@ export async function editImage(request: EditImageRequest): Promise<GenerationRe
   form.append('model', request.model ?? DEFAULT_IMAGE_MODEL)
   form.append('prompt', request.prompt.trim())
   form.append('image', new Blob([Uint8Array.from(Buffer.from(request.sourceImage.data, 'base64'))], { type: request.sourceImage.mimeType }), request.sourceImage.name)
-  if (request.size) form.append('size', request.size)
-  if (request.quality) form.append('quality', request.quality)
+  const normalizedSize = normalizeImageSize(request.size)
+  const normalizedQuality = normalizeImageQuality(request.quality)
+  if (normalizedSize) form.append('size', normalizedSize)
+  if (normalizedQuality) form.append('quality', normalizedQuality)
   form.append('n', '1')
 
   const requestSignal = timedSignal(request.signal)
